@@ -303,6 +303,9 @@ class Parallelism:
     enable_async_tensor_parallel: bool = False
     """Whether to apply async tensor parallel (currently only effective when compile is enabled)"""
 
+    expert_parallel_degree: int = 1
+    """Expert Parallelism degree. 1 means disabled."""
+
     pipeline_parallel_degree: int = 1
     """
     Pipeline Parallelism degree, or number of ranks. 1 means disabled.

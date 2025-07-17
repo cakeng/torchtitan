@@ -45,8 +45,8 @@ DATASETS = {
         text_processor=_process_c4_text,
     ),
     "c4_test": DatasetConfig(
-        path="tests/assets/c4_test",
-        loader=lambda path: load_dataset(path, split="train"),
+        path="allenai/c4",
+        loader=lambda path: load_dataset(path, 'en', split="train"),
         text_processor=_process_c4_text,
     ),
 }

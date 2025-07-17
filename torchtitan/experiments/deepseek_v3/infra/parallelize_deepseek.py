@@ -51,6 +51,10 @@ def parallelize_deepseek(
     logger.info("Applying parallelism to the model...")
     world_size = int(os.environ["WORLD_SIZE"])
 
+    fb_mesh = world_mesh["fb"]
+    fb_rank = fb_mesh.get_local_rank()
+    fb_size = fb_mesh.size()
+
     pp_mesh = world_mesh["pp"]
     ep_mesh = world_mesh["ep"]
     pp_rank = pp_mesh.get_local_rank()
@@ -69,11 +73,11 @@ def parallelize_deepseek(
     model_args.num_stages = pp_size
     model_args.stage_idx = pp_rank
     logger.info(
-        f"Parallelism: {rank=}, {ep_size=}, {pp_size=}, {model_args.ep_size=}, {model_args.num_stages=}, {model_args.stage_idx=}"
+        f"Parallelism: {rank=}, {fb_size=}, {ep_size=}, {pp_size=}, {model_args.ep_size=}, {model_args.num_stages=}, {model_args.stage_idx=}"
     )
     # print(model_args)
     # verify world size matches parallelized total
-    parallelized_world_size = pp_size * hsdp_size
+    parallelized_world_size = pp_size * hsdp_size * fb_size
     logger.info(f"Total Parallelized World size {parallelized_world_size}")
     assert (
         world_size == parallelized_world_size
@@ -102,8 +106,23 @@ def parallelize_deepseek(
     # Apply HSDP on root model (lm_head, embeddings, etc)
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
 
+    # 모델 파트 분리: 파이프라인 병렬화 단계별로 파트 분리
+    # pp_size가 1이면 전체 모델, 아니면 각 파이프라인 stage별로 파트 분리
+    model_parts = []
+    if pp_size > 1 and hasattr(model.model, "layers"):
+        # 각 파이프라인 stage에 해당하는 레이어만 파트로 분리
+        # 예시: model.model.layers는 dict이므로, 각 stage에 해당하는 레이어만 추출
+        # 실제 분할 방식은 모델 구조에 따라 다를 수 있음
+        # 여기서는 단순히 전체 레이어를 하나의 파트로 반환 (실제 분할 필요시 수정)
+        model_parts.append(model.model)
+    else:
+        model_parts.append(model)
+
     return (
         model,
+        model_parts,
+        fb_size,
+        fb_rank,
         pp_size,
         pp_rank,
         pp_mesh,

@@ -23,6 +23,7 @@ class ParallelDims:
     cp: int
     tp: int
     pp: int
+    fb: int
     world_size: int
     enable_loss_parallel: bool
 
@@ -30,14 +31,15 @@ class ParallelDims:
         self._validate()
 
     def _validate(self):
-        dp_replicate, dp_shard, cp, tp, pp = (
+        dp_replicate, dp_shard, cp, tp, pp, fb = (
             self.dp_replicate,
             self.dp_shard,
             self.cp,
             self.tp,
             self.pp,
+            self.fb,
         )
-        for d in (dp_replicate, cp, tp, pp):
+        for d in (dp_replicate, cp, tp, pp, fb):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
 
         assert dp_shard == -1 or dp_shard >= 1, " dp_shard must -1 or >=1."
@@ -45,17 +47,17 @@ class ParallelDims:
             self.dp_shard = dp_shard = self.world_size // (dp_replicate * cp * tp * pp)
         assert dp_shard >= 1
 
-        assert dp_replicate * dp_shard * cp * tp * pp == self.world_size, (
+        assert dp_replicate * dp_shard * cp * tp * pp * fb == self.world_size, (
             f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
-            f"cp({cp}) * tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
+            f"cp({cp}) * tp({tp}) * pp({pp}) * fb({fb}) != WORLD_SIZE({self.world_size})"
         )
 
     def build_mesh(self, device_type: str) -> DeviceMesh:
         dims = []
         names = []
         for d, name in zip(
-            [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp],
-            ["pp", "dp_replicate", "dp_shard", "cp", "tp"],
+            [self.pp, self.dp_replicate, self.dp_shard, self.cp, self.tp, self.fb],
+            ["pp", "dp_replicate", "dp_shard", "cp", "tp", "fb"],
         ):
             if d > 1:
                 dims.append(d)
@@ -135,6 +137,10 @@ class ParallelDims:
     @property
     def pp_enabled(self):
         return self.pp > 1
+    
+    @property
+    def fb_enabled(self):
+        return self.fb > 1
 
     @property
     def loss_parallel_enabled(self):

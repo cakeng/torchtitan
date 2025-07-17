@@ -355,8 +355,13 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def compiled_forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.compiled_forward(x)
         return down_proj
 
 
@@ -721,6 +726,7 @@ class MoE(nn.Module):
             )
             gatherd_idxs = gatherd_idxs.repeat_interleave(tokens_per_expert_group)
 
+        
         # Prepare buffer for tokens processed by experts
         if self.shuffle_method == "symm_mem":
             # Take necessary space from `token_gather_buf` symm mem because we are
@@ -729,8 +735,8 @@ class MoE(nn.Module):
         else:  # "torch_all_to_all"
             processed_tokens = torch.empty_like(gathered_tokens)
 
-        # This part processes the tokens routed to the local experts.
-        # TODO: can we use group GEMM here?
+        # # This part processes the tokens routed to the local experts.
+        # # TODO: can we use group GEMM here?
         for i, expert in enumerate(self.experts.values()):
             processed_tokens[gatherd_idxs == i] = expert(
                 gathered_tokens[gatherd_idxs == i]
@@ -995,7 +1001,8 @@ class Attention(nn.Module):
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
-
+            
+    @torch.compile(mode="max-autotune-no-cudagraphs")
     def forward(
         self,
         hidden_states: torch.Tensor,

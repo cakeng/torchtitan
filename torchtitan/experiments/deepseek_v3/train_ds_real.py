@@ -15,6 +15,7 @@ import time
 from typing import Iterable
 
 import torch
+import torch.profiler
 import torch.distributed as dist
 
 import torchtitan.components.ft as ft
@@ -47,8 +48,22 @@ from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import get_device_info
 
+from torch.distributed.pipelining import PipelineStage, Schedule1F1B
+
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
+
+def g_str(s):
+    return "\033[32m" + s + "\033[0m"
+
+def r_str(s):
+    return "\033[31m" + s + "\033[0m"
+
+def b_str(s):
+    return "\033[34m" + s + "\033[0m"
+
+def y_str(s):
+    return "\033[33m" + s + "\033[0m"
 
 
 def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -90,10 +105,10 @@ def next_batch(
 def run_full_model(
     config: JobConfig,
 ):
-
     # setup mesh
     pp_dim = config.parallelism.pipeline_parallel_degree
     ep_dim = config.parallelism.expert_parallel_degree
+    fb_dim = 2
     if not ep_dim:
         # TODO - the fix for config extension is in PR...need it to land
         # logger.info(f"No EP degree specified, {ep_dim=}")
@@ -101,26 +116,30 @@ def run_full_model(
         logger.info("Using default EP degree 2")
 
     fsdp_dim = config.parallelism.data_parallel_shard_degree
-    logger.info(f"{pp_dim=}, {ep_dim=}, {fsdp_dim=}, {_device_info=}")
 
     world_mesh = dist.init_device_mesh(
-        "cuda", (pp_dim, ep_dim, fsdp_dim), mesh_dim_names=("pp", "ep", "fsdp")
+        "cuda", (fb_dim, pp_dim, ep_dim, fsdp_dim), mesh_dim_names=("fb", "pp", "ep", "fsdp")
     )
-    logger.info(f"{world_mesh.size()=}")
+    logger.info(g_str("Mesh: ") + f"{world_mesh}")
 
     rank = dist.get_rank()
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
 
+    logger.info(g_str(f"{rank=}:") + f" {device=}")
+
     model_args = deepseek_config_registry.get(model_id, None)
     if model_args is None:
         raise ValueError(f"Model {model_id} not found in registry.")
 
-    # TODO - remove this for full model
-    # model_args.num_hidden_layers = 16
+    # TODO - remove this for full model\
 
+    # model_args.num_hidden_layers = 16
     (
         model,
+        model_parts,
+        fb_size,
+        fb_rank,
         pp_size,
         pp_rank,
         pp_mesh,
@@ -153,6 +172,7 @@ def run_full_model(
         dp_replicate=ep_size,
         dp_shard=fsdp_dim,
         pp=pp_size,
+        fb=fb_size,
         cp=1,
         tp=1,
         world_size=world_mesh.size(),
@@ -176,70 +196,88 @@ def run_full_model(
         f"{color.green}({device_mem_stats.max_reserved_pct:.2f}%){color.reset}"
     )
 
+    if pp_rank == 0 and ep_rank == 0:
+        print(r_str(f"Rank {rank}: ") + f"{pp_size=}_{pp_rank=}_{ep_size=}_{ep_rank=}_{fb_size=} - Model: \n{model}")
+
     # Create loss function
     loss_fn = cross_entropy_loss  # torch.nn.functional.cross_entropy
 
     ft_manager = ft.init_ft_manager(config)
-    optimizer = build_optimizers([model], config, ft_manager)
+    optimizer = build_optimizers(model_parts, config, ft_manager)
 
     lr_scheduler = build_lr_schedulers(optimizer, config)
 
-    # Run forward and backward
-    steps = config.training.steps
+    # # Run forward and backward
+    # steps = config.training.steps
 
-    loss = float("inf")
-    data_iterator = iter(dataloader)
+    # loss = float("inf")
+    # data_iterator = iter(dataloader)
 
-    for step in range(steps):
-        optimizer.zero_grad()
+    # datetime_str = time.strftime("%Y%m%d-%H%M%S")
+    # trace_name = f"ds_real_{pp_size=}_{pp_rank=}_{ep_size=}_{ep_rank=}_{datetime_str}"
 
-        inputs, label = next_batch(data_iterator, metrics_processor)
-        x = inputs["input"]
+    # with torch.profiler.profile(
+    #     schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs', trace_name),
+    #     record_shapes=True,
+    #     profile_memory=True,
+    #     with_stack=True
+    # ) as prof:
+    #     for step in range(10):
+    #         optimizer.zero_grad()
 
-        if pp_size > 1:
+    #         inputs, label = next_batch(data_iterator, metrics_processor)
+    #         x = inputs["input"]
 
-            # Create pipeline stage
-            stage = PipelineStage(
-                model,
-                pp_rank,
-                pp_size,
-                device,
-                group=pp_mesh.get_group(),
-            )
+    #         if pp_size > 1:
 
-            # Create pipeline schedule
-            losses = []
-            pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
+    #             # Create pipeline stage
+    #             stage = PipelineStage(
+    #                 model,
+    #                 pp_rank,
+    #                 pp_size,
+    #                 device,
+    #                 group=pp_mesh.get_group(),
+    #             )
 
-            if pp_rank == 0:
-                y = pp_schedule.step(x)
-            elif pp_rank == pp_size - 1:
-                # last rank...run loss function
-                y = pp_schedule.step(target=label, losses=losses)
-                loss = torch.mean(torch.stack(losses))
-            else:
-                pp_schedule.step()
-        else:
-            y = model(x)
-            loss = loss_fn(y, label)
-            loss.backward()
+    #             # Create pipeline schedule
+    #             losses = []
+    #             pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
 
-        if pp_rank == pp_size - 1:
+    #             if pp_rank == 0:
+    #                 y = pp_schedule.step(x)
+    #             elif pp_rank == pp_size - 1:
+    #                 # last rank...run loss function
+    #                 y = pp_schedule.step(target=label, losses=losses)
+    #                 loss = torch.mean(torch.stack(losses))
+    #             else:
+    #                 pp_schedule.step()
+    #         else:
+    #             y = model(x)
+    #             loss = loss_fn(y, label)
+    #             loss.backward()
 
-            global_avg_loss = global_max_loss = loss  # .detach().item()
+    #         if pp_rank == pp_size - 1:
 
-            metrics_processor.log(step, global_avg_loss, global_max_loss)
+    #             global_avg_loss = global_max_loss = loss  # .detach().item()
 
-        optimizer.step()
-        lr_scheduler.step()
+    #             metrics_processor.log(step, global_avg_loss, global_max_loss,
+    #                                   -1.0)
 
-    metrics_processor.close()
-    logger.info("Training completed")
+    #         # optimizer.step()
+    #         # lr_scheduler.step()
+
+    #         prof.step()
+    # logger.info("Profiler trace exported to ./profiler_logs/" + trace_name)
+
+    # metrics_processor.close()
+    # logger.info("Training completed")
 
 
 if __name__ == "__main__":
     # set device before init_device mesh, otherwise ep will have duplicate device mapping
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    num_device = torch.cuda.device_count()
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_device)
 
     init_logger()
     # we do this to remove a root logger that is added by HF
