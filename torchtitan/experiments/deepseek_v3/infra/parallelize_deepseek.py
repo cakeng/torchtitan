@@ -22,6 +22,14 @@ from torchtitan.tools.logging import logger
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
 
+def g_str(s):
+    return "\033[32m" + s + "\033[0m"
+def r_str(s):
+    return "\033[31m" + s + "\033[0m"
+def b_str(s):
+    return "\033[34m" + s + "\033[0m"
+def y_str(s):
+    return "\033[33m" + s + "\033[0m"
 
 # from ..model.moe import MoE
 
@@ -39,6 +47,7 @@ def parallelize_deepseek(
     device: torch.device,
     model_args,
     rank: int,
+    fb_gloo_grp: dist.ProcessGroup,
     # parallel_dims: ParallelDims,
     # job_config: JobConfig,
 ):
@@ -73,17 +82,21 @@ def parallelize_deepseek(
     model_args.num_stages = pp_size
     model_args.stage_idx = pp_rank
     logger.info(
-        f"Parallelism: {rank=}, {fb_size=}, {ep_size=}, {pp_size=}, {model_args.ep_size=}, {model_args.num_stages=}, {model_args.stage_idx=}"
+        y_str(f"Rank {rank} Parallelism: ") + 
+        f"{fb_size=}, {ep_size=}, {pp_size=}, {model_args.ep_size=}, {model_args.num_stages=}, {model_args.stage_idx=}"
     )
     # print(model_args)
     # verify world size matches parallelized total
     parallelized_world_size = pp_size * hsdp_size * fb_size
-    logger.info(f"Total Parallelized World size {parallelized_world_size}")
+    logger.info(g_str(f"Total Parallelized World size: ") + f"{parallelized_world_size}")
     assert (
         world_size == parallelized_world_size
     ), f"mismatch between total world size {world_size=} and parallelized total {parallelized_world_size}"
 
+    model=None
+
     # Instantiate model
+    logger.info("")
     with device, world_mesh:
         model = DeepseekForCausalLM(model_args)
     # Load weights
@@ -105,6 +118,25 @@ def parallelize_deepseek(
 
     # Apply HSDP on root model (lm_head, embeddings, etc)
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
+
+    # Share weights within fb ranks
+    if fb_size > 1:
+        dist.barrier(group=fb_gloo_grp)
+        if fb_rank == 0:
+            model.share_memory() # Make model's storage shareable via IPC
+            params_to_share = [p.data for p in model.parameters()]
+            dist.broadcast_object_list(params_to_share, group=fb_gloo_grp, group_src=0)
+            print(r_str(f"Rank {rank}: ") + f"Sharing model parameters on GPU {device}")
+        else:
+            params_to_share = [p.data for p in model.parameters()]
+            dist.broadcast_object_list(params_to_share, group=fb_gloo_grp, group_src=0)
+            for p_local, p_shared in zip(model.parameters(), params_to_share):
+                p_local.data = p_shared
+
+            print(r_str(f"Rank {rank}: ") + f"Reconstructed model from shared parameters on GPU {device}")
+        dist.barrier(group=fb_gloo_grp)
+
+
 
     # 모델 파트 분리: 파이프라인 병렬화 단계별로 파트 분리
     # pp_size가 1이면 전체 모델, 아니면 각 파이프라인 stage별로 파트 분리

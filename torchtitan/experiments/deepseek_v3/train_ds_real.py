@@ -55,13 +55,10 @@ model_id = "deepseek-ai/DeepSeek-V2-Lite"
 
 def g_str(s):
     return "\033[32m" + s + "\033[0m"
-
 def r_str(s):
     return "\033[31m" + s + "\033[0m"
-
 def b_str(s):
     return "\033[34m" + s + "\033[0m"
-
 def y_str(s):
     return "\033[33m" + s + "\033[0m"
 
@@ -108,7 +105,8 @@ def run_full_model(
     # setup mesh
     pp_dim = config.parallelism.pipeline_parallel_degree
     ep_dim = config.parallelism.expert_parallel_degree
-    fb_dim = 2
+    fb_dim = config.parallelism.forward_backward_parallel_degree
+    assert fb_dim <= 2, "Forward-backward parallelism cannot have a degree more than 2."
     if not ep_dim:
         # TODO - the fix for config extension is in PR...need it to land
         # logger.info(f"No EP degree specified, {ep_dim=}")
@@ -117,12 +115,31 @@ def run_full_model(
 
     fsdp_dim = config.parallelism.data_parallel_shard_degree
 
+    # set device before init_device mesh, otherwise ep will have duplicate device mapping
+    num_device = torch.cuda.device_count()
+    logger.info(g_str("Num GPUs: ") + f"{num_device}")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_device)
+
     world_mesh = dist.init_device_mesh(
         "cuda", (fb_dim, pp_dim, ep_dim, fsdp_dim), mesh_dim_names=("fb", "pp", "ep", "fsdp")
     )
     logger.info(g_str("Mesh: ") + f"{world_mesh}")
 
     rank = dist.get_rank()
+    os_rank = os.environ["LOCAL_RANK"]
+    logger.info(r_str(f"OS Rank ") + f"{os_rank}, " + r_str(f"Dist Rank ") + f"{rank}")
+
+    fb_gloo_grp = None
+    if fb_dim > 1:
+        fb_mesh = world_mesh["fb"]
+        fb_ranks = fb_mesh.mesh.tolist()
+        fb_gloo_grp = dist.new_group(
+            ranks=fb_ranks,
+            backend="gloo",
+            group_desc="fb_gloo_group"
+        )
+        logger.info(y_str(f"Rank {rank} initialized GLOO group: ") + f"{fb_mesh}")
+
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
 
@@ -145,7 +162,7 @@ def run_full_model(
         pp_mesh,
         ep_size,
         ep_rank,
-    ) = parallelize_deepseek(world_mesh, device, model_args, rank)
+    ) = parallelize_deepseek(world_mesh, device, model_args, rank, fb_gloo_grp)
 
     # build tokenizer
     tokenizer = get_hf_tokenizer(model_id)
@@ -275,14 +292,14 @@ def run_full_model(
 
 
 if __name__ == "__main__":
-    # set device before init_device mesh, otherwise ep will have duplicate device mapping
-    num_device = torch.cuda.device_count()
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_device)
 
     init_logger()
     # we do this to remove a root logger that is added by HF
     # otherwise we get duplicate logs
     remove_notset_root_handlers()
+    
+    os_rank = os.environ["LOCAL_RANK"]
+    logger.info(r_str(f"Rank ") + f"{os_rank}" + " started!")
 
     config_manager = ConfigManager()
     config = config_manager.parse_args()

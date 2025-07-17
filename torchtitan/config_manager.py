@@ -294,6 +294,8 @@ class Parallelism:
     - "never" will disable `reshard_after_forward` for all forward passes.
     """
 
+    forward_backward_parallel_degree: int = 1
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
