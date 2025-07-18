@@ -136,7 +136,7 @@ def parallelize_deepseek(
                 # 현재 모듈의 직접적인 버퍼만 처리 (점이 없는 이름들)
                 for name, buffer in list(module.named_buffers(recurse=False)):
                     if buffer.is_meta:
-                        logger.info(y_str(f"Rank {rank}: ") + f"Materializing meta buffer {name} on GPU {target_device}")
+                        # logger.info(y_str(f"Rank {rank}: ") + f"Materializing meta buffer {name} on GPU {target_device}")
                         # meta buffer를 실제 device에서 초기화
                         new_buffer = torch.empty_like(buffer, device=target_device)
                         # RoPE 관련 버퍼인 경우 적절히 초기화

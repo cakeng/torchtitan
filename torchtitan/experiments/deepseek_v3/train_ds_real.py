@@ -48,7 +48,10 @@ from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import get_device_info
 
-from torch.distributed.pipelining import PipelineStage, Schedule1F1B
+from torch.distributed.pipelining import (PipelineStage, 
+                                          Schedule1F1B,
+                                          ScheduleForwardOnly,
+                                          ScheduleBackwardOnly,)
 
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
@@ -239,8 +242,8 @@ def run_full_model(
         f"{color.green}({device_mem_stats.max_reserved_pct:.2f}%){color.reset}"
     )
 
-    if pp_rank == 0 and ep_rank == 0:
-        print(r_str(f"Rank {rank}: ") + f"{pp_size=}_{pp_rank=}_{ep_size=}_{ep_rank=}_{fb_size=} - Model: \n{model}")
+    # if pp_rank == 0 and ep_rank == 0:
+    #     print(r_str(f"Rank {rank}: ") + f"{pp_size=}_{pp_rank=}_{ep_size=}_{ep_rank=}_{fb_size=} - Model: \n{model}")
 
     # Create loss function
     loss_fn = cross_entropy_loss  # torch.nn.functional.cross_entropy
@@ -284,17 +287,32 @@ def run_full_model(
                 )
 
                 # Create pipeline schedule
-                losses = []
-                pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
-
-                if pp_rank == 0:
-                    y = pp_schedule.step(x)
-                elif pp_rank == pp_size - 1:
-                    # last rank...run loss function
-                    y = pp_schedule.step(target=label, losses=losses)
-                    loss = torch.mean(torch.stack(losses))
+                if fb_dim > 1:
+                    losses = torch.zeros(microbatches, device=device)
+                    if fb_rank == 0:
+                        pp_schedule = ScheduleForwardOnly(stage, microbatches, shared_losses=losses, loss_fn=loss_fn)
+                    else:
+                        pp_schedule = ScheduleBackwardOnly(stage, microbatches, shared_losses=losses, loss_fn=loss_fn)
+                    if pp_rank == 0:
+                        y = pp_schedule.step(x)
+                    elif pp_rank == pp_size - 1:
+                        # last rank...run loss function
+                        y = pp_schedule.step(target=label)
+                        # loss = torch.mean(torch.stack(losses))
+                    else:
+                        pp_schedule.step()
                 else:
-                    pp_schedule.step()
+                    losses = []
+                    pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
+                
+                    if pp_rank == 0:
+                        y = pp_schedule.step(x)
+                    elif pp_rank == pp_size - 1:
+                        # last rank...run loss function
+                        y = pp_schedule.step(target=label, losses=losses)
+                        loss = torch.mean(torch.stack(losses))
+                    else:
+                        pp_schedule.step()
             else:
                 y = model(x)
                 loss = loss_fn(y, label)
