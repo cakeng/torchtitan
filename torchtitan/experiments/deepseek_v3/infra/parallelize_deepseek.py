@@ -48,6 +48,7 @@ def parallelize_deepseek(
     model_args,
     rank: int,
     fb_gloo_grp: dist.ProcessGroup,
+    cpu_gloo_grp: dist.ProcessGroup,
     # parallel_dims: ParallelDims,
     # job_config: JobConfig,
 ):
@@ -98,10 +99,61 @@ def parallelize_deepseek(
     # Instantiate model
     logger.info("")
     with device, world_mesh:
-        model = DeepseekForCausalLM(model_args)
+        if fb_rank == 0:    
+            model = DeepseekForCausalLM(model_args)
+        else:
+            with torch.device("meta"):
+                model = DeepseekForCausalLM(model_args)
     # Load weights
     # load_weights_from_hf(model, model_id, device)
     model.train()
+
+    dist.barrier(group=cpu_gloo_grp)
+    logger.info(g_str(f"Rank {rank}: All processes synchronized."))
+    # Share weights within fb ranks
+    if fb_size > 1:
+        if fb_rank == 0:
+            model.share_memory() # Make model's storage shareable via IPC
+            # Get state dict with shared tensors
+            shared_state_dict = {}
+            for name, param in model.named_parameters():
+                shared_state_dict[name] = param.data
+            
+            print(r_str(f"Rank {rank}: ") + f"Sharing model state dict on GPU {device}")
+            dist.broadcast_object_list([shared_state_dict], group=fb_gloo_grp, group_src=0)
+        else:
+            received_data = [None]
+            print(r_str(f"Rank {rank}: ") + f"Receiving shared model state dict on GPU {device}")
+            dist.broadcast_object_list(received_data, group=fb_gloo_grp, group_src=0)
+            shared_state_dict = received_data[0]
+            
+            if shared_state_dict is not None:
+                # Load shared tensors into model (this will replace meta tensors)
+                model.load_state_dict(shared_state_dict, strict=False, assign=True)
+            
+            # 안전하게 meta buffers만 처리
+            def materialize_meta_buffers(module, target_device):
+                # 현재 모듈의 직접적인 버퍼만 처리 (점이 없는 이름들)
+                for name, buffer in list(module.named_buffers(recurse=False)):
+                    if buffer.is_meta:
+                        logger.info(y_str(f"Rank {rank}: ") + f"Materializing meta buffer {name} on GPU {target_device}")
+                        # meta buffer를 실제 device에서 초기화
+                        new_buffer = torch.empty_like(buffer, device=target_device)
+                        # RoPE 관련 버퍼인 경우 적절히 초기화
+                        if 'inv_freq' in name:
+                            # inv_freq는 특별히 계산해서 초기화해야 함
+                            pass  # 모델 내부에서 lazy 초기화됨
+                        module.register_buffer(name, new_buffer, persistent=False)
+                
+                # 재귀적으로 자식 모듈들 처리
+                for child in module.children():
+                    materialize_meta_buffers(child, target_device)
+            
+            materialize_meta_buffers(model, device)
+            
+            print(r_str(f"Rank {rank}: ") + f"Loaded shared model state dict and materialized buffers on GPU {device}")
+        
+        dist.barrier(group=fb_gloo_grp)
 
     # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
     # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
@@ -118,25 +170,6 @@ def parallelize_deepseek(
 
     # Apply HSDP on root model (lm_head, embeddings, etc)
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
-
-    # Share weights within fb ranks
-    if fb_size > 1:
-        dist.barrier(group=fb_gloo_grp)
-        if fb_rank == 0:
-            model.share_memory() # Make model's storage shareable via IPC
-            params_to_share = [p.data for p in model.parameters()]
-            dist.broadcast_object_list(params_to_share, group=fb_gloo_grp, group_src=0)
-            print(r_str(f"Rank {rank}: ") + f"Sharing model parameters on GPU {device}")
-        else:
-            params_to_share = [p.data for p in model.parameters()]
-            dist.broadcast_object_list(params_to_share, group=fb_gloo_grp, group_src=0)
-            for p_local, p_shared in zip(model.parameters(), params_to_share):
-                p_local.data = p_shared
-
-            print(r_str(f"Rank {rank}: ") + f"Reconstructed model from shared parameters on GPU {device}")
-        dist.barrier(group=fb_gloo_grp)
-
-
 
     # 모델 파트 분리: 파이프라인 병렬화 단계별로 파트 분리
     # pp_size가 1이면 전체 모델, 아니면 각 파이프라인 stage별로 파트 분리

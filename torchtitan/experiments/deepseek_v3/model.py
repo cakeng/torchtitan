@@ -360,8 +360,8 @@ class MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
     def forward(self, x):
-        # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        down_proj = self.compiled_forward(x)
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # down_proj = self.compiled_forward(x)
         return down_proj
 
 
@@ -1002,8 +1002,20 @@ class Attention(nn.Module):
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
             
-    @torch.compile(mode="max-autotune-no-cudagraphs")
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # return self.compiled_forward(hidden_states, attention_mask, position_ids)
+        return self._forward_func(hidden_states, attention_mask, position_ids)
+
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def compiled_forward(self, hidden_states, attention_mask, position_ids):
+        return self._forward_func(hidden_states, attention_mask, position_ids)
+
+    def _forward_func(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,

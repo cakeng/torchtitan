@@ -129,21 +129,47 @@ def run_full_model(
     os_rank = os.environ["LOCAL_RANK"]
     logger.info(r_str(f"OS Rank ") + f"{os_rank}, " + r_str(f"Dist Rank ") + f"{rank}")
 
+    cpu_gloo_grp = dist.new_group(
+        backend="gloo",
+        group_desc="cpu_gloo_group"
+    )
+    # Global synchronization to ensure all processes reach this point before proceeding
+    dist.barrier(group=cpu_gloo_grp)
+    logger.info(g_str(f"Rank {rank}: All processes synchronized."))
+    
     fb_gloo_grp = None
     if fb_dim > 1:
-        fb_mesh = world_mesh["fb"]
-        fb_ranks = fb_mesh.mesh.tolist()
-        fb_gloo_grp = dist.new_group(
-            ranks=fb_ranks,
-            backend="gloo",
-            group_desc="fb_gloo_group"
-        )
-        logger.info(y_str(f"Rank {rank} initialized GLOO group: ") + f"{fb_mesh}")
+        # Get all unique FB groups first
+        all_fb_groups = []
+        for fb_grp_idx in range(dist.get_world_size() // fb_dim):
+            # Calculate ranks for this FB group
+            fb_group_ranks = [fb_grp_idx, fb_grp_idx +  (dist.get_world_size() // fb_dim)]
+            all_fb_groups.append(fb_group_ranks)
+        
+        # All processes must participate in creating all groups
+        logger.info(r_str(f"Rank {rank} creating FB GLOO groups: ") + f"{all_fb_groups}")
+        
+        created_groups = []
+        for group_idx, fb_ranks in enumerate(all_fb_groups):
+            group = dist.new_group(
+                ranks=fb_ranks,
+                backend="gloo",
+                group_desc=f"fb_gloo_group_{group_idx}_{fb_ranks}"
+            )
+            created_groups.append((group, fb_ranks))
+        
+        # Find the group this rank belongs to
+        current_rank = dist.get_rank()
+        for group, fb_ranks in created_groups:
+            if current_rank in fb_ranks:
+                fb_gloo_grp = group
+                logger.info(y_str(f"Rank {rank} assigned to FB GLOO group: ") + f"{fb_ranks}")
+                break
 
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
 
-    logger.info(g_str(f"{rank=}:") + f" {device=}")
+    logger.info(g_str(f"Rank {rank}:") + f" {device=}")
 
     model_args = deepseek_config_registry.get(model_id, None)
     if model_args is None:
@@ -162,7 +188,7 @@ def run_full_model(
         pp_mesh,
         ep_size,
         ep_rank,
-    ) = parallelize_deepseek(world_mesh, device, model_args, rank, fb_gloo_grp)
+    ) = parallelize_deepseek(world_mesh, device, model_args, rank, fb_gloo_grp, cpu_gloo_grp)
 
     # build tokenizer
     tokenizer = get_hf_tokenizer(model_id)
@@ -224,71 +250,71 @@ def run_full_model(
 
     lr_scheduler = build_lr_schedulers(optimizer, config)
 
-    # # Run forward and backward
-    # steps = config.training.steps
+    # Run forward and backward
+    steps = config.training.steps
 
-    # loss = float("inf")
-    # data_iterator = iter(dataloader)
+    loss = float("inf")
+    data_iterator = iter(dataloader)
 
-    # datetime_str = time.strftime("%Y%m%d-%H%M%S")
-    # trace_name = f"ds_real_{pp_size=}_{pp_rank=}_{ep_size=}_{ep_rank=}_{datetime_str}"
+    datetime_str = time.strftime("%Y%m%d-%H%M%S")
+    trace_name = f"ds_real_{fb_rank=}_{pp_rank=}_{ep_rank=}_{datetime_str}"
 
-    # with torch.profiler.profile(
-    #     schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
-    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs', trace_name),
-    #     record_shapes=True,
-    #     profile_memory=True,
-    #     with_stack=True
-    # ) as prof:
-    #     for step in range(10):
-    #         optimizer.zero_grad()
+    with torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs', trace_name),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        for step in range(10):
+            optimizer.zero_grad()
 
-    #         inputs, label = next_batch(data_iterator, metrics_processor)
-    #         x = inputs["input"]
+            inputs, label = next_batch(data_iterator, metrics_processor)
+            x = inputs["input"]
 
-    #         if pp_size > 1:
+            if pp_size > 1:
+                
+                # Create pipeline stage
+                stage = PipelineStage(
+                    model,
+                    pp_rank,
+                    pp_size,
+                    device,
+                    group=pp_mesh.get_group(),
+                )
 
-    #             # Create pipeline stage
-    #             stage = PipelineStage(
-    #                 model,
-    #                 pp_rank,
-    #                 pp_size,
-    #                 device,
-    #                 group=pp_mesh.get_group(),
-    #             )
+                # Create pipeline schedule
+                losses = []
+                pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
 
-    #             # Create pipeline schedule
-    #             losses = []
-    #             pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
+                if pp_rank == 0:
+                    y = pp_schedule.step(x)
+                elif pp_rank == pp_size - 1:
+                    # last rank...run loss function
+                    y = pp_schedule.step(target=label, losses=losses)
+                    loss = torch.mean(torch.stack(losses))
+                else:
+                    pp_schedule.step()
+            else:
+                y = model(x)
+                loss = loss_fn(y, label)
+                loss.backward()
 
-    #             if pp_rank == 0:
-    #                 y = pp_schedule.step(x)
-    #             elif pp_rank == pp_size - 1:
-    #                 # last rank...run loss function
-    #                 y = pp_schedule.step(target=label, losses=losses)
-    #                 loss = torch.mean(torch.stack(losses))
-    #             else:
-    #                 pp_schedule.step()
-    #         else:
-    #             y = model(x)
-    #             loss = loss_fn(y, label)
-    #             loss.backward()
+            if pp_rank == pp_size - 1:
 
-    #         if pp_rank == pp_size - 1:
+                global_avg_loss = global_max_loss = loss  # .detach().item()
 
-    #             global_avg_loss = global_max_loss = loss  # .detach().item()
+                metrics_processor.log(step, global_avg_loss, global_max_loss,
+                                    -1.0)
 
-    #             metrics_processor.log(step, global_avg_loss, global_max_loss,
-    #                                   -1.0)
+            # optimizer.step()
+            # lr_scheduler.step()
 
-    #         # optimizer.step()
-    #         # lr_scheduler.step()
+            prof.step()
+        logger.info("Profiler trace exported to ./profiler_logs/" + trace_name)
 
-    #         prof.step()
-    # logger.info("Profiler trace exported to ./profiler_logs/" + trace_name)
-
-    # metrics_processor.close()
-    # logger.info("Training completed")
+    metrics_processor.close()
+    logger.info("Training completed")
 
 
 if __name__ == "__main__":
@@ -298,9 +324,6 @@ if __name__ == "__main__":
     # otherwise we get duplicate logs
     remove_notset_root_handlers()
     
-    os_rank = os.environ["LOCAL_RANK"]
-    logger.info(r_str(f"Rank ") + f"{os_rank}" + " started!")
-
     config_manager = ConfigManager()
     config = config_manager.parse_args()
 
