@@ -50,6 +50,7 @@ from torchtitan.tools.utils import get_device_info
 
 from torch.distributed.pipelining import (PipelineStage, 
                                           Schedule1F1B,
+                                          ScheduleGPipe,
                                           ScheduleForwardOnly,
                                           ScheduleBackwardOnly,)
 
@@ -148,10 +149,7 @@ def run_full_model(
             # Calculate ranks for this FB group
             fb_group_ranks = [fb_grp_idx, fb_grp_idx +  (dist.get_world_size() // fb_dim)]
             all_fb_groups.append(fb_group_ranks)
-        
-        # All processes must participate in creating all groups
-        logger.info(r_str(f"Rank {rank} creating FB GLOO groups: ") + f"{all_fb_groups}")
-        
+
         created_groups = []
         for group_idx, fb_ranks in enumerate(all_fb_groups):
             group = dist.new_group(
@@ -202,7 +200,8 @@ def run_full_model(
     )
 
     # Synthetic setting
-    microbatches = pp_size * 2
+    microbatches = 4
+    # microbatches = pp_size * 2
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -262,6 +261,9 @@ def run_full_model(
     datetime_str = time.strftime("%Y%m%d-%H%M%S")
     trace_name = f"ds_real_{fb_rank=}_{pp_rank=}_{ep_rank=}_{datetime_str}"
 
+    dist.barrier(group=cpu_gloo_grp)
+    logger.info(g_str(f"Rank {rank}: All processes synchronized."))
+
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs', trace_name),
@@ -269,7 +271,7 @@ def run_full_model(
         profile_memory=True,
         with_stack=True
     ) as prof:
-        for step in range(10):
+        for step in range(1):
             optimizer.zero_grad()
 
             inputs, label = next_batch(data_iterator, metrics_processor)
@@ -284,26 +286,31 @@ def run_full_model(
                     pp_size,
                     device,
                     group=pp_mesh.get_group(),
+                    do_fb_pipeline=(fb_dim > 1),
+                    fb_group=fb_gloo_grp,
+                    global_rank=rank,
                 )
 
                 # Create pipeline schedule
                 if fb_dim > 1:
-                    losses = torch.zeros(microbatches, device=device)
                     if fb_rank == 0:
-                        pp_schedule = ScheduleForwardOnly(stage, microbatches, shared_losses=losses, loss_fn=loss_fn)
+                        pp_schedule = ScheduleForwardOnly(stage, microbatches, loss_fn=loss_fn)
                     else:
-                        pp_schedule = ScheduleBackwardOnly(stage, microbatches, shared_losses=losses, loss_fn=loss_fn)
+                        pp_schedule = ScheduleBackwardOnly(stage, microbatches, loss_fn=loss_fn)
+                    
+                    losses = []
                     if pp_rank == 0:
                         y = pp_schedule.step(x)
                     elif pp_rank == pp_size - 1:
                         # last rank...run loss function
-                        y = pp_schedule.step(target=label)
-                        # loss = torch.mean(torch.stack(losses))
+                        y = pp_schedule.step(target=label, losses=losses)
+                        loss = torch.mean(torch.stack(losses))
                     else:
                         pp_schedule.step()
+
                 else:
                     losses = []
-                    pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
+                    pp_schedule = ScheduleGPipe(stage, microbatches, loss_fn=loss_fn)
                 
                     if pp_rank == 0:
                         y = pp_schedule.step(x)
