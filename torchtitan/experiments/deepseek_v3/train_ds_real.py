@@ -54,6 +54,8 @@ from torch.distributed.pipelining import (PipelineStage,
                                           ScheduleForwardOnly,
                                           ScheduleBackwardOnly,)
 
+from multiprocessing import Manager
+
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
 
@@ -141,7 +143,7 @@ def run_full_model(
     dist.barrier(group=cpu_gloo_grp)
     logger.info(g_str(f"Rank {rank}: All processes synchronized."))
     
-    fb_gloo_grp = None
+    fb_grp = None
     if fb_dim > 1:
         # Get all unique FB groups first
         all_fb_groups = []
@@ -163,7 +165,7 @@ def run_full_model(
         current_rank = dist.get_rank()
         for group, fb_ranks in created_groups:
             if current_rank in fb_ranks:
-                fb_gloo_grp = group
+                fb_grp = group
                 logger.info(y_str(f"Rank {rank} assigned to FB GLOO group: ") + f"{fb_ranks}")
                 break
 
@@ -189,7 +191,7 @@ def run_full_model(
         pp_mesh,
         ep_size,
         ep_rank,
-    ) = parallelize_deepseek(world_mesh, device, model_args, rank, fb_gloo_grp, cpu_gloo_grp)
+    ) = parallelize_deepseek(world_mesh, device, model_args, rank, fb_grp, cpu_gloo_grp)
 
     # build tokenizer
     tokenizer = get_hf_tokenizer(model_id)
@@ -264,6 +266,30 @@ def run_full_model(
     dist.barrier(group=cpu_gloo_grp)
     logger.info(g_str(f"Rank {rank}: All processes synchronized."))
 
+    shared_fwd_cache = None
+    if fb_dim > 1:
+        # For each pair of forward/backward processes, one must create the
+        # shared dictionary and broadcast the proxy object to the other.
+        
+        # The process with fb_rank 0 will be the source.
+        if fb_rank == 0:
+            # Create the manager and the shared dictionary.
+            manager = Manager()
+            shared_fwd_cache = manager.dict()
+            # We need to broadcast the proxy object, not the manager itself.
+            # It must be in a list.
+            object_to_broadcast = [shared_fwd_cache]
+        else:
+            # The receiver process prepares a placeholder list.
+            object_to_broadcast = [None]
+
+        # Broadcast the list containing the proxy object over the fb_grp.
+        # The source is the rank with local_rank 0 within the group.
+        dist.broadcast_object_list(object_to_broadcast, src=0, group=fb_grp)
+        
+        # All processes in the group now have the same proxy object.
+        shared_fwd_cache = object_to_broadcast[0]
+
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs', trace_name),
@@ -279,6 +305,8 @@ def run_full_model(
 
             if pp_size > 1:
                 
+                shared_fwd_cache = Manager().dict() if fb_dim > 1 else None
+
                 # Create pipeline stage
                 stage = PipelineStage(
                     model,
@@ -287,8 +315,9 @@ def run_full_model(
                     device,
                     group=pp_mesh.get_group(),
                     do_fb_pipeline=(fb_dim > 1),
-                    fb_group=fb_gloo_grp,
-                    global_rank=rank,
+                    fb_group=fb_grp,
+                    global_rank=rank, 
+                    shared_fwd_cache=shared_fwd_cache
                 )
 
                 # Create pipeline schedule
@@ -331,9 +360,22 @@ def run_full_model(
 
                 metrics_processor.log(step, global_avg_loss, global_max_loss,
                                     -1.0)
-
+                
+            if fb_dim > 1:
+                # Use a barrier to ensure all processes have finished their backward passes
+                # before we attempt to clear the cache.
+                dist.barrier(group=fb_grp)
+                # Only one rank (the one that created it) should perform the clear operation.
+                if fb_rank == 0:
+                    shared_fwd_cache.clear()
+                # A second barrier ensures no process starts the next step until the
+                # cache is confirmed to be empty.
+                
             # optimizer.step()
             # lr_scheduler.step()
+            if fb_dim > 1:
+                logger.info(g_str(f"Rank {rank}: Step {step} finished - Synchronizing..."))
+                dist.barrier(group=cpu_gloo_grp)
 
             prof.step()
         logger.info("Profiler trace exported to ./profiler_logs/" + trace_name)
