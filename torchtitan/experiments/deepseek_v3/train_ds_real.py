@@ -54,7 +54,9 @@ from torch.distributed.pipelining import (PipelineStage,
                                           ScheduleForwardOnly,
                                           ScheduleBackwardOnly,)
 
+import torch.multiprocessing as mp
 from multiprocessing import Manager
+from multiprocessing.managers import BaseManager
 
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
@@ -268,27 +270,78 @@ def run_full_model(
 
     shared_fwd_cache = None
     if fb_dim > 1:
-        # For each pair of forward/backward processes, one must create the
-        # shared dictionary and broadcast the proxy object to the other.
-        
-        # The process with fb_rank 0 will be the source.
-        if fb_rank == 0:
-            # Create the manager and the shared dictionary.
+        # --- Centralized Manager Creation ---
+        # Only one rank (global rank 0) will create the manager server.
+        # This manager will host one dictionary per pipeline stage.
+        if rank == 0:
             manager = Manager()
-            shared_fwd_cache = manager.dict()
-            # We need to broadcast the proxy object, not the manager itself.
-            # It must be in a list.
-            object_to_broadcast = [shared_fwd_cache]
+            # Create a list of dictionaries, one for each pipeline stage.
+            all_caches = [manager.dict() for _ in range(pp_size)]
+            authkey_bytes = bytes(manager._authkey)
+            # Prepare the connection info and the list of all cache proxies to be broadcast.
+            data_to_broadcast = [manager.address, authkey_bytes, all_caches]
         else:
-            # The receiver process prepares a placeholder list.
-            object_to_broadcast = [None]
+            # All other ranks prepare a placeholder to receive the broadcasted data.
+            data_to_broadcast = [None, None, None]
 
-        # Broadcast the list containing the proxy object over the fb_grp.
-        # The source is the rank with local_rank 0 within the group.
-        dist.broadcast_object_list(object_to_broadcast, src=0, group=fb_grp)
+        # Broadcast the connection info and the list of caches from rank 0 to all other ranks.
+        dist.broadcast_object_list(data_to_broadcast, src=0, group=cpu_gloo_grp)
+
+        # All ranks now extract the connection info and the list of caches.
+        address, authkey_bytes, all_caches = data_to_broadcast
+
+        # If this rank is not the manager host, it must connect as a client.
+        if rank != 0:
+            class SharedCacheManager(BaseManager):
+                pass
+            # Register the 'dict' type so the client knows how to create a proxy for it.
+            SharedCacheManager.register('dict')
+            manager = SharedCacheManager(address=address, authkey=authkey_bytes)
+            manager.connect()
+
+        # Each rank selects the specific dictionary that corresponds to its pipeline stage rank (pp_rank).
+        # This ensures the forward and backward processes of the same stage share the same dictionary.
+        shared_fwd_cache = all_caches[pp_rank]
+
+    # --- Test shared cache functionality ---
+    if fb_dim > 1:
+        logger.info(y_str(f"Rank {rank}: Testing shared forward cache..."))
         
-        # All processes in the group now have the same proxy object.
-        shared_fwd_cache = object_to_broadcast[0]
+        # Use a predictable key based on the pipeline rank, which is shared
+        # by the forward and backward processes of a single stage.
+        test_key = f"pp_stage_{pp_rank}"
+        
+        # The forward process (fb_rank 0) writes a test value.
+        if fb_rank == 0:
+            test_value = f"hello from rank {rank}"
+            shared_fwd_cache[test_key] = test_value
+            logger.info(g_str(f"Rank {rank} (forward):") + f" Wrote key '{test_key}' to shared cache.")
+
+        # Synchronize within the forward-backward pair to ensure the write completes before the read.
+        dist.barrier(group=fb_grp)
+
+        # The backward process (fb_rank 1) reads and verifies the value.
+        if fb_rank != 0:
+            try:
+                retrieved_value = shared_fwd_cache[test_key]
+                logger.info(g_str(f"Rank {rank} (backward):") + f" Successfully read key '{test_key}' with value: '{retrieved_value}'. Cache is working.")
+                # A more robust test could check the value, but existence is a good first step.
+                assert "hello from" in retrieved_value
+            except (KeyError, AssertionError) as e:
+                logger.error(r_str(f"Rank {rank} (backward):") + f" FAILED cache test for key '{test_key}'. Error: {e}. Cache keys: {list(shared_fwd_cache.keys())}")
+                assert False, "Cache test failed."
+
+        # Synchronize again to ensure the backward process has finished reading.
+        dist.barrier(group=fb_grp)
+        
+        # Cleanup: only the forward process should clear the key.
+        if fb_rank == 0:
+            shared_fwd_cache.pop(test_key, None)
+            logger.info(g_str(f"Rank {rank} (forward):") + f" Cleaned up test key '{test_key}'.")
+
+        # Global barrier to ensure all tests are done before proceeding.
+        logger.info(y_str(f"Rank {rank}: Finished testing shared cache. Synchronizing all processes."))
+        dist.barrier(group=cpu_gloo_grp)    
 
     with torch.profiler.profile(
         schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
@@ -304,9 +357,6 @@ def run_full_model(
             x = inputs["input"]
 
             if pp_size > 1:
-                
-                shared_fwd_cache = Manager().dict() if fb_dim > 1 else None
-
                 # Create pipeline stage
                 stage = PipelineStage(
                     model,
@@ -385,6 +435,16 @@ def run_full_model(
 
 
 if __name__ == "__main__":
+
+    try:
+        # Use the 'forkserver' start method if available, as it can be faster
+        # than 'spawn' for repeated process creation. Fall back to 'spawn'.
+        if mp.get_start_method(allow_none=True) is None:
+            mp.set_start_method("spawn")
+    except RuntimeError:
+        # The start method can only be set once.
+        pass
+
 
     init_logger()
     # we do this to remove a root logger that is added by HF

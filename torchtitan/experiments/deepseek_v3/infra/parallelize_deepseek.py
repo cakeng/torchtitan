@@ -113,45 +113,54 @@ def parallelize_deepseek(
     # Share weights within fb ranks
     if fb_size > 1:
         if fb_rank == 0:
-            model.share_memory() # Make model's storage shareable via IPC
-            # Get state dict with shared tensors
-            shared_state_dict = {}
+            # 모든 파라미터를 공유 가능하게 만들기
+            model.share_memory()
+            
+            # 모델 자체를 프로세스 간 공유 가능한 객체로 만들기
+            import torch.multiprocessing as mp
+            
+            # 모델을 공유 메모리에 저장
+            shared_model_state = {}
             for name, param in model.named_parameters():
-                shared_state_dict[name] = param.data
+                # GPU 텐서를 공유 가능하게 설정
+                shared_model_state[name] = param.data.share_memory_()
             
-            print(r_str(f"Rank {rank}: ") + f"Sharing model state dict on GPU {device}")
-            dist.broadcast_object_list([shared_state_dict], group=fb_gloo_grp, group_src=0)
+            print(r_str(f"Rank {rank}: ") + f"Model parameters set to shared memory on GPU {device}")
+            
+            # 다른 rank들이 모델을 초기화할 때까지 대기
+            dist.barrier(group=fb_gloo_grp)
+            
+            # 공유된 파라미터 정보 브로드캐스트
+            param_info = {name: param.data for name, param in model.named_parameters()}
+            dist.broadcast_object_list([param_info], group=fb_gloo_grp, group_src=0)
         else:
-            received_data = [None]
-            print(r_str(f"Rank {rank}: ") + f"Receiving shared model state dict on GPU {device}")
-            dist.broadcast_object_list(received_data, group=fb_gloo_grp, group_src=0)
-            shared_state_dict = received_data[0]
+            # 다른 rank들은 같은 모델 구조 생성 후 공유 파라미터 연결
+            dist.barrier(group=fb_gloo_grp)
             
-            if shared_state_dict is not None:
-                # Load shared tensors into model (this will replace meta tensors)
-                model.load_state_dict(shared_state_dict, strict=False, assign=True)
+            received_params = [None]
+            dist.broadcast_object_list(received_params, group=fb_gloo_grp, group_src=0)
+            shared_params = received_params[0]
             
-            # 안전하게 meta buffers만 처리
+            # 공유된 파라미터로 모델 파라미터 교체
+            for name, param in model.named_parameters():
+                if name in shared_params:
+                    param.data = shared_params[name]
+            
+            # meta buffers 처리
             def materialize_meta_buffers(module, target_device):
-                # 현재 모듈의 직접적인 버퍼만 처리 (점이 없는 이름들)
                 for name, buffer in list(module.named_buffers(recurse=False)):
                     if buffer.is_meta:
-                        # logger.info(y_str(f"Rank {rank}: ") + f"Materializing meta buffer {name} on GPU {target_device}")
-                        # meta buffer를 실제 device에서 초기화
                         new_buffer = torch.empty_like(buffer, device=target_device)
-                        # RoPE 관련 버퍼인 경우 적절히 초기화
                         if 'inv_freq' in name:
-                            # inv_freq는 특별히 계산해서 초기화해야 함
                             pass  # 모델 내부에서 lazy 초기화됨
                         module.register_buffer(name, new_buffer, persistent=False)
                 
-                # 재귀적으로 자식 모듈들 처리
                 for child in module.children():
                     materialize_meta_buffers(child, target_device)
             
             materialize_meta_buffers(model, device)
             
-            print(r_str(f"Rank {rank}: ") + f"Loaded shared model state dict and materialized buffers on GPU {device}")
+            print(r_str(f"Rank {rank}: ") + f"Connected to shared model parameters on GPU {device}")
         
         dist.barrier(group=fb_gloo_grp)
 
