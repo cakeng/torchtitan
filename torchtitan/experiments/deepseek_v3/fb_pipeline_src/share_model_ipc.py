@@ -1,4 +1,7 @@
+import subprocess
 import os
+import json
+import shutil
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -41,7 +44,7 @@ def share_model_parameters_ipc(
             # Store original tensor reference to prevent deallocation
             original_tensors[name] = tensor
             
-            handle, shared_tensor = torch_ipc_extension.copy_tensor_and_get_ipc(tensor)
+            shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(tensor)
             device = torch.device("cuda", torch.cuda.current_device())
             device_index = device.index if hasattr(device, "index") else device
             device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
@@ -72,7 +75,7 @@ def share_model_parameters_ipc(
             assert device_uuid == source_uuid, \
                 r_str("Source tensor and destination tensor must be on the same device.") + \
                 f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
-            shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
+            shared_tensor, handle_ptr = torch_ipc_extension.open_ipc_and_get_tensor(
                 handle, device, dtype, shape, stride, storage_offset)
             _set_param_or_buffer(model, name, shared_tensor)
             
@@ -101,7 +104,7 @@ def create_and_share_tensor_ipc(
     
     if rank == src_rank:
         assert torch.Size(shape).numel() >= 1, "Tensors with fewer than 1 elements are not supported by IPC."
-        handle, shared_tensor = torch_ipc_extension.create_tensor_and_get_ipc(
+        shared_tensor, handle = torch_ipc_extension.create_tensor_and_get_ipc(
             shape, dtype, device
         )
         # Get the device UUID for more robust device identification
@@ -119,7 +122,7 @@ def create_and_share_tensor_ipc(
         assert device_uuid == source_uuid, \
             r_str("Source tensor and destination tensor must be on the same device.") + \
             f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
-        shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
+        shared_tensor, handle_ptr = torch_ipc_extension.open_ipc_and_get_tensor(
             handle, device, dtype, shape, stride, storage_offset)
 
     dist.barrier(group=group)
@@ -140,7 +143,7 @@ def copy_and_share_tensor_ipc(
         # Keep reference to original tensor during IPC creation
         original_tensor_ref = tensor
         
-        handle, shared_tensor = torch_ipc_extension.copy_tensor_and_get_ipc(tensor)
+        shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(tensor)
         device = torch.device("cuda", torch.cuda.current_device())
         device_index = device.index if hasattr(device, "index") else device
         device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
@@ -164,7 +167,7 @@ def copy_and_share_tensor_ipc(
         assert device_uuid == source_uuid, \
             r_str("Source tensor and destination tensor must be on the same device.") + \
             f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
-        shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
+        shared_tensor, handle_ptr = torch_ipc_extension.open_ipc_and_get_tensor(
             handle, device, dtype, shape, stride, storage_offset)
         
     dist.barrier(group=group)      
@@ -192,48 +195,192 @@ def _set_param_or_buffer(model, name, new_tensor):
     if old_tensor is not None:
         del old_tensor
 
-def verify_no_memory_leaks():
-    """Helper function to verify memory usage."""
-    import gc
-    torch.cuda.empty_cache()
-    gc.collect()
-    return torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+def get_driver_memory_usage(device_index: int):
+    """
+    Gets the used and total GPU memory for the current process directly from
+    the driver for a specific device.
+
+    This function is useful for verifying memory allocated outside of PyTorch's
+    default caching allocator, such as memory allocated via a custom C++
+    extension like the one we built.
+
+    Args:
+        device_index: The index of the GPU device (e.g., 0).
+
+    Returns:
+        A tuple of (used_memory_mb, total_memory_mb).
+        Returns (None, None) if the driver tool is not found or parsing fails.
+    """
+    pid = os.getpid()
+    used_mb = None
+    total_mb = None
+
+    # Case 1: NVIDIA GPUs using nvidia-smi
+    nvidia_smi_path = shutil.which("nvidia-smi")
+    if nvidia_smi_path:
+        try:
+            # Get total memory for the specified device
+            total_cmd = [
+                nvidia_smi_path,
+                f"--query-gpu=memory.total",
+                f"--format=csv,noheader,nounits",
+                f"--id={device_index}"
+            ]
+            result = subprocess.run(
+                total_cmd, capture_output=True, text=True, check=True
+            )
+            total_mb = int(result.stdout.strip())
+
+            # Get memory used by the current process
+            used_cmd = [
+                nvidia_smi_path,
+                "--query-compute-apps=pid,used_gpu_memory",
+                "--format=csv,noheader,nounits"
+            ]
+            result = subprocess.run(
+                used_cmd, capture_output=True, text=True, check=True
+            )
+            
+            used_mb = 0 # Default to 0 if process not found
+            for line in result.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                proc_pid, mem_used = line.split(", ")
+                if int(proc_pid) == pid:
+                    used_mb = int(mem_used)
+                    break
+            
+            return used_mb, total_mb
+        except Exception as e:
+            print(f"Error processing nvidia-smi output: {e}")
+            return None, None
+
+    # Case 2: AMD GPUs using rocm-smi
+    rocm_smi_path = shutil.which("rocm-smi")
+    if rocm_smi_path:
+        try:
+            # Query the specific device and get output in JSON format
+            cmd = [
+                rocm_smi_path, "-d", str(device_index), 
+                "--showmeminfo", "vram", "--showuse", "--json"
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True
+            )
+            data = json.loads(result.stdout)
+            
+            card_key = f"card{device_index}"
+            card_data = data[card_key]
+            
+            # Get total memory
+            total_vram_str = card_data.get("VRAM Total Memory (B)")
+            
+            total_mb = -1  # Default to -1 if not found
+            total_mb = int(total_vram_str)
+
+            # Get memory used by the current process (fallback to total used if per-process not available)
+            used_mb = -1  # Default to -1 if not found
+            used_vram_str = card_data.get("VRAM Total Used Memory (B)")
+            if used_vram_str is not None:
+                used_mb = int(used_vram_str)
+            
+            return used_mb, total_mb
+        except Exception as e:
+            print(f"Error processing rocm-smi output: {e}")
+            return None, None
+
+    print("Could not find 'nvidia-smi' or 'rocm-smi' in PATH.")
+    return None, None
 
 def test_memory_management(rank, device):
     """Test to verify no memory leaks in IPC tensor operations."""
     if rank == 0:
         print(f"\n[Rank {rank}] Testing memory management...")
     
-    initial_allocated, initial_reserved = verify_no_memory_leaks()
-    
     # Test 1: Create and share multiple tensors
-    tensors = []
-    for i in range(5):
-        shape = (1000, 1000)
-        dtype = torch.float32
-        shared_tensor = create_and_share_tensor_ipc(shape, dtype, device, src_rank=0)
-        tensors.append(shared_tensor)
-    
-    mid_allocated, mid_reserved = verify_no_memory_leaks()
-    
-    # Test 2: Delete references and check memory cleanup
-    del tensors
-    torch.cuda.synchronize()  # Ensure CUDA operations complete
-    
-    final_allocated, final_reserved = verify_no_memory_leaks()
-    
-    if rank == 0:
-        print(f"Memory usage - Initial: {initial_allocated/1024**2:.2f}MB, "
-              f"Peak: {mid_allocated/1024**2:.2f}MB, "
-              f"Final: {final_allocated/1024**2:.2f}MB")
+    configs = [
+        # Small tensors
+        (torch.Size([8, 8]), torch.float32, 2),
+        (torch.Size([16, 16]), torch.float16, 2),
+        (torch.Size([32,]), torch.int32, 4),
+        (torch.Size([32,]), torch.int8, 4),
+        # Medium tensors
+        (torch.Size([128, 64]), torch.float32, 4),
+        (torch.Size([256, 128]), torch.float16, 4),
+        (torch.Size([128, 128]), torch.int64, 2),
+        (torch.Size([128, 128]), torch.uint8, 2),
+        # Large tensors
+        (torch.Size([1024, 512]), torch.float32, 8),
+        (torch.Size([2048, 256]), torch.float16, 8),
+        (torch.Size([512, 512]), torch.int32, 4),
+        # Large number of allocs
+        (torch.Size([128, 64]), torch.float32, 512),
+        (torch.Size([256, 128]), torch.float16, 256),
+        (torch.Size([128, 128]), torch.int64, 100),
+        (torch.Size([128, 128]), torch.uint8, 2000),
+        # Very large tensor (stress test, reduce num_alloc for safety)
+        (torch.Size([1024, 1024, 1024]), torch.float32, 1),
+        (torch.Size([512, 1024, 1024]), torch.float16, 3),
+    ]
+
+    for i, (shape, dtype, num_alloc) in enumerate(configs):
+
+        initial_allocated, _ = get_driver_memory_usage(device.index)
+        dist.barrier()
+
+        tensors = []
+        for i in range(num_alloc):
+            shared_tensor = create_and_share_tensor_ipc(shape, dtype, device, src_rank=0)
+            tensors.append(shared_tensor)
+        if rank == 0:
+            size = shared_tensor.element_size() * shared_tensor.numel()
+            if size < 2 * 1024 * 1024:
+                # The driver allocates in 2MiB chunks, so we need to round up
+                size = 2 * 1024 * 1024
+            size *= num_alloc
+        dist.barrier()
         
-        # Allow some tolerance for memory management overhead
-        memory_increase = final_allocated - initial_allocated
-        if memory_increase > 100 * 1024 * 1024:  # 100MB tolerance
-            print(y_str(f"Warning: Potential memory leak detected. Increase: {memory_increase/1024**2:.2f}MB"))
-        else:
+        mid_allocated, _ = get_driver_memory_usage(device.index)
+
+        dist.barrier()
+        
+        # Test 2: Delete references and check memory cleanup
+        shared_tensor = None
+        del tensors
+        import gc
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.synchronize()  # Ensure CUDA operations complete
+
+        dist.barrier()
+        
+        final_allocated, _ = get_driver_memory_usage(device.index)
+        
+        if rank == 0:
+            print (f"--- Test {i+1}, config: shape={shape}, dtype={dtype}, num_alloc={num_alloc}, size={size/1024**2:.3f}MB ---")
+            print(f"Memory usage - Initial: {initial_allocated/1024**2:.2f}MB, "
+                f"Peak: {mid_allocated/1024**2:.2f}MB, "
+                f"Final: {final_allocated/1024**2:.2f}MB")
             
-            print(g_str("✓ Memory management test passed"))
+            # Allow some tolerance for memory management overhead
+            fail = False
+            d_alloc = (mid_allocated - initial_allocated) - size 
+            if abs(d_alloc)  > 4 * 1024 * 1024:  # 4MB tolerance
+                fail = True
+                print(r_str(f"Warning: Potential memory allocation problem detected. "
+                            f"Allocation Delta: {d_alloc/1024**2:.2f}MB, expected {size/1024**2:.2f}MB"))
+
+            d_alloc = final_allocated - initial_allocated
+            # There seems to be a constant overhead for managing the
+            # closed IPC handles, but this is not a leak
+            # as it does not scale with the number or the size of the tensors.
+            if abs(d_alloc) > 4 * 1024 * 1024:  # 4MB tolerance
+                fail = True
+                print(r_str(f"Warning: Potential memory leak detected. Final Delta: {d_alloc/1024**2:.2f}MB"))
+            
+            if not fail:
+                print(g_str("✓ Memory management test passed"))
+    
 
 class SimpleModel(nn.Module):
     """A basic model for initial testing."""
@@ -694,7 +841,7 @@ def main():
     dist.barrier()
     if rank == 0:
         print("\n--- DeepSeek-V2-Lite Test PASSED ---")
-        print("\nAll verification successful on all ranks!")
+        print(g_str("\nAll verification successful on all ranks!"))
 
 if __name__ == "__main__":
     if "torch_ipc_extension" in globals():

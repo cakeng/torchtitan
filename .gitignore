@@ -2,6 +2,9 @@ __pycache__
 .idea
 .DS_Store
 *.egg-info
+*.json
+*.tmp
+*.egg
 build
 outputs
 dist/*
