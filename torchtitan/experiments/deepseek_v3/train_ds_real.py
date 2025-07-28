@@ -114,12 +114,10 @@ def run_full_model(
     pp_dim = config.parallelism.pipeline_parallel_degree
     ep_dim = config.parallelism.expert_parallel_degree
     fb_dim = config.parallelism.forward_backward_parallel_degree
-    assert fb_dim <= 2, "Forward-backward parallelism cannot have a degree more than 2."
+    assert fb_dim <= 3, "Forward-backward parallelism cannot have a degree more than 2."
     if not ep_dim:
-        # TODO - the fix for config extension is in PR...need it to land
-        # logger.info(f"No EP degree specified, {ep_dim=}")
-        ep_dim = 2
-        logger.info("Using default EP degree 2")
+        ep_dim = 3
+        logger.info("Using default EP degree 3")
 
     fsdp_dim = config.parallelism.data_parallel_shard_degree
 

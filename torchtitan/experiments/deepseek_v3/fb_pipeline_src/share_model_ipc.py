@@ -62,10 +62,12 @@ def share_model_parameters_ipc(
             del original_tensors[name]
         
         object_to_broadcast = [handles_and_meta]
-        dist.broadcast_object_list(object_to_broadcast, src=src_rank, group=group)
+        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
+        dist.broadcast_object_list(object_to_broadcast, src=src_global_rank, group=group)
     else:
         received_objects = [None]
-        dist.broadcast_object_list(received_objects, src=src_rank, group=group)
+        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
+        dist.broadcast_object_list(received_objects, src=src_global_rank, group=group)
         handles_and_meta = received_objects[0]
         
         for name, handle, shape, dtype, stride, storage_offset, source_uuid in handles_and_meta:
@@ -112,10 +114,12 @@ def create_and_share_tensor_ipc(
         device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
         meta = (handle, shape, dtype, shared_tensor.stride(), 0, device_uuid)
         object_to_broadcast = [meta]
-        dist.broadcast_object_list(object_to_broadcast, src=src_rank, group=group)
+        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
+        dist.broadcast_object_list(object_to_broadcast, src=src_global_rank, group=group)
     else:
         received_objects = [None]
-        dist.broadcast_object_list(received_objects, src=src_rank, group=group)
+        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
+        dist.broadcast_object_list(received_objects, src=src_global_rank, group=group)
         handle, shape, dtype, stride, storage_offset, source_uuid = received_objects[0]
         device_index = device.index if hasattr(device, "index") else device
         device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
@@ -153,13 +157,15 @@ def copy_and_share_tensor_ipc(
             device_uuid
         )
         object_to_broadcast = [meta]
-        dist.broadcast_object_list(object_to_broadcast, src=src_rank, group=group)
+        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
+        dist.broadcast_object_list(object_to_broadcast, src=src_global_rank, group=group)
         
         # Clear reference after successful sharing
         del original_tensor_ref
     else:
         received_objects = [None]
-        dist.broadcast_object_list(received_objects, src=src_rank, group=group)
+        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
+        dist.broadcast_object_list(received_objects, src=src_global_rank, group=group)
         handle, shape, dtype, stride, storage_offset, source_uuid = received_objects[0]
         device = torch.device("cuda", torch.cuda.current_device())
         device_index = device.index if hasattr(device, "index") else device
