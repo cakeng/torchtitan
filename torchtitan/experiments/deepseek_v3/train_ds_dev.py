@@ -23,7 +23,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleBackwardOnly, ScheduleForwardOnly
 from accelerate import init_empty_weights
-from fb_pipeline_src.share_model_ipc import share_model_parameters_ipc, create_and_share_tensor_ipc
+from fb_pipeline_src.share_model_ipc import (share_model_parameters_ipc, 
+                                             create_and_share_tensor_ipc,
+                                             copy_and_share_tensor_ipc)
 
 
 # Use DeepSeek-V2-Lite as a proxy
@@ -149,7 +151,7 @@ def run_full_model(
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
 
     # Synthetic setting
-    microbatches = 8
+    microbatches = 6
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -164,8 +166,65 @@ def run_full_model(
     label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
 
     # Create loss function
-    loss_fn = torch.nn.functional.cross_entropy
+    loss_fn = torch.nn.functional.cross_entropy 
 
+    shared_forward_cache = None
+    if fbbp_size > 1:
+        print(b_str(f"Rank {rank} ") + f"Capturing forward cache")
+        dist.barrier(group=global_cpu_grp)
+        # Capture forward cache
+        if pp_size > 1:
+            # Create pipeline stage
+            stage = PipelineStage(
+                model,
+                pp_rank,
+                pp_size,
+                device,
+                group=pp_mesh.get_group(),
+                do_fbbp=False,
+                fbbp_group=fbbp_grp,
+                global_rank=rank,
+                shared_fwd_cache=shared_forward_cache,
+            )
+            pp_schedule = ScheduleForwardOnly(stage, microbatches, loss_fn=loss_fn,
+                                              sample_fwd_cache=True)
+
+            if pp_rank == 0:
+                y = pp_schedule.step(x)
+            else:
+                pp_schedule.step()
+
+            dist.barrier(group=global_cpu_grp)
+
+            # Create shared forward cache
+            (sample_output_tuple, sample_flatten_input_tensors) = stage.fwd_cache[0]
+            shared_forward_cache = {}
+            shared_forward_str_cache = {}
+            num_cache = pp_size * 3 if fbbp_size > 2 else  int(pp_size * 1.5 + 0.6)
+            for i in range(num_cache):
+                output_tuple_list = []
+                flatten_input_tensors_list = []
+                output_tuple_str_list = []
+                flatten_input_tensors_str_list = []
+                for t in sample_output_tuple:
+                    shared_t = copy_and_share_tensor_ipc(t, fbbp_grp)
+                    output_tuple_list.append(shared_t)
+                    output_tuple_str_list.append(str(shared_t.size()))
+                for t in sample_flatten_input_tensors:
+                    shared_t = copy_and_share_tensor_ipc(t, fbbp_grp)
+                    flatten_input_tensors_list.append(shared_t)
+                    flatten_input_tensors_str_list.append(str(shared_t.size()))
+                output_tuple = tuple(output_tuple_list)
+                flatten_input_tensors = tuple(flatten_input_tensors_list)
+                output_tuple_str = str(output_tuple_str_list)
+                flatten_input_tensors_str = str(flatten_input_tensors_str_list)
+                shared_forward_cache[i] = (output_tuple, flatten_input_tensors)
+                shared_forward_str_cache[i] = (output_tuple_str, flatten_input_tensors_str)
+            
+            print(b_str(f"Rank {rank} ") + f"Finished capturing forward cache:\n" +
+                  r_str(f"Sample forward cache: ") + f"{stage._get_fwd_cache_state_str()}\n" +
+                  g_str(f"Shared forward cache: ") + f"{shared_forward_str_cache}")    
+            
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}")
     dist.barrier(group=global_cpu_grp)
 
@@ -183,6 +242,7 @@ def run_full_model(
                 do_fbbp=(fbbp_size > 1),
                 fbbp_group=fbbp_grp,
                 global_rank=rank,
+                shared_fwd_cache=shared_forward_cache,
             )
 
             # Create pipeline schedule

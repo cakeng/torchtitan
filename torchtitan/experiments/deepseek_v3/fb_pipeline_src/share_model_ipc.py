@@ -658,10 +658,103 @@ def test_single_tensor_sharing(rank, device):
     if rank == 0:
         print(g_str(f"\n[Rank {rank}] All single tensor sharing tests completed successfully!"))
 
+def debug_backward_grads_issue():
+    """
+    Add debugging functionality to track when grads become None
+    """
+    import torch.distributed.pipelining._backward as backward_module
+    
+    # Monkey patch the backward functions to add debugging
+    original_stage_backward = backward_module.stage_backward
+    original_stage_backward_input = backward_module.stage_backward_input
+    original_stage_backward_weight = backward_module.stage_backward_weight
+    
+    def debug_stage_backward(stage_output, output_grads, input_values):
+        print(f"[DEBUG] stage_backward called:")
+        print(f"  stage_output type: {type(stage_output)}")
+        print(f"  output_grads type: {type(output_grads)}")
+        print(f"  input_values type: {type(input_values)}")
+        if isinstance(stage_output, torch.Tensor):
+            print(f"  stage_output.requires_grad: {stage_output.requires_grad}")
+        if output_grads is not None:
+            if isinstance(output_grads, (list, tuple)):
+                print(f"  output_grads length: {len(output_grads)}")
+                for i, grad in enumerate(output_grads):
+                    if isinstance(grad, torch.Tensor):
+                        print(f"  output_grads[{i}].shape: {grad.shape}")
+            elif isinstance(output_grads, torch.Tensor):
+                print(f"  output_grads.shape: {output_grads.shape}")
+        
+        result = original_stage_backward(stage_output, output_grads, input_values)
+        
+        print(f"[DEBUG] stage_backward result:")
+        print(f"  result type: {type(result)}")
+        if isinstance(result, tuple) and len(result) > 0:
+            grads = result[0]
+            print(f"  grads type: {type(grads)}")
+            if grads is None:
+                print(r_str("  ⚠ WARNING: grads is None!"))
+            elif isinstance(grads, (list, tuple)):
+                print(f"  grads length: {len(grads)}")
+                for i, grad in enumerate(grads):
+                    print(f"  grads[{i}]: {type(grad)} {grad.shape if isinstance(grad, torch.Tensor) else 'N/A'}")
+        
+        return result
+    
+    def debug_stage_backward_input(stage_output, output_grads, input_values, parameters):
+        print(f"[DEBUG] stage_backward_input called:")
+        print(f"  stage_output type: {type(stage_output)}")
+        print(f"  output_grads type: {type(output_grads)}")
+        print(f"  input_values type: {type(input_values)}")
+        print(f"  parameters count: {len(list(parameters)) if parameters else 0}")
+        
+        result = original_stage_backward_input(stage_output, output_grads, input_values, parameters)
+        
+        print(f"[DEBUG] stage_backward_input result:")
+        print(f"  result type: {type(result)}")
+        if isinstance(result, tuple) and len(result) > 0:
+            grads = result[0]
+            print(f"  grads type: {type(grads)}")
+            if grads is None:
+                print(r_str("  ⚠ WARNING: grads is None!"))
+            elif isinstance(grads, (list, tuple)):
+                print(f"  grads length: {len(grads)}")
+                for i, grad in enumerate(grads):
+                    print(f"  grads[{i}]: {type(grad)} {grad.shape if isinstance(grad, torch.Tensor) else 'N/A'}")
+        
+        return result
+    
+    def debug_stage_backward_weight(parameters, param_groups):
+        print(f"[DEBUG] stage_backward_weight called:")
+        print(f"  parameters count: {len(list(parameters)) if parameters else 0}")
+        print(f"  param_groups type: {type(param_groups)}")
+        
+        result = original_stage_backward_weight(parameters, param_groups)
+        
+        print(f"[DEBUG] stage_backward_weight result:")
+        print(f"  result type: {type(result)}")
+        if isinstance(result, tuple) and len(result) > 0:
+            grads = result[0]
+            print(f"  grads type: {type(grads)}")
+            if grads is None:
+                print(r_str("  ⚠ WARNING: grads is None!"))
+        
+        return result
+    
+    # Apply the monkey patches
+    backward_module.stage_backward = debug_stage_backward
+    backward_module.stage_backward_input = debug_stage_backward_input
+    backward_module.stage_backward_weight = debug_stage_backward_weight
+    
+    print(g_str("✓ Applied debugging patches to backward functions"))
+
 def main():
     """Main execution function with robust unit tests."""
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires a CUDA/HIP enabled GPU.")
+
+    # Apply debugging patches early
+    debug_backward_grads_issue()
 
     dist.init_process_group("gloo")
     
