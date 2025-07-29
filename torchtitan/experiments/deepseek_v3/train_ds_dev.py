@@ -295,9 +295,9 @@ if __name__ == "__main__":
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_gpus)
 
     mesh = dist.init_device_mesh("cuda", (3, 2, 2, 1), 
-                                 mesh_dim_names=("fbbp", "pp", "ep", "fsdp"))
+                                 mesh_dim_names=("mbp", "pp", "ep", "fsdp"))
     
-    assert num_gpus >= mesh.size() // mesh["fbbp"].size()
+    assert num_gpus >= mesh.size() // mesh["mbp"].size()
 
     run_full_model(mesh)
 
