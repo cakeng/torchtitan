@@ -3,9 +3,18 @@
 #include <c10/core/Storage.h>
 #include <ATen/ATen.h>
 #include <ATen/EmptyTensor.h> // For at::empty
+#include <memory>
 #include <iostream>
 #include <iomanip>
 #include <vector>
+#include <atomic>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <string>
+#include <stdexcept>
+#include <cstring> // For strerror
+#include <cerrno>  // For errno
 
 // Conditionally include the correct exception header and stream headers
 // based on the platform.
@@ -19,8 +28,61 @@
 
 // #define _PRINT_DEBUG 1
 
-// Define the IPC memory handle structure, which is 64 bytes for both
-// CUDA and HIP.
+// The data structure to be placed in shared memory
+struct SharedLockData {
+    std::atomic_flag lock_flag = ATOMIC_FLAG_INIT;
+};
+
+class SharedLock {
+public:
+    // Constructor initializes or attaches to a named shared memory segment
+    SharedLock(const std::string& name) : name_(name) {
+        std::string shm_name = "/" + name;
+        int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
+        if (fd == -1) throw std::runtime_error(
+            "shm_open failed for name " + shm_name + 
+            ": " + std::strerror(errno)
+        );
+        
+        ftruncate(fd, sizeof(SharedLockData));
+        data_ = static_cast<SharedLockData*>(mmap(
+            nullptr, sizeof(SharedLockData),
+            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0
+        ));
+        close(fd);
+        if (data_ == MAP_FAILED) throw std::runtime_error(
+            "mmap failed for name " + shm_name + 
+            ": " + std::strerror(errno)
+        );
+    }
+
+    // Destructor to unmap the shared memory segment
+    ~SharedLock() {
+        if (data_ != nullptr && data_ != MAP_FAILED) {
+            munmap(data_, sizeof(SharedLockData));
+        }
+    }
+
+    void acquire() {
+        while (data_->lock_flag.test_and_set(std::memory_order_acquire));
+    }
+
+    void release() {
+        data_->lock_flag.clear(std::memory_order_release);
+    }
+
+    static void destroy(const std::string& name) {
+        std::string shm_name = "/" + name;
+        shm_unlink(shm_name.c_str());
+    }
+
+    const std::string& get_name() const { return name_; }
+
+private:
+    std::string name_;
+    SharedLockData* data_;
+};
+
 struct IpcMemHandle {
     char reserved[64];
 };
@@ -29,19 +91,14 @@ struct IpcMemHandle {
 struct IpcAllocationContext {
     void* base_ptr;
     IpcMemHandle handle;
+    std::unique_ptr<SharedLock> lock; // Use a unique_ptr for ownership
 };
 
 // --- Custom Allocator for IPC-enabled memory ---
-// This allocator calls cuda/hipMalloc directly to ensure each allocation is a
-// unique memory region suitable for IPC. This means the allocation will NOT
-// be tracked by torch.cuda.memory_allocated().
 class IpcAllocator final : public c10::Allocator {
 public:
     IpcAllocator() {}
     c10::DataPtr allocate(size_t nbytes) override {
-        // Using hip/cudaMalloc directly is essential to guarantee that we get
-        // a new, unique memory allocation from the driver, which is required
-        // for creating a valid IPC handle.
         void* base_ptr{nullptr};
 #ifdef USE_HIP
         C10_HIP_CHECK(hipMalloc(&base_ptr, nbytes));
@@ -52,7 +109,6 @@ public:
         auto* ctx = new IpcAllocationContext();
         ctx->base_ptr = base_ptr;
 
-        // Get the IPC handle for the newly allocated memory.
 #ifdef USE_HIP
         C10_HIP_CHECK(hipIpcGetMemHandle(
             reinterpret_cast<hipIpcMemHandle_t*>(&ctx->handle), base_ptr));
@@ -61,14 +117,11 @@ public:
             reinterpret_cast<cudaIpcMemHandle_t*>(&ctx->handle), base_ptr));
 #endif
 
-        // Get the specific device for the current context.
 #ifdef USE_HIP
         c10::Device actual_device = c10::hip::getCurrentHIPStream().device();
 #else
         c10::Device actual_device = c10::cuda::getCurrentCUDAStream().device();
 #endif
-
-        // Report the device as 'cuda' for compatibility with the frontend.
         c10::Device reported_device(c10::kCUDA, actual_device.index());
 
         return {base_ptr, ctx, &ipc_deleter, reported_device};
@@ -83,16 +136,15 @@ public:
     }
 
 private:
-    // This deleter function now frees the memory directly.
     static void ipc_deleter(void* ctx_ptr) {
         auto* ctx = static_cast<IpcAllocationContext*>(ctx_ptr);
+        if (!ctx) return;
 #ifdef _PRINT_DEBUG
         std::cout << "--- [DEBUG IPC DELETER] ---" << std::endl;
         std::cout << "\tFreeing base_ptr via hip/cudaFree: " << ctx->base_ptr << std::endl;
         std::cout << "--------------------------" << std::endl;
 #endif
-        // FIXED: Do not throw exceptions from a deleter.
-        // Call the function directly and print a warning on failure.
+
 #ifdef USE_HIP
         hipError_t err = hipFree(ctx->base_ptr);
         if (err != hipSuccess) {
@@ -104,15 +156,39 @@ private:
             fprintf(stderr, "WARNING: cudaFree failed in IpcAllocator::ipc_deleter with error %d\n", err);
         }
 #endif
+        // Explicitly destroy the OS-level shared memory resource
+        if (ctx->lock) {
+            SharedLock::destroy(ctx->lock->get_name());
+        }
         delete ctx;
     }
 };
 
-// Create a single, global instance of the allocator.
-// This ensures all IPC tensors created by this extension share the exact same
-// allocator instance, preventing reference counting issues.
 static IpcAllocator g_ipc_allocator;
 
+std::string generate_lock_name_from_handle(const IpcMemHandle& handle) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    const unsigned char* ptr = reinterpret_cast<const unsigned char*>(&handle);
+    for (size_t i = 0; i < sizeof(handle); ++i) {
+        oss << std::setw(2) << static_cast<int>(ptr[i]);
+    }
+    return oss.str();
+}
+
+IpcAllocationContext* get_ctx_from_tensor(const torch::Tensor& tensor) {
+    auto* ctx = static_cast<IpcAllocationContext*>(tensor.storage().data_ptr().get_context());
+    TORCH_CHECK(ctx && ctx->lock, "Tensor does not have a valid IPC lock context.");
+    return ctx;
+}
+
+void acquire_lock_for_tensor(const torch::Tensor& tensor) {
+    get_ctx_from_tensor(tensor)->lock->acquire();
+}
+
+void release_lock_for_tensor(const torch::Tensor& tensor) {
+    get_ctx_from_tensor(tensor)->lock->release();
+}
 
 // Helper function to print bytes from GPU memory for debugging
 void print_gpu_bytes(const void* gpu_ptr, size_t nbytes = 10) {
@@ -146,8 +222,6 @@ void print_ipc_handle(const IpcMemHandle& handle) {
     std::cout << std::dec << std::endl;
 }
 
-
-// --- Create tensor using the custom allocator ---
 py::tuple create_tensor_and_get_ipc(
     c10::IntArrayRef shape,
     at::ScalarType dtype,
@@ -162,19 +236,20 @@ py::tuple create_tensor_and_get_ipc(
     auto numel = c10::multiply_integers(shape);
     const auto storage_nbytes = numel * element_size;
 
-    // Use the global allocator instance.
     c10::DataPtr data_ptr = g_ipc_allocator.allocate(storage_nbytes);
     auto* ctx = static_cast<IpcAllocationContext*>(data_ptr.get_context());
     IpcMemHandle handle = ctx->handle;
+
+    std::string lock_name = generate_lock_name_from_handle(ctx->handle);
+    ctx->lock = std::make_unique<SharedLock>(lock_name);
 
     c10::Storage storage(
         c10::Storage::use_byte_size_t(),
         storage_nbytes,
         std::move(data_ptr),
-        &g_ipc_allocator, // Pass pointer to the global allocator
+        &g_ipc_allocator,
         /*resizable=*/false);
 
-    // Create tensor options using the device from the storage.
     auto options = torch::TensorOptions().dtype(dtype).device(storage.device());
     auto final_tensor = at::empty({0}, options);
     final_tensor.set_(storage, 0, shape, {});
@@ -189,12 +264,9 @@ py::tuple create_tensor_and_get_ipc(
 #endif
 
     py::bytes handle_bytes(reinterpret_cast<char*>(&handle), sizeof(handle));
-    // Return order changed to {tensor, handle}
     return py::make_tuple(final_tensor, handle_bytes);
 }
 
-// --- Copy an existing tensor to shared IPC memory ---
-// Name changed from copy_to_ipc_tensor
 py::tuple copy_tensor_and_get_ipc(const torch::Tensor& tensor) {
     TORCH_CHECK(tensor.is_cuda(), "Input tensor must be on a CUDA/HIP device");
     TORCH_CHECK(tensor.is_contiguous(), "Input tensor must be contiguous for IPC");
@@ -202,20 +274,20 @@ py::tuple copy_tensor_and_get_ipc(const torch::Tensor& tensor) {
 
     const auto nbytes = tensor.nbytes();
 
-    // Use the global allocator instance.
     c10::DataPtr data_ptr = g_ipc_allocator.allocate(nbytes);
     auto* ctx = static_cast<IpcAllocationContext*>(data_ptr.get_context());
     IpcMemHandle handle = ctx->handle;
+
+    std::string lock_name = generate_lock_name_from_handle(ctx->handle);
+    ctx->lock = std::make_unique<SharedLock>(lock_name);
 
     c10::Storage storage(
         c10::Storage::use_byte_size_t(),
         nbytes,
         std::move(data_ptr),
-        &g_ipc_allocator, // Pass pointer to the global allocator
+        &g_ipc_allocator,
         /*resizable=*/false);
 
-    // Create new options based on the source tensor, but override the
-    // device with the one from the new storage.
     auto options = tensor.options().device(storage.device());
     auto new_tensor = at::empty({0}, options);
     new_tensor.set_(storage, 0, tensor.sizes(), tensor.strides());
@@ -236,12 +308,10 @@ py::tuple copy_tensor_and_get_ipc(const torch::Tensor& tensor) {
 #endif
 
     py::bytes handle_bytes(reinterpret_cast<char*>(&handle), sizeof(handle));
-    // Return order changed to {tensor, handle}
     return py::make_tuple(new_tensor, handle_bytes);
 }
 
-// --- MODIFIED: This function is for consumers, not owners, of memory ---
-py::tuple open_ipc_and_get_tensor(
+torch::Tensor open_ipc_and_get_tensor(
     py::bytes handle_bytes,
     c10::Device device,
     at::ScalarType dtype,
@@ -250,52 +320,49 @@ py::tuple open_ipc_and_get_tensor(
     int64_t storage_offset)
 {
     IpcMemHandle handle;
-    TORCH_CHECK(
-        py::len(handle_bytes) == sizeof(handle),
-        "IPC handle has incorrect size");
     std::memcpy(&handle, PYBIND11_BYTES_AS_STRING(handle_bytes.ptr()), sizeof(handle));
 
     void* base_ptr{nullptr};
 #ifdef USE_HIP
     C10_HIP_CHECK(hipIpcOpenMemHandle(
-        &base_ptr,
-        *reinterpret_cast<hipIpcMemHandle_t*>(&handle),
+        &base_ptr, *reinterpret_cast<hipIpcMemHandle_t*>(&handle),
         hipIpcMemLazyEnablePeerAccess));
 #else
     C10_CUDA_CHECK(cudaIpcOpenMemHandle(
-        &base_ptr,
-        *reinterpret_cast<cudaIpcMemHandle_t*>(&handle),
+        &base_ptr, *reinterpret_cast<cudaIpcMemHandle_t*>(&handle),
         cudaIpcMemLazyEnablePeerAccess));
 #endif
 
-    const auto element_size = c10::elementSize(dtype);
-    TORCH_CHECK(element_size > 0, "dtype has invalid element size");
-    void* data_ptr = static_cast<char*>(base_ptr) + storage_offset * element_size;
+    auto* ctx = new IpcAllocationContext();
+    ctx->base_ptr = base_ptr;
+    ctx->handle = handle;
+    std::string lock_name = generate_lock_name_from_handle(handle);
+    ctx->lock = std::make_unique<SharedLock>(lock_name);
 
-    auto options = torch::TensorOptions().dtype(dtype).device(device);
-
-    // Custom deleter for IPC memory handle
-    auto ipc_close_deleter = [base_ptr](void* /*unused*/) {
+    auto consumer_deleter = [](void* ctx_ptr) {
+        auto* local_ctx = static_cast<IpcAllocationContext*>(ctx_ptr);
 #ifdef USE_HIP
-        hipError_t err = hipIpcCloseMemHandle(base_ptr);
-        if (err != hipSuccess) {
-            fprintf(stderr, "WARNING: hipIpcCloseMemHandle failed in custom deleter with error %d\n", err);
-        }
+        hipIpcCloseMemHandle(local_ctx->base_ptr);
 #else
-        cudaError_t err = cudaIpcCloseMemHandle(base_ptr);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "WARNING: cudaIpcCloseMemHandle failed in custom deleter with error %d\n", err);
-        }
+        cudaIpcCloseMemHandle(local_ctx->base_ptr);
 #endif
+        delete local_ctx;
     };
 
-    auto tensor = torch::from_blob(
-        data_ptr,
-        shape,
-        stride,
-        ipc_close_deleter,
-        options
-    );
+    c10::DataPtr data_ptr(base_ptr, ctx, consumer_deleter, device);
+
+    const auto nbytes = c10::multiply_integers(shape) * c10::elementSize(dtype);
+
+    c10::Storage storage(
+        c10::Storage::use_byte_size_t(),
+        nbytes,
+        std::move(data_ptr),
+        /*allocator=*/nullptr,
+        /*resizable=*/false);
+
+    auto options = torch::TensorOptions().dtype(dtype).device(storage.device());
+    auto final_tensor = at::empty({0}, options);
+    final_tensor.set_(storage, storage_offset, shape, stride);
 
 #ifdef _PRINT_DEBUG
     auto numel = c10::multiply_integers(shape);
@@ -307,12 +374,12 @@ py::tuple open_ipc_and_get_tensor(
     std::cout << "--------------------" << std::endl;
 #endif
 
-    // MODIFIED: Return the tensor and the opened handle pointer.
-    return py::make_tuple(tensor, reinterpret_cast<int64_t>(base_ptr));
+    return final_tensor;
 }
 
 // --- pybind11 Module Definition ---
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "A C++ PyTorch extension for creating and sharing CUDA/HIP tensors using IPC";
     m.def("create_tensor_and_get_ipc", &create_tensor_and_get_ipc,
           "Create a new tensor on CUDA/HIP using a custom IPC-aware "
           "allocator and return its tensor and IPC handle.");
@@ -320,5 +387,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Copies a tensor to new IPC-aware shared memory and returns "
           "the new tensor and its IPC handle.");
     m.def("open_ipc_and_get_tensor", &open_ipc_and_get_tensor,
-          "Open a CUDA/HIP IPC handle and return a tensor view AND the handle pointer for manual closing.");
+          "Open a CUDA/HIP IPC handle and returns a tensor.");
+    m.def("acquire", &acquire_lock_for_tensor, "Acquire the lock for a given IPC tensor.");
+    m.def("release", &release_lock_for_tensor, "Release the lock for a given IPC tensor.");
 }

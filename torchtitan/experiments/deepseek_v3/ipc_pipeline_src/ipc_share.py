@@ -2,6 +2,7 @@ import subprocess
 import os
 import json
 import shutil
+import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -27,6 +28,8 @@ def share_model_parameters_ipc(
 ):
     """Shares model parameters from a source rank using the C++ IPC extension."""
     # Add a barrier to ensure all processes enter the function together.
+    if group is None:
+        group = dist.group.WORLD
     rank = dist.get_rank(group=group)
 
     if rank == src_rank:
@@ -77,7 +80,7 @@ def share_model_parameters_ipc(
             assert device_uuid == source_uuid, \
                 r_str("Source tensor and destination tensor must be on the same device.") + \
                 f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
-            shared_tensor, handle_ptr = torch_ipc_extension.open_ipc_and_get_tensor(
+            shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
                 handle, device, dtype, shape, stride, storage_offset)
             _set_param_or_buffer(model, name, shared_tensor)
             
@@ -101,6 +104,8 @@ def create_and_share_tensor_ipc(
     src_rank: int = 0
 ):
     """Creates a shared tensor from a source rank using the C++ IPC extension."""
+    if group is None:
+        group = dist.group.WORLD
     rank = dist.get_rank(group=group)
     shared_tensor = None
     
@@ -126,11 +131,11 @@ def create_and_share_tensor_ipc(
         assert device_uuid == source_uuid, \
             r_str("Source tensor and destination tensor must be on the same device.") + \
             f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
-        shared_tensor, handle_ptr = torch_ipc_extension.open_ipc_and_get_tensor(
+        shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
             handle, device, dtype, shape, stride, storage_offset)
 
     dist.barrier(group=group)
-    return shared_tensor
+    return shared_tensor, handle
 
 def copy_and_share_tensor_ipc(
     tensor: torch.Tensor = None,
@@ -138,6 +143,8 @@ def copy_and_share_tensor_ipc(
     src_rank: int = 0
 ):
     """Creates a shared tensor from an existing tensor using the C++ IPC extension."""
+    if group is None:
+        group = dist.group.WORLD
     rank = dist.get_rank(group=group)
     shared_tensor = None
     
@@ -173,11 +180,11 @@ def copy_and_share_tensor_ipc(
         assert device_uuid == source_uuid, \
             r_str("Source tensor and destination tensor must be on the same device.") + \
             f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
-        shared_tensor, handle_ptr = torch_ipc_extension.open_ipc_and_get_tensor(
+        shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
             handle, device, dtype, shape, stride, storage_offset)
         
     dist.barrier(group=group)      
-    return shared_tensor
+    return shared_tensor, handle
 
 def _set_param_or_buffer(model, name, new_tensor):
     """Recursively finds and replaces a parameter or buffer in a model."""
@@ -336,7 +343,7 @@ def test_memory_management(rank, device):
 
         tensors = []
         for i in range(num_alloc):
-            shared_tensor = create_and_share_tensor_ipc(shape, dtype, device, src_rank=0)
+            shared_tensor, handle = create_and_share_tensor_ipc(shape, dtype, device, src_rank=0)
             tensors.append(shared_tensor)
         if rank == 0:
             size = shared_tensor.element_size() * shared_tensor.numel()
@@ -446,10 +453,10 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
                         raise ValueError(f"Unsupported dtype: {dtype}")
             
         # Create shared tensor from original tensor
-        shared_tensor_created = create_and_share_tensor_ipc(
+        shared_tensor_created, handle_created = create_and_share_tensor_ipc(
             shape, dtype, device, src_rank=0
         )
-        shared_tensor_copied = copy_and_share_tensor_ipc(
+        shared_tensor_copied, handle_copied = copy_and_share_tensor_ipc(
             original_tensor, src_rank=0
         )
         dist.barrier()
@@ -613,6 +620,59 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
                   "config " + config_to_str())
         
         dist.barrier()
+
+        # Test 4: Locked modification on all ranks
+        if dtype != torch.bool and dtype != torch.int8 and dtype != torch.uint8 and shared_tensor_created.numel() > 0:
+            shared_tensor_created.flatten()[0] = 0
+            dist.barrier()
+            val = rank + 1
+            print(b_str(f"//// [Rank {rank}] ") + "Entering critical section without mutex, " +
+                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
+            for i in range(50):
+                shared_tensor_created.flatten()[0] += (rank + 1)
+            print(b_str(f"//// [Rank {rank}] ") + "Exiting critical section without mutex, " +
+                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
+            dist.barrier()
+
+            if rank == 0:
+                print(y_str(f"[Rank {rank}] Concurrent tensor modification without mutex result: ") + 
+                      f"{shared_tensor_created.flatten()[0]}")
+            dist.barrier()
+                
+            shared_tensor_created.flatten()[0] = 0
+            dist.barrier()
+            torch_ipc_extension.acquire(shared_tensor_created)
+            print(b_str(f"//// [Rank {rank}] ") + "Entering critical section with mutex, " +
+                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
+            for i in range(50):
+                shared_tensor_created.flatten()[0] += (rank + 1)
+            print(b_str(f"//// [Rank {rank}] ") + "Exiting critical section with mutex, " +
+                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
+            torch_ipc_extension.release(shared_tensor_created)
+            dist.barrier()
+
+            if rank == 0:
+                # Verify changes are visible on rank 0
+                print(y_str(f"[Rank {rank}] Concurrent tensor modification with mutex result: ") + 
+                      f"{shared_tensor_created.flatten()[0]}")
+                expected_result = (sum(range(dist.get_world_size())) + dist.get_world_size()) * 50
+                result = shared_tensor_created.flatten()[0].item()
+                
+                if isinstance(result, float) or isinstance(expected_result, float):
+                    assert math.isclose(result, expected_result, rel_tol=1e-5), \
+                        r_str(f"[Rank {rank}] Concurrent Tensor modification with mutex incorrect for config " + config_to_str() + "!") + \
+                        f"\nExpected Result:\n{expected_result}" + \
+                        f"\nActual Result:\n{result}"
+                else:
+                    assert int(expected_result) == int(result), \
+                        r_str(f"[Rank {rank}] Concurrent Tensor modification with mutex incorrect for config " + config_to_str() + "!") + \
+                        f"\nExpected Result:\n{expected_result}" + \
+                        f"\nActual Result:\n{result}"
+                print(g_str(f"[Rank {rank}] ✓ Concurrent Tensor modification with mutex correct, ") +
+                    "config " + config_to_str())
+
+            
+        dist.barrier()
         
         if rank == 0:
             print(g_str(f"[Rank {rank}] ✓ All tests passed for config " + config_to_str()))
@@ -658,103 +718,10 @@ def test_single_tensor_sharing(rank, device):
     if rank == 0:
         print(g_str(f"\n[Rank {rank}] All single tensor sharing tests completed successfully!"))
 
-def debug_backward_grads_issue():
-    """
-    Add debugging functionality to track when grads become None
-    """
-    import torch.distributed.pipelining._backward as backward_module
-    
-    # Monkey patch the backward functions to add debugging
-    original_stage_backward = backward_module.stage_backward
-    original_stage_backward_input = backward_module.stage_backward_input
-    original_stage_backward_weight = backward_module.stage_backward_weight
-    
-    def debug_stage_backward(stage_output, output_grads, input_values):
-        print(f"[DEBUG] stage_backward called:")
-        print(f"  stage_output type: {type(stage_output)}")
-        print(f"  output_grads type: {type(output_grads)}")
-        print(f"  input_values type: {type(input_values)}")
-        if isinstance(stage_output, torch.Tensor):
-            print(f"  stage_output.requires_grad: {stage_output.requires_grad}")
-        if output_grads is not None:
-            if isinstance(output_grads, (list, tuple)):
-                print(f"  output_grads length: {len(output_grads)}")
-                for i, grad in enumerate(output_grads):
-                    if isinstance(grad, torch.Tensor):
-                        print(f"  output_grads[{i}].shape: {grad.shape}")
-            elif isinstance(output_grads, torch.Tensor):
-                print(f"  output_grads.shape: {output_grads.shape}")
-        
-        result = original_stage_backward(stage_output, output_grads, input_values)
-        
-        print(f"[DEBUG] stage_backward result:")
-        print(f"  result type: {type(result)}")
-        if isinstance(result, tuple) and len(result) > 0:
-            grads = result[0]
-            print(f"  grads type: {type(grads)}")
-            if grads is None:
-                print(r_str("  ⚠ WARNING: grads is None!"))
-            elif isinstance(grads, (list, tuple)):
-                print(f"  grads length: {len(grads)}")
-                for i, grad in enumerate(grads):
-                    print(f"  grads[{i}]: {type(grad)} {grad.shape if isinstance(grad, torch.Tensor) else 'N/A'}")
-        
-        return result
-    
-    def debug_stage_backward_input(stage_output, output_grads, input_values, parameters):
-        print(f"[DEBUG] stage_backward_input called:")
-        print(f"  stage_output type: {type(stage_output)}")
-        print(f"  output_grads type: {type(output_grads)}")
-        print(f"  input_values type: {type(input_values)}")
-        print(f"  parameters count: {len(list(parameters)) if parameters else 0}")
-        
-        result = original_stage_backward_input(stage_output, output_grads, input_values, parameters)
-        
-        print(f"[DEBUG] stage_backward_input result:")
-        print(f"  result type: {type(result)}")
-        if isinstance(result, tuple) and len(result) > 0:
-            grads = result[0]
-            print(f"  grads type: {type(grads)}")
-            if grads is None:
-                print(r_str("  ⚠ WARNING: grads is None!"))
-            elif isinstance(grads, (list, tuple)):
-                print(f"  grads length: {len(grads)}")
-                for i, grad in enumerate(grads):
-                    print(f"  grads[{i}]: {type(grad)} {grad.shape if isinstance(grad, torch.Tensor) else 'N/A'}")
-        
-        return result
-    
-    def debug_stage_backward_weight(parameters, param_groups):
-        print(f"[DEBUG] stage_backward_weight called:")
-        print(f"  parameters count: {len(list(parameters)) if parameters else 0}")
-        print(f"  param_groups type: {type(param_groups)}")
-        
-        result = original_stage_backward_weight(parameters, param_groups)
-        
-        print(f"[DEBUG] stage_backward_weight result:")
-        print(f"  result type: {type(result)}")
-        if isinstance(result, tuple) and len(result) > 0:
-            grads = result[0]
-            print(f"  grads type: {type(grads)}")
-            if grads is None:
-                print(r_str("  ⚠ WARNING: grads is None!"))
-        
-        return result
-    
-    # Apply the monkey patches
-    backward_module.stage_backward = debug_stage_backward
-    backward_module.stage_backward_input = debug_stage_backward_input
-    backward_module.stage_backward_weight = debug_stage_backward_weight
-    
-    print(g_str("✓ Applied debugging patches to backward functions"))
-
 def main():
     """Main execution function with robust unit tests."""
     if not torch.cuda.is_available():
         raise RuntimeError("This script requires a CUDA/HIP enabled GPU.")
-
-    # Apply debugging patches early
-    debug_backward_grads_issue()
 
     dist.init_process_group("gloo")
     

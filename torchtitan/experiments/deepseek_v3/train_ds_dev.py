@@ -23,9 +23,9 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleBackwardOnly, ScheduleForwardOnly
 from accelerate import init_empty_weights
-from fb_pipeline_src.share_model_ipc import (share_model_parameters_ipc, 
-                                             create_and_share_tensor_ipc,
-                                             copy_and_share_tensor_ipc)
+from ipc_pipeline_src.ipc_share import (share_model_parameters_ipc, 
+                                        create_and_share_tensor_ipc,
+                                        copy_and_share_tensor_ipc)
 
 
 # Use DeepSeek-V2-Lite as a proxy
@@ -46,13 +46,13 @@ def run_full_model(
 ):
     pp_mesh = mesh["pp"]
     ep_mesh = mesh["ep"]
-    fbbp_mesh = mesh["fbbp"]
+    mbp_mesh = mesh["mbp"]
     pp_rank = pp_mesh.get_local_rank()
     ep_rank = ep_mesh.get_local_rank()
-    fbbp_rank = fbbp_mesh.get_local_rank()
+    mbp_rank = mbp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
     ep_size = ep_mesh.size()
-    fbbp_size = fbbp_mesh.size()
+    mbp_size = mbp_mesh.size()
 
     rank = dist.get_rank()
     device_count = torch.cuda.device_count()
@@ -70,42 +70,42 @@ def run_full_model(
     model_args.stage_idx = pp_rank
     print(
         b_str(f"Parallelism Setting: ") + 
-        f"Global_{rank=}, {ep_size=}, {pp_size=}, {fbbp_size=}, "
-        f"Ranks: {ep_rank=}, {pp_rank=}, {fbbp_rank=}, {device=}, "
+        f"Global_{rank=}, {ep_size=}, {pp_size=}, {mbp_size=}, "
+        f"Ranks: {ep_rank=}, {pp_rank=}, {mbp_rank=}, {device=}, "
         f"{model_args.num_stages=}, {model_args.stage_idx=}"
     )
     # print(model_args)
     
-    fbbp_grp = None
+    mbp_grp = None
     global_cpu_grp = dist.new_group(
         backend="gloo",
         group_desc=f"global_cpu_group"
     )
-    if fbbp_size > 1:
+    if mbp_size > 1:
         # Global synchronization to ensure all processes reach this point before proceeding
         # Get all unique FB groups first
-        all_fbbp_groups = []
-        num_fbbp_groups = dist.get_world_size() // fbbp_size
-        for fb_grp_idx in range(num_fbbp_groups ):
+        all_mbp_groups = []
+        num_mbp_groups = dist.get_world_size() // mbp_size
+        for fb_grp_idx in range(num_mbp_groups ):
             # Calculate ranks for this FB group
-            fbbp_group_ranks = [(fb_grp_idx + i * num_fbbp_groups) for i in range(fbbp_size)]
-            all_fbbp_groups.append(fbbp_group_ranks)
+            mbp_group_ranks = [(fb_grp_idx + i * num_mbp_groups) for i in range(mbp_size)]
+            all_mbp_groups.append(mbp_group_ranks)
 
-        created_fbbp_groups = []
-        for group_idx, fbbp_ranks in enumerate(all_fbbp_groups):
+        created_mbp_groups = []
+        for group_idx, mbp_ranks in enumerate(all_mbp_groups):
             group = dist.new_group(
-                ranks=fbbp_ranks,
+                ranks=mbp_ranks,
                 backend="gloo",
-                group_desc=f"fbbp_group_{group_idx}_{fbbp_ranks}"
+                group_desc=f"mbp_group_{group_idx}_{mbp_ranks}"
             )
-            created_fbbp_groups.append((group, fbbp_ranks))
+            created_mbp_groups.append((group, mbp_ranks))
 
         dist.barrier(group=global_cpu_grp)
         # Find the group this rank belongs to
         current_rank = dist.get_rank()
-        for group, fb_ranks in created_fbbp_groups:
+        for group, fb_ranks in created_mbp_groups:
             if current_rank in fb_ranks:
-                fbbp_grp = group
+                mbp_grp = group
                 break
         dist.barrier(group=global_cpu_grp)
 
@@ -113,20 +113,20 @@ def run_full_model(
     
     fsdp_mesh = mesh["fsdp"]
     hsdp_mesh = mesh["ep", "fsdp"]
-    print(g_str(f"{rank=} ") + f"fbbp_mesh: {fbbp_mesh}, pp_mesh: {pp_mesh}, ep_mesh: {ep_mesh}, "
+    print(g_str(f"{rank=} ") + f"mbp_mesh: {mbp_mesh}, pp_mesh: {pp_mesh}, ep_mesh: {ep_mesh}, "
           f"fsdp_mesh: {fsdp_mesh}, hsdp_mesh: {hsdp_mesh}")
     dist.barrier(group=global_cpu_grp)
 
     # Instantiate model
     with device, mesh:
-        if fbbp_rank == 0:    
+        if mbp_rank == 0:    
             model = DeepseekForCausalLM(model_args)
         else:
             with init_empty_weights():
                 model = DeepseekForCausalLM(model_args)
 
-    if fbbp_size > 1:
-        share_model_parameters_ipc(model, fbbp_grp)
+    if mbp_size > 1:
+        share_model_parameters_ipc(model, mbp_grp)
 
     # Load weights
     # load_weights_from_hf(model, model_id, device)
@@ -169,7 +169,7 @@ def run_full_model(
     loss_fn = torch.nn.functional.cross_entropy 
 
     shared_forward_cache = None
-    if fbbp_size > 1:
+    if mbp_size > 1:
         print(b_str(f"Rank {rank} ") + f"Capturing forward cache")
         dist.barrier(group=global_cpu_grp)
         # Capture forward cache
@@ -181,8 +181,8 @@ def run_full_model(
                 pp_size,
                 device,
                 group=pp_mesh.get_group(),
-                do_fbbp=False,
-                fbbp_group=fbbp_grp,
+                do_mbp=False,
+                mbp_group=mbp_grp,
                 global_rank=rank,
                 shared_fwd_cache=shared_forward_cache,
             )
@@ -200,18 +200,18 @@ def run_full_model(
             (sample_output_tuple, sample_flatten_input_tensors) = stage.fwd_cache[0]
             shared_forward_cache = {}
             shared_forward_str_cache = {}
-            num_cache = pp_size * 3 if fbbp_size > 2 else  int(pp_size * 1.5 + 0.6)
+            num_cache = pp_size * 3 if mbp_size > 2 else  int(pp_size * 1.5 + 0.6)
             for i in range(num_cache):
                 output_tuple_list = []
                 flatten_input_tensors_list = []
                 output_tuple_str_list = []
                 flatten_input_tensors_str_list = []
                 for t in sample_output_tuple:
-                    shared_t = copy_and_share_tensor_ipc(t, fbbp_grp)
+                    shared_t = copy_and_share_tensor_ipc(t, mbp_grp)
                     output_tuple_list.append(shared_t)
                     output_tuple_str_list.append(str(shared_t.size()))
                 for t in sample_flatten_input_tensors:
-                    shared_t = copy_and_share_tensor_ipc(t, fbbp_grp)
+                    shared_t = copy_and_share_tensor_ipc(t, mbp_grp)
                     flatten_input_tensors_list.append(shared_t)
                     flatten_input_tensors_str_list.append(str(shared_t.size()))
                 output_tuple = tuple(output_tuple_list)
@@ -239,15 +239,15 @@ def run_full_model(
                 pp_size,
                 device,
                 group=pp_mesh.get_group(),
-                do_fbbp=(fbbp_size > 1),
-                fbbp_group=fbbp_grp,
+                do_mbp=(mbp_size > 1),
+                mbp_group=mbp_grp,
                 global_rank=rank,
                 shared_fwd_cache=shared_forward_cache,
             )
 
             # Create pipeline schedule
             losses = []
-            if fbbp_size <= 1:
+            if mbp_size <= 1:
                 pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
                 if pp_rank == 0:
                     y = pp_schedule.step(x)
@@ -257,14 +257,14 @@ def run_full_model(
                 else:
                     pp_schedule.step()
             else:
-                if fbbp_rank == 0:
+                if mbp_rank == 0:
                     pp_schedule = ScheduleForwardOnly(stage, microbatches, loss_fn=loss_fn)
                 else:
                     pp_schedule = ScheduleBackwardOnly(stage, microbatches, loss_fn=loss_fn)
                 
                 if pp_rank == 0:
                     y = pp_schedule.step(x)
-                elif pp_rank == pp_size - 1 and fbbp_rank == 0:
+                elif pp_rank == pp_size - 1 and mbp_rank == 0:
                     y = pp_schedule.step(target=label, losses=losses)
                     loss = torch.mean(torch.stack(losses))
                 else:
@@ -278,7 +278,7 @@ def run_full_model(
             print(f"logits: {y.shape}")
             print(f"{loss=}")
 
-        if pp_rank == 0 and ((fbbp_size > 1 and fbbp_rank > 1) or (fbbp_size <= 1 and fbbp_rank == 0)):
+        if pp_rank == 0 and ((mbp_size > 1 and mbp_rank > 1) or (mbp_size <= 1 and mbp_rank == 0)):
             param = model.get_parameter("model.layers.0.self_attn.q_proj.weight")
             print(f"{torch.linalg.norm(param.grad)=}")
 
