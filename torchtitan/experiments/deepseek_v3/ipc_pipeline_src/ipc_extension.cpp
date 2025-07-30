@@ -182,11 +182,40 @@ IpcAllocationContext* get_ctx_from_tensor(const torch::Tensor& tensor) {
     return ctx;
 }
 
+void synchronize_device(c10::Device device) {
+    TORCH_CHECK(device.is_cuda(), "Device must be CUDA/HIP for synchronization");
+    c10::DeviceGuard guard(device);
+#ifdef USE_HIP
+    // Use device-wide synchronization for robustness
+    C10_HIP_CHECK(hipDeviceSynchronize());
+#else
+    // Use device-wide synchronization for robustness
+    C10_CUDA_CHECK(cudaDeviceSynchronize());
+#endif
+}
+
 void acquire_lock_for_tensor(const torch::Tensor& tensor) {
+    #ifdef USE_HIP
+        roctxRangePush("IPC Lock Critical Section");
+    #else
+        nvtxRangePushA("IPC Lock Critical Section");
+    #endif
     get_ctx_from_tensor(tensor)->lock->acquire();
 }
 
+void release_lock_for_tensor_async(const torch::Tensor& tensor) {
+    get_ctx_from_tensor(tensor)->lock->release();
+    #ifdef USE_HIP
+        roctxRangePop();
+    #else
+        nvtxRangePop();
+    #endif
+}
+
 void release_lock_for_tensor(const torch::Tensor& tensor) {
+    // Synchronize the stream to ensure all pending operations are complete
+    // before the lock is released. This prevents race conditions.
+    synchronize_device(tensor.device());
     get_ctx_from_tensor(tensor)->lock->release();
 }
 
@@ -389,5 +418,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("open_ipc_and_get_tensor", &open_ipc_and_get_tensor,
           "Open a CUDA/HIP IPC handle and returns a tensor.");
     m.def("acquire", &acquire_lock_for_tensor, "Acquire the lock for a given IPC tensor.");
-    m.def("release", &release_lock_for_tensor, "Release the lock for a given IPC tensor.");
+    m.def("release", &release_lock_for_tensor, 
+          "Release the lock for a given IPC tensor, includes device-wide synchronization to avoid race conditions on kernel launched in the critical section.");
+    m.def("release_async", &release_lock_for_tensor_async, 
+          "Release the lock for a given IPC tensor, Pytorch-level GPU synchronization is required to avoid race conditions on kernel launched in the critical section.");
 }

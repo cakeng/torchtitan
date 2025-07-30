@@ -622,16 +622,19 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
         dist.barrier()
 
         # Test 4: Locked modification on all ranks
+        num_adds = 100
         if dtype != torch.bool and dtype != torch.int8 and dtype != torch.uint8 and shared_tensor_created.numel() > 0:
             shared_tensor_created.flatten()[0] = 0
             dist.barrier()
-            val = rank + 1
-            print(b_str(f"//// [Rank {rank}] ") + "Entering critical section without mutex, " +
-                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
-            for i in range(50):
+            init_val = shared_tensor_created.flatten()[0].item()
+            print(b_str(f"//// [Rank {rank}] ") + g_str("Entering")+ " critical section without mutex, " +
+                        f"Shared tensor value: {init_val} " + b_str(f"////"))
+            for i in range(num_adds):
                 shared_tensor_created.flatten()[0] += (rank + 1)
-            print(b_str(f"//// [Rank {rank}] ") + "Exiting critical section without mutex, " +
-                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
+            final_val = shared_tensor_created.flatten()[0].item()
+            expected_val = init_val + (num_adds * (rank + 1))
+            print(b_str(f"//// [Rank {rank}] ") + r_str("Exiting") + " critical section without mutex, " +
+                        f"Shared tensor value: {final_val}, expected: {expected_val} " + b_str(f"////"))
             dist.barrier()
 
             if rank == 0:
@@ -642,21 +645,25 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             shared_tensor_created.flatten()[0] = 0
             dist.barrier()
             torch_ipc_extension.acquire(shared_tensor_created)
-            print(b_str(f"//// [Rank {rank}] ") + "Entering critical section with mutex, " +
-                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
-            for i in range(50):
+            init_val = shared_tensor_created.flatten()[0].item()
+            print(b_str(f"//// [Rank {rank}] ") + g_str("Entering") + " critical section with mutex, " +
+                        f"Shared tensor value: {init_val} " + b_str(f"////"))      
+            for i in range(num_adds):
                 shared_tensor_created.flatten()[0] += (rank + 1)
-            print(b_str(f"//// [Rank {rank}] ") + "Exiting critical section with mutex, " +
-                        f"Shared tensor value: {shared_tensor_created.flatten()[0]} " + b_str(f"////"))
+            final_val = shared_tensor_created.flatten()[0].item()
+            expected_val = init_val + (num_adds * (rank + 1))
+            print(b_str(f"//// [Rank {rank}] ") + r_str("Exiting") + " critical section with mutex, " +
+                        f"Shared tensor value: {final_val}, expected: {expected_val} " + b_str(f"////"))
             torch_ipc_extension.release(shared_tensor_created)
             dist.barrier()
 
             if rank == 0:
                 # Verify changes are visible on rank 0
-                print(y_str(f"[Rank {rank}] Concurrent tensor modification with mutex result: ") + 
-                      f"{shared_tensor_created.flatten()[0]}")
-                expected_result = (sum(range(dist.get_world_size())) + dist.get_world_size()) * 50
+                expected_result = (sum(range(dist.get_world_size())) + dist.get_world_size()) * num_adds
                 result = shared_tensor_created.flatten()[0].item()
+                
+                print(y_str(f"[Rank {rank}] Concurrent tensor modification with mutex result: ") + 
+                      f"{result}, " + y_str("expected: ") + f"{expected_result}")
                 
                 if isinstance(result, float) or isinstance(expected_result, float):
                     assert math.isclose(result, expected_result, rel_tol=1e-5), \
