@@ -474,6 +474,11 @@ public:
         // FIX: Use :: to call the global POSIX function, not the member function.
         ::sem_post(&data_->semaphore); 
     }
+    void wait_for_value(int64_t target_value, int poll_interval_us) {
+        while (get() != target_value) {
+            std::this_thread::sleep_for(std::chrono::microseconds(poll_interval_us));
+        }
+    }
 
     // --- Resource Management ---
     static void destroy(const std::string& name) {
@@ -530,7 +535,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("mutex_release", &SharedData::mutex_release, "Releases the exclusive mutex lock.")
 
         .def("sem_wait", &SharedData::sem_wait, "Waits on (decrements) the semaphore.")
-        .def("sem_post", &SharedData::sem_post, "Posts to (increments) the semaphore.");
+        .def("sem_post", &SharedData::sem_post, "Posts to (increments) the semaphore.")
+        .def("wait_for_value", &SharedData::wait_for_value, 
+             "Waits until the shared integer reaches a target value.",
+             py::arg("target_value"), py::arg("poll_interval_us") = 100);
 
     m.def("destroy_shared_data", &SharedData::destroy, 
           "Destroys and unlinks the shared memory and semaphore for a SharedData object.",

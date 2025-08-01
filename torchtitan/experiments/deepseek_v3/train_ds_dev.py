@@ -21,11 +21,17 @@ from model_config import deepseek_config_registry
 
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.pipelining import PipelineStage, Schedule1F1B, ScheduleBackwardOnly, ScheduleForwardOnly
+from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 from accelerate import init_empty_weights
 from ipc_pipeline_src.ipc_share import (share_model_parameters_ipc, 
                                         create_and_share_tensor_ipc,
-                                        copy_and_share_tensor_ipc)
+                                        copy_and_share_tensor_ipc,
+                                        SharedGradientCache)
+from ipc_pipeline_src.mbp_schedule import ScheduleMbp
+from ipc_pipeline_src.mbp_stage import MbpStage
+
+import torch_ipc_extension # Your compiled extension
+
 
 
 # Use DeepSeek-V2-Lite as a proxy
@@ -76,13 +82,14 @@ def run_full_model(
     )
     # print(model_args)
     
+    # Setup MBP groups
     mbp_grp = None
+    mbp_group_idx = None
     global_cpu_grp = dist.new_group(
         backend="gloo",
         group_desc=f"global_cpu_group"
     )
     if mbp_size > 1:
-        # Global synchronization to ensure all processes reach this point before proceeding
         # Get all unique FB groups first
         all_mbp_groups = []
         num_mbp_groups = dist.get_world_size() // mbp_size
@@ -98,40 +105,48 @@ def run_full_model(
                 backend="gloo",
                 group_desc=f"mbp_group_{group_idx}_{mbp_ranks}"
             )
-            created_mbp_groups.append((group, mbp_ranks))
+            created_mbp_groups.append((group_idx, group, mbp_ranks))
 
         dist.barrier(group=global_cpu_grp)
         # Find the group this rank belongs to
         current_rank = dist.get_rank()
-        for group, fb_ranks in created_mbp_groups:
+        for group_idx, group, fb_ranks in created_mbp_groups:
+
             if current_rank in fb_ranks:
+                mbp_group_idx = group_idx
                 mbp_grp = group
                 break
         dist.barrier(group=global_cpu_grp)
 
-
-    
     fsdp_mesh = mesh["fsdp"]
+    fsdp_rank = fsdp_mesh.get_local_rank()
+    fsdp_size = fsdp_mesh.size()
     hsdp_mesh = mesh["ep", "fsdp"]
-    print(g_str(f"{rank=} ") + f"mbp_mesh: {mbp_mesh}, pp_mesh: {pp_mesh}, ep_mesh: {ep_mesh}, "
-          f"fsdp_mesh: {fsdp_mesh}, hsdp_mesh: {hsdp_mesh}")
+    mbp_orthogonal_mesh = mesh["pp", "ep", "fsdp"]
+    print(g_str(f"Rank {rank} Mesh: ") + y_str("mbp_mesh ") + f"{mbp_group_idx}: {mbp_mesh}, " +
+                y_str("pp_mesh: ") + f"{pp_mesh}, " + y_str("ep_mesh: ") + f"{ep_mesh}, " +
+                y_str("sdp_mesh: ") + f"{fsdp_mesh}, " + y_str("hsdp_mesh: ") + f"{hsdp_mesh}, " +
+                y_str("mbp_orthogonal_mesh: ") + f"{mbp_orthogonal_mesh}\n", end="")
+    
     dist.barrier(group=global_cpu_grp)
 
     # Instantiate model
     with device, mesh:
         if mbp_rank == 0:    
+            # Only MBP rank 0 creates the model with weights
             model = DeepseekForCausalLM(model_args)
         else:
+            # Other ranks create the model without weights
             with init_empty_weights():
                 model = DeepseekForCausalLM(model_args)
 
     if mbp_size > 1:
+        # Share model parameters across MBP group
         share_model_parameters_ipc(model, mbp_grp)
 
     # Load weights
     # load_weights_from_hf(model, model_id, device)
     model.train()
-
 
     # Apply data parallelism
     # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
@@ -151,7 +166,8 @@ def run_full_model(
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
 
     # Synthetic setting
-    microbatches = 6
+    microbatches = mbp_size
+    max_concurrent_mb = 2
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -168,26 +184,47 @@ def run_full_model(
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy 
 
-    shared_forward_cache = None
+    # Setup MBP control variables
+    # MBP control variables are shared across the first process in each MBP rank.
+    mbp_ctrl = None
+    if mbp_size > 1 and mbp_group_idx == 0:
+        print(b_str(f"Rank {rank} ") + f"Creating MBP control variable mbp_ctrl\n", end="")
+        mbp_ctrl_name = f"mbp_ctrl"
+        if rank == 0:
+            mbp_ctrl = torch_ipc_extension.SharedData(
+                name=mbp_ctrl_name, is_creator=True, initial_value=0,
+                semaphore_count = max_concurrent_mb
+            )
+        else:
+            mbp_ctrl = torch_ipc_extension.SharedData(
+                name=mbp_ctrl_name, is_creator=False
+            )
+    dist.barrier(group=global_cpu_grp)
+
+    # Setup MBP shared gradient cache
+    shared_grad_cache = None
     if mbp_size > 1:
-        print(b_str(f"Rank {rank} ") + f"Capturing forward cache")
-        dist.barrier(group=global_cpu_grp)
+        # Semaphore to limit memory usage
+        if mbp_rank == 0:
+            mbp_ctrl.sem_wait()
+            print(b_str(f"Rank {rank} (MBP rank 0)") + f"Capturing gradient cache, microbatch {mbp_rank}\n", end="")
+        else:
+            print(g_str(f"Rank {rank} ") + f"Capturing gradient cache, microbatch {mbp_rank}\n", end="")
         # Capture forward cache
         if pp_size > 1:
             # Create pipeline stage
-            stage = PipelineStage(
+            stage = MbpStage(
                 model,
                 pp_rank,
                 pp_size,
                 device,
                 group=pp_mesh.get_group(),
-                do_mbp=False,
-                mbp_group=mbp_grp,
-                global_rank=rank,
-                shared_fwd_cache=shared_forward_cache,
             )
-            pp_schedule = ScheduleForwardOnly(stage, microbatches, loss_fn=loss_fn,
-                                              sample_fwd_cache=True)
+
+            # Wait for semaphore'd first MBP ranks to arrive
+            dist.barrier(group=mbp_orthogonal_mesh.get_group())
+
+            pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, loss_fn=loss_fn)
 
             if pp_rank == 0:
                 y = pp_schedule.step(x)
@@ -196,34 +233,11 @@ def run_full_model(
 
             dist.barrier(group=global_cpu_grp)
 
-            # Create shared forward cache
-            (sample_output_tuple, sample_flatten_input_tensors) = stage.fwd_cache[0]
-            shared_forward_cache = {}
-            shared_forward_str_cache = {}
-            num_cache = pp_size * 3 if mbp_size > 2 else  int(pp_size * 1.5 + 0.6)
-            for i in range(num_cache):
-                output_tuple_list = []
-                flatten_input_tensors_list = []
-                output_tuple_str_list = []
-                flatten_input_tensors_str_list = []
-                for t in sample_output_tuple:
-                    shared_t = copy_and_share_tensor_ipc(t, mbp_grp)
-                    output_tuple_list.append(shared_t)
-                    output_tuple_str_list.append(str(shared_t.size()))
-                for t in sample_flatten_input_tensors:
-                    shared_t = copy_and_share_tensor_ipc(t, mbp_grp)
-                    flatten_input_tensors_list.append(shared_t)
-                    flatten_input_tensors_str_list.append(str(shared_t.size()))
-                output_tuple = tuple(output_tuple_list)
-                flatten_input_tensors = tuple(flatten_input_tensors_list)
-                output_tuple_str = str(output_tuple_str_list)
-                flatten_input_tensors_str = str(flatten_input_tensors_str_list)
-                shared_forward_cache[i] = (output_tuple, flatten_input_tensors)
-                shared_forward_str_cache[i] = (output_tuple_str, flatten_input_tensors_str)
-            
-            print(b_str(f"Rank {rank} ") + f"Finished capturing forward cache:\n" +
-                  r_str(f"Sample forward cache: ") + f"{stage._get_fwd_cache_state_str()}\n" +
-                  g_str(f"Shared forward cache: ") + f"{shared_forward_str_cache}")    
+            print(b_str(f"Rank {rank} ") + f"Finished capturing forward cache.")  
+        if mbp_rank == 0:  
+            mbp_ctrl.sem_post()
+
+    return 0
             
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}")
     dist.barrier(group=global_cpu_grp)
