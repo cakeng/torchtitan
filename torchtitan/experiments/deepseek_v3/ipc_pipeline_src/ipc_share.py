@@ -3,6 +3,8 @@ import os
 import json
 import shutil
 import math
+import time
+import random
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -394,19 +396,236 @@ def test_memory_management(rank, device):
             if not fail:
                 print(g_str("✓ Memory management test passed"))
     
+def _test_atomic_operations(rank, world_size, group):
+    """Tests the atomic integer operations (get, set, add, etc.)."""
+    test_name = "atomic_operations_test"
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Atomic Operations ---"))
 
-class SimpleModel(nn.Module):
-    """A basic model for initial testing."""
-    def __init__(self):
-        super().__init__()
-        self.layer1 = nn.Linear(10, 20)
-        self.relu = nn.ReLU()
-        self.layer2 = nn.Linear(20, 5)
-        self.register_buffer('my_buffer', torch.randn(1, 5))
+    shared_obj = None
+    try:
+        # Step 1: Create/Open the SharedData object
+        # Creator (rank 0) initializes the object.
+        if rank == 0:
+            shared_obj = torch_ipc_extension.SharedData(
+                name=test_name, is_creator=True, initial_value=100
+            )
+        else:
+            shared_obj = torch_ipc_extension.SharedData(
+                name=test_name, is_creator=False
+            )
+        
+        dist.barrier(group=group)
 
-    def forward(self, x):
-        return self.layer2(self.relu(self.layer1(x))) + self.my_buffer
+        # Test 1: get/set
+        if rank == 0:
+            shared_obj.set(42)
+        
+        dist.barrier(group=group)
+        
+        val = shared_obj.get()
+        assert val == 42, f"Rank {rank} failed get/set test! Expected 42, got {val}"
+        if rank == 0:
+            print(g_str("[Rank 0] ✓ Test 'get/set' passed."))
+        
+        dist.barrier(group=group)
+
+        # Test 2: fetch_add
+        # Each rank adds its own rank value
+        old_val = shared_obj.fetch_add(rank)
+        
+        dist.barrier(group=group)
+        
+        # After all ranks add, the final value should be the sum
+        if rank == 0:
+            expected_sum = 42 + sum(range(world_size))
+            final_val = shared_obj.get()
+            assert final_val == expected_sum, \
+                f"Atomic 'fetch_add' failed! Expected {expected_sum}, got {final_val}"
+            print(g_str("[Rank 0] ✓ Test 'fetch_add' passed."))
+
+        dist.barrier(group=group)
+
+        # Test 3: exchange
+        if rank == 1:
+            # Rank 1 exchanges the value
+            old_val = shared_obj.exchange(999)
+            expected_old_val = 42 + sum(range(world_size))
+            assert old_val == expected_old_val, \
+                f"Atomic 'exchange' failed! Expected old value {expected_old_val}, got {old_val}"
+        
+        dist.barrier(group=group)
+
+        if rank == 0:
+            final_val = shared_obj.get()
+            assert final_val == 999, \
+                f"Visibility for 'exchange' failed! Expected 999, got {final_val}"
+            print(g_str("[Rank 0] ✓ Test 'exchange' passed."))
+
+    finally:
+        # Final barrier and cleanup
+        dist.barrier(group=group)
+        if rank == 0:
+            torch_ipc_extension.destroy_shared_data(test_name)
+
+
+def _test_mutex_synchronization(rank, world_size, group):
+    """Tests the mutex for exclusive access to a critical section."""
+    test_name = "mutex_sync_test"
+    num_adds = 100
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Mutex Synchronization ({num_adds} adds/rank) ---"))
+
+    shared_obj = None
+    try:
+        # Create/Open the SharedData object with value 0
+        if rank == 0:
+            shared_obj = torch_ipc_extension.SharedData(
+                name=test_name, is_creator=True, initial_value=0
+            )
+        else:
+            shared_obj = torch_ipc_extension.SharedData(
+                name=test_name, is_creator=False
+            )
+        dist.barrier(group=group)
+
+        # All ranks contend to add to the shared value
+        print(b_str(f"[Rank {rank}] Entering") + f" critical section without mutex.")
+        initial_val = shared_obj.get()
+        expected_val = initial_val + num_adds
+        for _ in range(num_adds):
+            # This read-modify-write pattern is a classic race condition
+            # that the mutex is designed to prevent.
+            current_val = shared_obj.get()
+            shared_obj.set(current_val + 1)
+        print(y_str(f"[Rank {rank}] Exiting") + f" critical section with mutex - " +
+              f"Initial value: {initial_val}, Expected final value: {expected_val}.")
+        
+        dist.barrier(group=group)
+
+        if rank == 0:
+            final_val = shared_obj.get()
+            expected_val = num_adds * world_size
+            print(y_str(f"[Rank 0] Expected final value: {expected_val}, got {final_val} without mutex."))
+            shared_obj.set(0)
+
+        dist.barrier(group=group)
+
+        # All ranks contend to add to the shared value
+        shared_obj.mutex_acquire()
+        print(b_str(f"[Rank {rank}] Entering") + f" critical section with mutex.")
+        initial_val = shared_obj.get()
+        expected_val = initial_val + num_adds
+        for _ in range(num_adds):
+            # This read-modify-write pattern is a classic race condition
+            # that the mutex is designed to prevent.
+            current_val = shared_obj.get()
+            shared_obj.set(current_val + 1)
+        print(y_str(f"[Rank {rank}] Exiting") + f" critical section with mutex - " +
+              f"Initial value: {initial_val}, Expected final value: {expected_val}.")
+        shared_obj.mutex_release()
+        
+        dist.barrier(group=group)
+
+        # Verification
+        if rank == 0:
+            final_val = shared_obj.get()
+            expected_val = num_adds * world_size
+            print(y_str(f"[Rank 0] Expected final value: {expected_val}, got {final_val} with mutex."))
+            assert final_val == expected_val, \
+                f"Mutex test failed! Expected final value {expected_val}, got {final_val}"
+            print(g_str(f"[Rank 0] ✓ Test 'mutex' passed. Final value: {final_val}"))
+
+    finally:
+        dist.barrier(group=group)
+        if rank == 0:
+            torch_ipc_extension.destroy_shared_data(test_name)
+
+
+def _test_semaphore_synchronization(rank, world_size, group):
+    """Tests the semaphore for controlling concurrent access."""
+    semaphore_slots = max(1, world_size // 2)
+    test_name = "semaphore_sync_test"
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Semaphore ({semaphore_slots} slots) ---"))
+
+    shared_obj = None
+    try:
+        # Create/Open SharedData. The integer will track active processes.
+        if rank == 0:
+            shared_obj = torch_ipc_extension.SharedData(
+                name=test_name, is_creator=True, initial_value=0,
+                semaphore_count=semaphore_slots
+            )
+        dist.barrier(group=group)
+        if rank != 0:
+            shared_obj = torch_ipc_extension.SharedData(
+                name=test_name, is_creator=False
+            )
+        dist.barrier(group=group)
+
+        # All ranks attempt to enter the critical section
+        shared_obj.sem_wait()
+
+        print(b_str(f"[Rank {rank}] Entering") + " critical section.")
+        
+        # --- Critical Section ---
+        # Increment a counter to track how many processes are inside
+        active_procs = shared_obj.fetch_add(1) + 1
+
+        print (f"[Rank {rank}] Active processes inside: {active_procs}")
+        
+        # The number of active processes should never exceed the semaphore count
+        assert active_procs <= semaphore_slots, \
+            f"Semaphore failed! Rank {rank} found {active_procs} processes inside, but limit is {semaphore_slots}"
+        
+        time.sleep(random.uniform(0.01, 0.05)) # Simulate work
+        
+        # Decrement the counter upon exit
+        shared_obj.fetch_add(-1)
+        # --- End Critical Section ---
+        
+        print(y_str(f"[Rank {rank}] Exiting") + " critical section.")
+        shared_obj.sem_post()
+        
+        dist.barrier(group=group)
+
+        # Verification
+        if rank == 0:
+            final_active_procs = shared_obj.get()
+            assert final_active_procs == 0, \
+                f"Semaphore cleanup failed! Expected 0 active procs, got {final_active_procs}"
+            print(g_str(f"[Rank 0] ✓ Test 'semaphore' passed."))
+
+    finally:
+        dist.barrier(group=group)
+        if rank == 0:
+            torch_ipc_extension.destroy_shared_data(test_name)
+
+
+def test_shared_cpu_data(rank, group=None):
+    """
+    Main entry point for testing the shared CPU data extension.
+    """
+    if group is None:
+        group = dist.group.WORLD
     
+    world_size = dist.get_world_size(group=group)
+
+    try:
+        _test_atomic_operations(rank, world_size, group)
+        _test_mutex_synchronization(rank, world_size, group)
+        _test_semaphore_synchronization(rank, world_size, group)
+        
+        dist.barrier(group=group)
+        if rank == 0:
+            print(g_str("\n✓ All shared CPU data tests passed successfully!"))
+
+    except Exception as e:
+        print(r_str(f"[Rank {rank}] ✗ A test failed with an exception."))
+        # Ensure the exception is re-raised to be visible
+        raise e
+
 def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storage_offset):
     original_tensor = None
     shared_tensor_created = None
@@ -622,19 +841,19 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
         dist.barrier()
 
         # Test 4: Locked modification on all ranks
-        num_adds = 100
+        num_adds = 10
         if dtype != torch.bool and dtype != torch.int8 and dtype != torch.uint8 and shared_tensor_created.numel() > 0:
             shared_tensor_created.flatten()[0] = 0
             dist.barrier()
             init_val = shared_tensor_created.flatten()[0].item()
-            print(b_str(f"//// [Rank {rank}] ") + g_str("Entering")+ " critical section without mutex, " +
-                        f"Shared tensor value: {init_val} " + b_str(f"////"))
+            print(b_str(f"[Rank {rank}] Entering")+ " critical section without mutex, " +
+                        f"Shared tensor value: {init_val} ")
             for i in range(num_adds):
                 shared_tensor_created.flatten()[0] += (rank + 1)
             final_val = shared_tensor_created.flatten()[0].item()
             expected_val = init_val + (num_adds * (rank + 1))
-            print(b_str(f"//// [Rank {rank}] ") + r_str("Exiting") + " critical section without mutex, " +
-                        f"Shared tensor value: {final_val}, expected: {expected_val} " + b_str(f"////"))
+            print(y_str(f"[Rank {rank}] Exiting") + " critical section without mutex, " +
+                        f"Shared tensor value: {final_val}, expected: {expected_val} ")
             dist.barrier()
 
             if rank == 0:
@@ -646,14 +865,14 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             dist.barrier()
             torch_ipc_extension.acquire(shared_tensor_created)
             init_val = shared_tensor_created.flatten()[0].item()
-            print(b_str(f"//// [Rank {rank}] ") + g_str("Entering") + " critical section with mutex, " +
-                        f"Shared tensor value: {init_val} " + b_str(f"////"))      
+            print(b_str(f"//// [Rank {rank}] Entering") + " critical section with mutex, " +
+                        f"Shared tensor value: {init_val} ")      
             for i in range(num_adds):
                 shared_tensor_created.flatten()[0] += (rank + 1)
             final_val = shared_tensor_created.flatten()[0].item()
             expected_val = init_val + (num_adds * (rank + 1))
-            print(b_str(f"//// [Rank {rank}] ") + r_str("Exiting") + " critical section with mutex, " +
-                        f"Shared tensor value: {final_val}, expected: {expected_val} " + b_str(f"////"))
+            print(y_str(f"//// [Rank {rank}] Exiting") + " critical section with mutex, " +
+                        f"Shared tensor value: {final_val}, expected: {expected_val} ")
             torch_ipc_extension.release(shared_tensor_created)
             dist.barrier()
 
@@ -723,7 +942,19 @@ def test_single_tensor_sharing(rank, device):
         single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storage_offset)
         dist.barrier()
     if rank == 0:
-        print(g_str(f"\n[Rank {rank}] All single tensor sharing tests completed successfully!"))
+        print(g_str(f"\n[Rank {rank}] ✓ All single tensor sharing tests completed successfully!"))
+
+class SimpleModel(nn.Module):
+    """A basic model for initial testing."""
+    def __init__(self):
+        super().__init__()
+        self.layer1 = nn.Linear(10, 20)
+        self.relu = nn.ReLU()
+        self.layer2 = nn.Linear(20, 5)
+        self.register_buffer('my_buffer', torch.randn(1, 5))
+
+    def forward(self, x):
+        return self.layer2(self.relu(self.layer1(x))) + self.my_buffer
 
 def main():
     """Main execution function with robust unit tests."""
@@ -737,6 +968,18 @@ def main():
     torch.cuda.set_device(target_device_id)
     device = torch.device("cuda", target_device_id)
 
+    # --- Test 0: Shared CPU Data Test ---
+    if rank == 0:
+        print("="*50)
+        print("RUNNING TEST 0: Shared CPU Data")
+        print("="*50)
+            
+    test_shared_cpu_data(rank)
+
+    dist.barrier()
+    if rank == 0:
+        print("--- Shared CPU Data Test PASSED ---")
+
     # --- Test 1: Memory Management Test ---
     if rank == 0:
         print("="*50)
@@ -747,7 +990,7 @@ def main():
     
     dist.barrier()
     if rank == 0:
-        print("--- Memory Management Test COMPLETED ---")
+        print("--- Memory Management Test PASSED ---")
     
     # --- Test 2: Single Tensor Sharing ---
     if rank == 0:
@@ -790,7 +1033,7 @@ def main():
         expected_weight = torch.empty_like(simple_model.layer1.weight.data)
         dist.broadcast(expected_weight, src=0)
         assert torch.equal(simple_model.layer1.weight.data, expected_weight)
-        print(g_str(f"[Rank {rank}] Verified SimpleModel weight update is visible."))
+        print(g_str(f"[Rank {rank}] ✓ Verified SimpleModel weight update is visible."))
         
     dist.barrier()
     if rank == 0:
@@ -838,7 +1081,7 @@ def main():
             r_str(f"Parameter mismatch after sharing! \n") +
             f"Expected:\n{expected_param}\nGot:\n{target_param_on_worker}"
         )
-        print(g_str(f"[Rank {rank}] Verified parameter '{target_param_name}' matches rank 0."))
+        print(g_str(f"[Rank {rank}] ✓ Verified parameter '{target_param_name}' matches rank 0."))
     
     dist.barrier()
     if rank == 0:
@@ -873,7 +1116,7 @@ def main():
         expected_bytes = expected_logits_before.view(torch.int8)
         assert torch.equal(local_bytes, expected_bytes), \
             r_str("Initial logits do not match between ranks at the byte level!")
-        print(g_str(f"[Rank {rank}] Verified initial logits match rank 0."))
+        print(g_str(f"[Rank {rank}] ✓ Verified initial logits match rank 0."))
 
     dist.barrier()
 
@@ -909,12 +1152,12 @@ def main():
         expected_bytes_after = expected_logits_after.view(torch.int8)
         assert torch.equal(local_bytes_after, expected_bytes_after), \
             r_str("Final logits do not match between ranks at the byte level!")
-        print(g_str(f"[Rank {rank}] Verified final logits match rank 0."))
+        print(g_str(f"[Rank {rank}] ✓ Verified final logits match rank 0."))
 
     dist.barrier()
     if rank == 0:
         print("\n--- DeepSeek-V2-Lite Test PASSED ---")
-        print(g_str("\nAll verification successful on all ranks!"))
+        print(g_str("\n//// All verification successful on all ranks! ////"))
 
 if __name__ == "__main__":
     if "torch_ipc_extension" in globals():

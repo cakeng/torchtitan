@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <cstring> // For strerror
 #include <cerrno>  // For errno
+#include <semaphore.h> // For sem_t
 
 // Conditionally include the correct exception header and stream headers
 // based on the platform.
@@ -54,6 +55,7 @@ public:
             "mmap failed for name " + shm_name + 
             ": " + std::strerror(errno)
         );
+        data_->lock_flag.clear();
     }
 
     // Destructor to unmap the shared memory segment
@@ -195,21 +197,21 @@ void synchronize_device(c10::Device device) {
 }
 
 void acquire_lock_for_tensor(const torch::Tensor& tensor) {
-    #ifdef USE_HIP
-        roctxRangePush("IPC Lock Critical Section");
-    #else
-        nvtxRangePushA("IPC Lock Critical Section");
-    #endif
+    // #ifdef USE_HIP
+    //     roctxRangePush("IPC Lock Critical Section");
+    // #else
+    //     nvtxRangePushA("IPC Lock Critical Section");
+    // #endif
     get_ctx_from_tensor(tensor)->lock->acquire();
 }
 
 void release_lock_for_tensor_async(const torch::Tensor& tensor) {
     get_ctx_from_tensor(tensor)->lock->release();
-    #ifdef USE_HIP
-        roctxRangePop();
-    #else
-        nvtxRangePop();
-    #endif
+    // #ifdef USE_HIP
+    //     roctxRangePop();
+    // #else
+    //     nvtxRangePop();
+    // #endif
 }
 
 void release_lock_for_tensor(const torch::Tensor& tensor) {
@@ -406,6 +408,95 @@ torch::Tensor open_ipc_and_get_tensor(
     return final_tensor;
 }
 
+// The data structure to be placed in shared memory.
+struct SharedPayload {
+    std::atomic<int64_t> value;
+    std::atomic_flag mutex_lock = ATOMIC_FLAG_INIT;
+    sem_t semaphore;
+};
+
+class SharedData {
+public:
+    // Constructor: Creates or opens a named shared memory segment.
+    SharedData(const std::string& name, bool is_creator, int64_t initial_value, unsigned int semaphore_count) : name_(name) {
+        std::string shm_name = "/" + name;
+        int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
+        if (fd == -1) {
+            throw std::runtime_error("shm_open failed for " + shm_name + ": " + std::strerror(errno));
+        }
+        
+        ftruncate(fd, sizeof(SharedPayload));
+        data_ = static_cast<SharedPayload*>(mmap(
+            nullptr, sizeof(SharedPayload),
+            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0
+        ));
+        close(fd);
+
+        if (data_ == MAP_FAILED) {
+            throw std::runtime_error("mmap failed for " + shm_name + ": " + std::strerror(errno));
+        }
+
+        // Only the creator process should initialize the shared data.
+        if (is_creator) {
+            data_->value.store(initial_value);
+            data_->mutex_lock.clear(); 
+            // The second argument '1' makes the semaphore shared between processes.
+            if (sem_init(&data_->semaphore, 1, semaphore_count) == -1) {
+                throw std::runtime_error("sem_init failed: " + std::string(std::strerror(errno)));
+            }
+        }
+    }
+
+    // Destructor unmaps the shared memory from this process's address space.
+    ~SharedData() {
+        if (data_ != nullptr && data_ != MAP_FAILED) {
+            munmap(data_, sizeof(SharedPayload));
+        }
+    }
+
+    // --- Atomic Integer Operations ---
+    int64_t add(int64_t n) { return data_->value.fetch_add(n) + n; }
+    int64_t get() { return data_->value.load(); }
+    void set(int64_t n) { data_->value.store(n); }
+    int64_t fetch_add(int64_t n) { return data_->value.fetch_add(n); }
+    int64_t exchange(int64_t n) { return data_->value.exchange(n); }
+
+    // --- Mutex Operations ---
+    void mutex_acquire() { while (data_->mutex_lock.test_and_set(std::memory_order_acquire)); }
+    void mutex_release() { data_->mutex_lock.clear(std::memory_order_release); }
+
+    // --- Semaphore Operations ---
+    void sem_wait() { 
+        // FIX: Use :: to call the global POSIX function, not the member function.
+        ::sem_wait(&data_->semaphore); 
+    }
+    void sem_post() { 
+        // FIX: Use :: to call the global POSIX function, not the member function.
+        ::sem_post(&data_->semaphore); 
+    }
+
+    // --- Resource Management ---
+    static void destroy(const std::string& name) {
+        std::string shm_name = "/" + name;
+        int fd = shm_open(shm_name.c_str(), O_RDWR, 0666);
+        if (fd != -1) {
+            SharedPayload* temp_data = static_cast<SharedPayload*>(mmap(
+                nullptr, sizeof(SharedPayload), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0
+            ));
+            if (temp_data != MAP_FAILED) {
+                sem_destroy(&temp_data->semaphore);
+                munmap(temp_data, sizeof(SharedPayload));
+            }
+            close(fd);
+        }
+        shm_unlink(shm_name.c_str());
+    }
+
+private:
+    std::string name_;
+    SharedPayload* data_;
+};
+
 // --- pybind11 Module Definition ---
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "A C++ PyTorch extension for creating and sharing CUDA/HIP tensors using IPC";
@@ -422,4 +513,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Release the lock for a given IPC tensor, includes device-wide synchronization to avoid race conditions on kernel launched in the critical section.");
     m.def("release_async", &release_lock_for_tensor_async, 
           "Release the lock for a given IPC tensor, Pytorch-level GPU synchronization is required to avoid race conditions on kernel launched in the critical section.");
+
+    py::class_<SharedData>(m, "SharedData")
+        .def(py::init<const std::string&, bool, int64_t, unsigned int>(), 
+             "Creates or opens a shared data object.",
+             py::arg("name"), py::arg("is_creator"), 
+             py::arg("initial_value") = 0, py::arg("semaphore_count") = 1)
+        
+        .def("add", &SharedData::add, "Atomically adds a value and returns the new value.")
+        .def("get", &SharedData::get, "Atomically gets the current value.")
+        .def("set", &SharedData::set, "Atomically sets the value.")
+        .def("fetch_add", &SharedData::fetch_add, "Atomically adds a value and returns the old value.")
+        .def("exchange", &SharedData::exchange, "Atomically sets a new value and returns the old value.")
+
+        .def("mutex_acquire", &SharedData::mutex_acquire, "Acquires the exclusive mutex lock.")
+        .def("mutex_release", &SharedData::mutex_release, "Releases the exclusive mutex lock.")
+
+        .def("sem_wait", &SharedData::sem_wait, "Waits on (decrements) the semaphore.")
+        .def("sem_post", &SharedData::sem_post, "Posts to (increments) the semaphore.");
+
+    m.def("destroy_shared_data", &SharedData::destroy, 
+          "Destroys and unlinks the shared memory and semaphore for a SharedData object.",
+          py::arg("name"));
 }

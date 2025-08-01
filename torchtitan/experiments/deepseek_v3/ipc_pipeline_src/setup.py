@@ -4,35 +4,53 @@ import torch.version
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
-# Define compiler flags and directories.
-extra_compile_args = []
+# --- Common Flags and Source Files ---
+extra_compile_args = ['-std=c++17', '-g']
+libraries = []
 include_dirs = []
 library_dirs = []
 
-# Check if we are in a HIP environment and configure paths accordingly.
+# For POSIX shared memory and semaphores, we need to link against the
+# real-time library. This is required by the SharedData class.
+libraries.append('rt')
+
+# --- Configure for GPU environment ---
 if hasattr(torch.version, 'hip') and torch.version.hip is not None:
     # If we are in a HIP environment, pass a custom macro to the C++ compiler.
     extra_compile_args.append('-DUSE_HIP')
     
-    # Add HIP include and library paths.
     # The ROCM_PATH environment variable is standard on ROCm systems.
     rocm_path = os.environ.get('ROCM_PATH', '/opt/rocm')
     include_dirs.append(os.path.join(rocm_path, 'include'))
+    include_dirs.append(os.path.join(rocm_path, 'roctracer', 'include'))
     library_dirs.append(os.path.join(rocm_path, 'lib'))
+    
+    # Add the specific library needed for roctx functions
+    libraries.append('roctracer64')
+    
+else:
+    # Add nvtx for profiling if in a CUDA environment.
+    libraries.append('nvtx3')
 
+# --- Define the single source file to be compiled ---
 source_file = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "ipc_extension.cpp"
+    "torch_ipc_extension.cpp" # The new, combined source file
 )
 
+# --- Setup Call ---
 setup(
+    # The name of the overall package.
     name='torch_ipc_extension',
     ext_modules=[
+        # Define a single extension module that compiles the combined C++ file.
         CppExtension(
-            'torch_ipc_extension', # The name of the importable module
-            [source_file],
+            # The name of the final importable Python module.
+            'torch_ipc_extension', 
+            [source_file], # Pass the single source file as a list
             include_dirs=include_dirs,
             library_dirs=library_dirs,
+            libraries=libraries,
             extra_compile_args=extra_compile_args
         )
     ],
