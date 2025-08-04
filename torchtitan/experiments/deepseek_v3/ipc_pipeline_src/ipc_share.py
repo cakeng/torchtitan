@@ -23,82 +23,6 @@ def b_str(s):
 def y_str(s):
     return "\033[33m" + s + "\033[0m"
 
-class SharedGradientCache:
-    """
-    Manages a cache of shared IPC tensors for accumulating gradients
-    across multiple processes on a single machine.
-    """
-    def __init__(self, group: dist.ProcessGroup = None):
-        self.cache = {}  # Local cache: name -> shared_tensor
-        self.group = group if group is not None else dist.group.WORLD
-        self.rank = dist.get_rank(group=self.group)
-
-    def _get_or_create_shared_grad(self, name: str, grad: torch.Tensor) -> torch.Tensor:
-        """
-        Retrieves a shared tensor from the cache. If it doesn't exist,
-        it coordinates with other processes to create one.
-        """
-        if name in self.cache:
-            return self.cache[name]
-
-        # Rank 0 is responsible for creating the tensor and broadcasting its handle.
-        handle = None
-        if self.rank == 0:
-            # Create a new shared tensor, initialized to zeros.
-            # The returned handle is a 'bytes' object.
-            shared_tensor, handle = torch_ipc_extension.create_tensor_and_get_ipc(
-                grad.shape, grad.dtype, grad.device
-            )
-            shared_tensor.zero_()
-            dist.broadcast_object_list([handle], src=0, group=self.group)
-        else:
-            # Other ranks receive the handle.
-            received_objects = [None]
-            dist.broadcast_object_list(received_objects, src=0, group=self.group)
-            handle = received_objects[0]
-            # Open the shared tensor using the received handle.
-            shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
-                handle, grad.device, grad.dtype, grad.shape, grad.stride(), 0
-            )
-
-        # All processes now have a reference to the same shared tensor.
-        self.cache[name] = shared_tensor
-        return shared_tensor
-
-    def accumulate(self, name: str, grad: torch.Tensor):
-        """
-        Atomically adds a gradient to its corresponding shared tensor in the cache.
-        """
-        # Get the shared tensor from the cache (creating it if necessary).
-        cached_grad = self._get_or_create_shared_grad(name, grad)
-
-        # Use the mutex to ensure the add operation is atomic across processes.
-        torch_ipc_extension.acquire(cached_grad)
-        cached_grad.add_(grad)
-        torch_ipc_extension.release(cached_grad)
-
-    def get(self, name: str) -> torch.Tensor:
-        """Retrieves a gradient tensor from the cache."""
-        return self.cache.get(name)
-
-    def zero(self, name: str):
-        """Resets a specific cached gradient to zero."""
-        if name in self.cache:
-            cached_grad = self.cache[name]
-            torch_ipc_extension.acquire(cached_grad)
-            cached_grad.zero_()
-            torch_ipc_extension.release(cached_grad)
-
-    def destroy(self):
-        """
-        Clears the cache, allowing Python's GC to destroy the tensors
-        and trigger the C++ deleters to clean up OS resources.
-        """
-        dist.barrier(group=self.group)
-        # Clearing the dictionary drops the reference counts.
-        self.cache.clear()
-        dist.barrier(group=self.group)
-
 def share_model_parameters_ipc(
     model: nn.Module,
     group: dist.ProcessGroup = None,
@@ -595,8 +519,9 @@ def _test_mutex_synchronization(rank, world_size, group):
             # that the mutex is designed to prevent.
             current_val = shared_obj.get()
             shared_obj.set(current_val + 1)
+        current_val = shared_obj.get()
         print(y_str(f"[Rank {rank}] Exiting") + f" critical section with mutex - " +
-              f"Initial value: {initial_val}, Expected final value: {expected_val}.")
+              f"Initial value: {initial_val}, Expected final value: {expected_val}, got {current_val}.")
         
         dist.barrier(group=group)
 
@@ -618,8 +543,9 @@ def _test_mutex_synchronization(rank, world_size, group):
             # that the mutex is designed to prevent.
             current_val = shared_obj.get()
             shared_obj.set(current_val + 1)
+        current_val = shared_obj.get()
         print(y_str(f"[Rank {rank}] Exiting") + f" critical section with mutex - " +
-              f"Initial value: {initial_val}, Expected final value: {expected_val}.")
+              f"Initial value: {initial_val}, Expected final value: {expected_val}, got {current_val}.")
         shared_obj.mutex_release()
         
         dist.barrier(group=group)
