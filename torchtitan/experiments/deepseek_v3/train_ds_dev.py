@@ -237,13 +237,12 @@ def run_full_model(
     mbp_grad_manager = None
     if mbp_size > 1:
         # Only the first process in each SMB group captures the weight gradients
-        mbp_grad_manager = SharedGradientManager(model, group=mbp_grp)
+        mbp_grad_manager = SharedGradientManager(model, mesh=fsdp_mesh, group=mbp_grp)
         if smb_group_idx == 0:
             grad_metadata = {}
             handles = []
 
             print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
-            grad_metadata, handles = mbp_grad_manager.discover_gradient_metadata()
             # Create pipeline stage
             stage = MbpStage(
                 model,
@@ -261,33 +260,24 @@ def run_full_model(
                 y_dict = pp_schedule.step(target=label)
             else:
                 pp_schedule.step()
-
-            for handle in handles:
-                handle.remove()
-            print(b_str(f"Rank {rank} ") + f"Finished gradient capture: {grad_metadata=}\n", end="")
-        
         dist.barrier(group=mbp_grp)
 
         # Now, all ranks in the MBP group participate in creating the shared cache.
         # Rank 0 will broadcast the metadata it discovered.
-        mbp_grad_manager.setup_shared_cache_from_metadata(grad_metadata if mbp_rank == 0 else {})
-        
-        # Finally, attach the permanent hooks for the actual training runs.
-        mbp_grad_manager.attach_accumulation_hooks()
- 
+        mbp_grad_manager.setup_shared_cache()
         print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.")
-
-
-    return
 
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}")
     dist.barrier(group=global_cpu_grp)
 
+    
     # Run forward and backward
     steps = 2
     for _ in range(steps):
         # Only the first process in each SMB group captures the weight gradients
-        if pp_size > 1 and smb_group_idx == 0:
+        model.zero_grad()
+        mbp_grad_manager.zero_grad()
+        if pp_size > 1:
             # Create pipeline stage
             stage = MbpStage(
                 model,
@@ -300,7 +290,7 @@ def run_full_model(
             mbp_ctrl.wait_for_value(smb_group_idx)
             # Semaphore to limit memory usage
             mbp_ctrl.sem_wait()
-            print(b_str(f"Rank {rank} ") + f"Entering gradient capture, microbatch {mbp_rank}\n", end="")
+            print(b_str(f"Rank {rank} ") + f"Executing F/B pass on microbatch {mbp_rank}\n", end="")
             # Wait for all SMB group members to enter the critical section before allowing the next MBP group to enter
             dist.barrier(group=smb_grp)
             if mbp_group_idx == 0:
@@ -310,76 +300,45 @@ def run_full_model(
 
             pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, loss_fn=loss_fn, global_rank=rank)
 
+            losses = []
             if pp_rank == 0:
                 pp_schedule.step(x)
             elif pp_rank == pp_size - 1:
-                y_dict = pp_schedule.step(target=label)
+                y_dict = pp_schedule.step(target=label, losses=losses)
+                loss = torch.mean(torch.stack(losses))
             else:
                 pp_schedule.step()
 
-            print(b_str(f"Rank {rank} ") + f"Finished gradient capture.")  
+            print(b_str(f"Rank {rank} ") + f"Finished F/B pass on microbatch {mbp_rank}\n", end="")  
 
             # Release the semaphore
             mbp_ctrl.sem_post()
-        dist.barrier(group=smb_grp)
-        if rank == 0:
-            mbp_ctrl.set(0)
-        if pp_size > 1:
-            # Create pipeline stage
-            stage = PipelineStage(
-                model,
-                pp_rank,
-                pp_size,
-                device,
-                group=pp_mesh.get_group(),
-                do_mbp=(mbp_size > 1),
-                mbp_group=mbp_grp,
-                global_rank=rank,
-                shared_fwd_cache=shared_forward_cache,
-            )
-
-            # Create pipeline schedule
-            losses = []
-            if mbp_size <= 1:
-                pp_schedule = Schedule1F1B(stage, microbatches, loss_fn=loss_fn)
-                if pp_rank == 0:
-                    y = pp_schedule.step(x)
-                elif pp_rank == pp_size - 1:
-                    y = pp_schedule.step(target=label, losses=losses)
-                    loss = torch.mean(torch.stack(losses))
-                else:
-                    pp_schedule.step()
-            else:
-                if mbp_rank == 0:
-                    pp_schedule = ScheduleForwardOnly(stage, microbatches, loss_fn=loss_fn)
-                else:
-                    pp_schedule = ScheduleBackwardOnly(stage, microbatches, loss_fn=loss_fn)
-                
-                if pp_rank == 0:
-                    y = pp_schedule.step(x)
-                elif pp_rank == pp_size - 1 and mbp_rank == 0:
-                    y = pp_schedule.step(target=label, losses=losses)
-                    loss = torch.mean(torch.stack(losses))
-                else:
-                    pp_schedule.step()
-        else:
-            y = model(x)
-            loss = loss_fn(y, label)
-            loss.backward()
 
         if pp_rank == pp_size - 1:
-            print(f"logits: {y.shape}")
-            print(f"{loss=}")
+            first_key = next(iter(y_dict))
+            print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
+
+        mbp_grad_manager.accumulate_grad()
+        # Wait for all MBP members to finish gradient accumulation before running optimizer
+        dist.barrier(group=mbp_grp)
 
         if pp_rank == 0 and ((mbp_size > 1 and mbp_rank > 1) or (mbp_size <= 1 and mbp_rank == 0)):
-            param = model.get_parameter("model.layers.0.self_attn.q_proj.weight")
-            print(f"{torch.linalg.norm(param.grad)=}")
+            # param = model.get_parameter("model.layers.0.self_attn.q_proj.weight")
+            grad = mbp_grad_manager.get_grad("model.layers.0.self_attn.q_proj.weight")
+            print(y_str(f"Rank {rank} ") + f"{torch.linalg.norm(grad)=}")
 
-        model.zero_grad()
+        # Wait for all processes to finish before the next iteration
+        dist.barrier(group=global_cpu_grp)
+        if rank == 0:
+            print(g_str(f"Rank {rank} ") + f"/////// Finished iteration {_} ///////\n", end="")
+            # Reset microbatch counter
+            mbp_ctrl.set(0)
 
-    print(g_str(f"Rank {rank} ") + f"Finished training loop")
-    dist.barrier(group=global_cpu_grp)
-    print(b_str(f"Rank {rank} ") + f"All processes finished training loop")
+    print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
+    if mbp_size > 1:
+        mbp_grad_manager.destroy()
+        if rank == 0:
+            torch_ipc_extension.destroy_shared_data(f"mbp_ctrl")
 
 
 if __name__ == "__main__":

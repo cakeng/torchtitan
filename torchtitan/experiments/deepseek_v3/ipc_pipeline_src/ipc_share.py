@@ -11,7 +11,6 @@ import torch.distributed as dist
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights
 
-# Import the C++ extension after it has been built.
 import torch_ipc_extension
 
 def g_str(s):

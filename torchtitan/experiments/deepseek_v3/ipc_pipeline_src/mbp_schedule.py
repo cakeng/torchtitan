@@ -105,7 +105,7 @@ class _MbpSchedule(ABC):
             # Clean external container first
             losses.clear()
             # Copy internal losses to external container
-            losses.extend(self._internal_losses)
+            losses.extend(self._internal_losses.values())
 
         self._internal_losses.clear()
 
@@ -388,7 +388,7 @@ class ScheduleMbp(MbpScheduleSingle):
 
         # No loss function, no need to run backward
         if not self._has_backward:
-            return
+            return   
 
         # Run backward
         # Delay send waits
