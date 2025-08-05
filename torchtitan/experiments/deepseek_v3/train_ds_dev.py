@@ -196,8 +196,8 @@ def run_full_model(
 
     # Synthetic setting
     microbatches = mbp_size 
+
     max_concurrent_processes = 1 * (mesh.size() // mbp_size)
-    # max_concurrent_processes = 2 * (mesh.size() // mbp_size)
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -260,14 +260,13 @@ def run_full_model(
                 y_dict = pp_schedule.step(target=label)
             else:
                 pp_schedule.step()
-        dist.barrier(group=mbp_grp)
+        dist.barrier(group=global_cpu_grp)
 
         # Now, all ranks in the MBP group participate in creating the shared cache.
         # Rank 0 will broadcast the metadata it discovered.
         mbp_grad_manager.setup_shared_cache()
-        print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.")
-
-    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}")
+        print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.\n", end="")
+    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     dist.barrier(group=global_cpu_grp)
 
     
@@ -346,7 +345,7 @@ if __name__ == "__main__":
     num_gpus = torch.cuda.device_count()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_gpus)
 
-    mesh = dist.init_device_mesh("cuda", (2, 2, 2, 1), 
+    mesh = dist.init_device_mesh("cuda", (6, 2, 2, 1), 
                                  mesh_dim_names=("mbp", "pp", "ep", "fsdp"))
     
     assert num_gpus >= mesh.size() // mesh["mbp"].size()
