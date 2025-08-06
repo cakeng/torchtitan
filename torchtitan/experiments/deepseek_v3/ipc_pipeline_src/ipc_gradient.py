@@ -1,7 +1,7 @@
 import torch
 import torch.distributed as dist
 from typing import Dict, Tuple, List
-from torch.distributed.tensor import DTensor, DeviceMesh
+from torch.distributed.tensor import DTensor, DeviceMesh, distribute_tensor
 from torch.distributed.tensor.placement_types import Replicate
 
 # Assume your compiled extension is named 'torch_ipc_extension'
@@ -19,7 +19,8 @@ def y_str(s):
 class SharedGradientManager:
     """
     Manages the discovery, creation, and accumulation of gradients into
-    shared, distributed IPC tensors (DTensors) for multi-process training.
+    shared IPC tensors for multi-process training. The cache holds local
+    torch.Tensors that are backed by shared memory.
     """
     def __init__(self, model: torch.nn.Module, mesh: DeviceMesh, group: dist.ProcessGroup):
         """
@@ -34,12 +35,13 @@ class SharedGradientManager:
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
         self.global_rank = dist.get_global_rank(group=self.group, group_rank=self.rank)
-        self.grad_cache: Dict[str, DTensor] = {}
+        # The cache now correctly holds torch.Tensor objects
+        self.grad_cache: Dict[str, torch.Tensor] = {}
 
     def setup_shared_cache(self, src_rank: int = 0):
         """
         Discovers gradient metadata from the model after a backward pass,
-        and creates the shared, distributed IPC tensors for accumulation.
+        and creates the shared IPC tensors for accumulation.
         """
         grad_metadata = {}
         if self.rank == src_rank:
@@ -59,70 +61,56 @@ class SharedGradientManager:
             grad_metadata = metadata_list[0]
 
         for name, (global_shape, dtype, placements) in grad_metadata.items():
-            local_shard_shape = DTensor.from_local(
-                torch.empty(0, dtype=dtype, device=self.mesh.device_type),
-                self.mesh,
-                placements,
-                run_check=False
-            ).to_local().shape
+            meta_tensor = torch.empty(global_shape, dtype=dtype, device="meta")
+            conceptual_dtensor = distribute_tensor(meta_tensor, self.mesh, placements)
+            local_shard_shape = conceptual_dtensor.to_local().shape
 
-            # FIX: If the local shard for this rank has zero elements,
-            # there's no need to create a shared tensor for it.
             if torch.Size(local_shard_shape).numel() == 0:
                 continue
 
+            # This creates a plain torch.Tensor backed by shared memory
             shared_local_tensor, _ = torch_ipc_extension.create_tensor_and_get_ipc(
-                local_shard_shape, dtype, self.mesh.device_type
+                local_shard_shape, dtype, torch.device(self.mesh.device_type)
             )
             
-            shared_dtensor = DTensor.from_local(
-                shared_local_tensor, self.mesh, placements, run_check=True
-            )
-            
-            self.grad_cache[name] = shared_dtensor
+            # The cache correctly stores the plain tensor
+            self.grad_cache[name] = shared_local_tensor
         
         self.zero_grad()
 
     def accumulate_grad(self):
         """
-        Accumulates gradients from the model into the shared DTensor cache.
+        Accumulates gradients from the model into the shared tensor cache.
         """
         for name, param in self.model.named_parameters():
             if param.requires_grad and param.grad is not None:
                 if name in self.grad_cache:
-                    cached_grad_dtensor = self.grad_cache[name]
+                    cached_grad = self.grad_cache[name]
                     
-                    # Acquire the lock on the local shard for atomic update.
-                    local_shard = cached_grad_dtensor.to_local()
-                    torch_ipc_extension.acquire(local_shard)
+                    # Convert DTensor grad to a local tensor before adding
+                    local_grad_shard = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
                     
-                    # Perform the DTensor to DTensor addition.
-                    cached_grad_dtensor.add_(param.grad)
-                    
-                    torch_ipc_extension.release(local_shard)
+                    torch_ipc_extension.acquire(cached_grad)
+                    cached_grad.add_(local_grad_shard)
+                    torch_ipc_extension.release(cached_grad)
 
                     param.grad = None
-                    if self.rank == 0:
-                        param.grad = cached_grad_dtensor
 
-    def get_grad(self, name: str) -> DTensor:
-        """Retrieves a distributed gradient tensor from the cache."""
+    def get_grad(self, name: str) -> torch.Tensor:
+        """Retrieves a gradient tensor from the cache."""
         if name not in self.grad_cache:
-            raise ValueError(f"Parameter {name} not found in the gradient cache")
+            raise ValueError(f"Parameter {name} not found in the gradient cache, entries: {self.grad_cache.keys()}")
         return self.grad_cache[name]
 
     def zero_grad(self):
         """
-        Resets all cached distributed gradient tensors to zero.
-        This is a collective operation.
+        Resets all cached gradient tensors to zero.
         """
         for cached_grad in self.grad_cache.values():
-            # DTensor.zero_() correctly zeros all local shards.
-            # We still use a lock to make the operation atomic.
-            local_shard = cached_grad.to_local()
-            torch_ipc_extension.acquire(local_shard)
+            # FIX: cached_grad is already a local tensor, no .to_local() needed.
+            torch_ipc_extension.acquire(cached_grad)
             cached_grad.zero_()
-            torch_ipc_extension.release(local_shard)
+            torch_ipc_extension.release(cached_grad)
         dist.barrier(group=self.group)
 
     def destroy(self):
