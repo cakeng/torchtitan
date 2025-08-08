@@ -116,6 +116,11 @@ class _MbpSchedule(ABC):
         kwarg_mbs: Optional[list] = None,
         target_mbs: Optional[list] = None,
         losses: Optional[list] = None,
+        mbp_ctrl=None,
+        smb_group_idx: int = 0,
+        smb_grp: dist.ProcessGroup = None,
+        mbp_group_idx: int = 0,
+        mbp_grp: dist.ProcessGroup = None,
     ):
         """
         Run one iteration of the pipeline schedule with list of microbatches.
@@ -300,7 +305,13 @@ class MbpScheduleSingle(_MbpSchedule):
             self._stage._prepare_backward_infra(self._n_microbatches)
         self._stage_initialized = True
 
-    def step(self, *args, target=None, losses: Optional[list] = None, **kwargs):
+    def step(self, *args, target=None, losses: Optional[list] = None,
+            mbp_ctrl=None,
+            smb_group_idx: int = 0,
+            smb_grp: dist.ProcessGroup = None,
+            mbp_group_idx: int = 0,
+            mbp_grp: dist.ProcessGroup = None,
+            **kwargs):
         """
         Run one iteration of the pipeline schedule with *whole-batch* input.
         Will chunk the input into microbatches automatically, and go through the
@@ -325,7 +336,12 @@ class MbpScheduleSingle(_MbpSchedule):
             targets_split = None
 
         # Run microbatches
-        self._step_microbatches(args_split, kwargs_split, targets_split, losses)
+        self._step_microbatches(args_split, kwargs_split, targets_split, losses,
+                                mbp_ctrl,
+                                smb_group_idx,
+                                smb_grp,
+                                mbp_group_idx,
+                                mbp_grp)
 
         # Return outputs as dict
         if self._stage.is_last:
@@ -346,6 +362,11 @@ class ScheduleMbp(MbpScheduleSingle):
         kwarg_mbs: Optional[list] = None,
         target_mbs: Optional[list] = None,
         losses: Optional[list] = None,
+        mbp_ctrl=None,
+        smb_group_idx: int = 0,
+        smb_grp: dist.ProcessGroup = None,
+        mbp_group_idx: int = 0,
+        mbp_grp: dist.ProcessGroup = None,
     ):
         """
         Run one iteration of the pipeline schedule with list of microbatches.
@@ -372,6 +393,11 @@ class ScheduleMbp(MbpScheduleSingle):
             logging.info(g_str(f"Rank {self._global_rank}: ") + b_str(f"Forwarding {i}") + f", receiving {ops}")
 
             output = self._stage.forward_one_chunk(i, arg_mbs[i], kwarg_mbs[i])  # type: ignore[index]
+
+            if mbp_ctrl is not None and mbp_group_idx == 0:
+                # Let other MBP groups enter the forward pass
+                # May still get blocked by the semaphore if too many MBP groups are in the critical section
+                mbp_ctrl.add(1)
 
             ops = self._stage.get_fwd_send_ops(i)
             logging.info(g_str(f"Rank {self._global_rank}: ") + b_str(f"Forwarded {i}") + f", sending {ops}")

@@ -207,8 +207,8 @@ def run_full_model(
 
     # Example inputs
     torch.manual_seed(ep_rank)
-    bs = 4
-    seqlen = 128
+    bs = 1
+    seqlen = 64
     x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
     label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
 
@@ -291,30 +291,40 @@ def run_full_model(
                 group=pp_mesh.get_group(),
             )
             pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, loss_fn=loss_fn, global_rank=rank)
-            # Enter the critical section one by one
+
             mbp_ctrl.wait_for_value(smb_group_idx)
             # Semaphore to limit memory usage
             mbp_ctrl.sem_wait()
-            print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
+            print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")            # Wait for all SMB group members to enter the critical section before allowing the next MBP group to enter
+
             # Wait for all SMB group members to enter the critical section before allowing the next MBP group to enter
             dist.barrier(group=smb_grp)
-            if mbp_group_idx == 0:
-                # Let other MBP groups enter the critical section 
-                # May still get blocked by the semaphore if too many MBP groups are in the critical section
-                mbp_ctrl.add(1)
 
             losses = []
             if pp_rank == 0:
-                pp_schedule.step(x)
+                pp_schedule.step(x,
+                                 mbp_ctrl=mbp_ctrl,
+                                 smb_group_idx=smb_group_idx,
+                                 smb_grp=smb_grp,
+                                 mbp_group_idx=mbp_group_idx,
+                                 mbp_grp=mbp_grp)
             elif pp_rank == pp_size - 1:
-                y_dict = pp_schedule.step(target=label, losses=losses)
+                y_dict = pp_schedule.step(target=label, losses=losses,
+                                          mbp_ctrl=mbp_ctrl,
+                                          smb_group_idx=smb_group_idx,
+                                          smb_grp=smb_grp,
+                                          mbp_group_idx=mbp_group_idx,
+                                          mbp_grp=mbp_grp)
                 loss = torch.mean(torch.stack(losses))
             else:
-                pp_schedule.step()
+                pp_schedule.step(mbp_ctrl=mbp_ctrl,
+                                 smb_group_idx=smb_group_idx,
+                                 smb_grp=smb_grp,
+                                 mbp_group_idx=mbp_group_idx,
+                                 mbp_grp=mbp_grp)
 
             # Release the semaphore
             print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
-            mbp_ctrl.sem_post()
 
             if pp_rank == pp_size - 1:
                 first_key = next(iter(y_dict))
@@ -324,7 +334,7 @@ def run_full_model(
             model.zero_grad()
             del pp_schedule, stage
             torch.cuda.empty_cache()
-            # Run optimizer here
+            mbp_ctrl.sem_post()
 
         # Wait for all MBP members to finish gradient accumulation before running optimizer
         dist.barrier(group=mbp_grp)
@@ -357,7 +367,7 @@ if __name__ == "__main__":
     num_gpus = torch.cuda.device_count()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_gpus)
 
-    mesh = dist.init_device_mesh("cuda", (6, 2, 2, 1), 
+    mesh = dist.init_device_mesh("cuda", (8, 2, 2, 1), 
                                  mesh_dim_names=("mbp", "pp", "ep", "fsdp"))
     
     assert num_gpus >= mesh.size() // mesh["mbp"].size()
