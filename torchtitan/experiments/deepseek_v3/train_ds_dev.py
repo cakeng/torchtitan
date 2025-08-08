@@ -87,7 +87,7 @@ def run_full_model(
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
 
     # Synthetic setting
-    microbatches = pp_size * 2
+    microbatches = 10
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
