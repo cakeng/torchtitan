@@ -30,6 +30,7 @@ from ipc_pipeline_src.mbp_stage import MbpStage
 from ipc_pipeline_src.ipc_gradient import SharedGradientManager
 import torch_ipc_extension 
 
+from datetime import datetime
 
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
@@ -65,7 +66,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 16
+    model_args.num_hidden_layers = 12
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -196,8 +197,8 @@ def run_full_model(
 
     # Synthetic setting
     microbatches = mbp_size 
-    max_concurrent_processes = 1 * (mesh.size() // mbp_size)
-    # max_concurrent_processes = 2 * (mesh.size() // mbp_size)
+
+    max_concurrent_processes = 4 * (mesh.size() // mbp_size)
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -206,8 +207,8 @@ def run_full_model(
 
     # Example inputs
     torch.manual_seed(ep_rank)
-    bs = 4
-    seqlen = 128
+    bs = 1
+    seqlen = 64
     x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
     label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
 
@@ -238,6 +239,8 @@ def run_full_model(
     if mbp_size > 1:
         # Only the first process in each SMB group captures the weight gradients
         mbp_grad_manager = SharedGradientManager(model, mesh=fsdp_mesh, group=mbp_grp)
+        pp_schedule = None
+        stage = None
         if smb_group_idx == 0:
             grad_metadata = {}
             handles = []
@@ -260,23 +263,24 @@ def run_full_model(
                 y_dict = pp_schedule.step(target=label)
             else:
                 pp_schedule.step()
-        dist.barrier(group=mbp_grp)
+        dist.barrier(group=global_cpu_grp)
 
         # Now, all ranks in the MBP group participate in creating the shared cache.
         # Rank 0 will broadcast the metadata it discovered.
         mbp_grad_manager.setup_shared_cache()
-        print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.")
+        if smb_group_idx == 0:
+            del pp_schedule, stage
+        torch.cuda.empty_cache()
+        print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.\n", end="")
 
-    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}")
+
+    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     dist.barrier(group=global_cpu_grp)
 
-    
     # Run forward and backward
-    steps = 2
+    steps = 1
     for _ in range(steps):
         # Only the first process in each SMB group captures the weight gradients
-        model.zero_grad()
-        mbp_grad_manager.zero_grad()
         if pp_size > 1:
             # Create pipeline stage
             stage = MbpStage(
@@ -286,46 +290,63 @@ def run_full_model(
                 device,
                 group=pp_mesh.get_group(),
             )
-            # Enter the critical section one by one
+            pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, loss_fn=loss_fn, global_rank=rank)
+
             mbp_ctrl.wait_for_value(smb_group_idx)
             # Semaphore to limit memory usage
             mbp_ctrl.sem_wait()
-            print(b_str(f"Rank {rank} ") + f"Executing F/B pass on microbatch {mbp_rank}\n", end="")
+            print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")            # Wait for all SMB group members to enter the critical section before allowing the next MBP group to enter
+
             # Wait for all SMB group members to enter the critical section before allowing the next MBP group to enter
             dist.barrier(group=smb_grp)
-            if mbp_group_idx == 0:
-                # Let other MBP groups enter the critical section 
-                # May still get blocked by the semaphore if too many MBP groups are in the critical section
-                mbp_ctrl.add(1)
-
-            pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, loss_fn=loss_fn, global_rank=rank)
 
             losses = []
             if pp_rank == 0:
-                pp_schedule.step(x)
+                pp_schedule.step(x,
+                                 mbp_ctrl=mbp_ctrl,
+                                 smb_group_idx=smb_group_idx,
+                                 smb_grp=smb_grp,
+                                 mbp_group_idx=mbp_group_idx,
+                                 mbp_grp=mbp_grp)
             elif pp_rank == pp_size - 1:
-                y_dict = pp_schedule.step(target=label, losses=losses)
+                y_dict = pp_schedule.step(target=label, losses=losses,
+                                          mbp_ctrl=mbp_ctrl,
+                                          smb_group_idx=smb_group_idx,
+                                          smb_grp=smb_grp,
+                                          mbp_group_idx=mbp_group_idx,
+                                          mbp_grp=mbp_grp)
                 loss = torch.mean(torch.stack(losses))
             else:
-                pp_schedule.step()
-
-            print(b_str(f"Rank {rank} ") + f"Finished F/B pass on microbatch {mbp_rank}\n", end="")  
+                pp_schedule.step(mbp_ctrl=mbp_ctrl,
+                                 smb_group_idx=smb_group_idx,
+                                 smb_grp=smb_grp,
+                                 mbp_group_idx=mbp_group_idx,
+                                 mbp_grp=mbp_grp)
 
             # Release the semaphore
+            print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
+
+            if pp_rank == pp_size - 1:
+                first_key = next(iter(y_dict))
+                print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
+
+            mbp_grad_manager.accumulate_grad()
+            model.zero_grad()
+            del pp_schedule, stage
+            torch.cuda.empty_cache()
             mbp_ctrl.sem_post()
 
-        if pp_rank == pp_size - 1:
-            first_key = next(iter(y_dict))
-            print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
-
-        mbp_grad_manager.accumulate_grad()
         # Wait for all MBP members to finish gradient accumulation before running optimizer
         dist.barrier(group=mbp_grp)
 
-        if pp_rank == 0 and ((mbp_size > 1 and mbp_rank > 1) or (mbp_size <= 1 and mbp_rank == 0)):
-            # param = model.get_parameter("model.layers.0.self_attn.q_proj.weight")
-            grad = mbp_grad_manager.get_grad("model.layers.0.self_attn.q_proj.weight")
-            print(y_str(f"Rank {rank} ") + f"{torch.linalg.norm(grad)=}")
+        if mbp_rank == 0:
+            # Run optimizer here
+            if rank == 0:
+                grad = mbp_grad_manager.get_grad("model.layers.0.self_attn.q_proj.weight")
+                print(y_str(f"Rank {rank} ") + f"{torch.linalg.norm(grad)=}")
+
+        dist.barrier(group=mbp_grp)
+        mbp_grad_manager.zero_grad()
 
         # Wait for all processes to finish before the next iteration
         dist.barrier(group=global_cpu_grp)
@@ -346,11 +367,14 @@ if __name__ == "__main__":
     num_gpus = torch.cuda.device_count()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_gpus)
 
-    mesh = dist.init_device_mesh("cuda", (2, 2, 2, 1), 
+    mesh = dist.init_device_mesh("cuda", (8, 2, 2, 1), 
                                  mesh_dim_names=("mbp", "pp", "ep", "fsdp"))
     
     assert num_gpus >= mesh.size() // mesh["mbp"].size()
 
+    time_start = datetime.now()
     run_full_model(mesh)
+    time_end = datetime.now()
+    print(f"Time elapsed: {time_end - time_start}\n", end="")
 
     dist.destroy_process_group()

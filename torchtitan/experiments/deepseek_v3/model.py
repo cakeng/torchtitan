@@ -1237,7 +1237,7 @@ class DeepseekModel(torch.nn.Module):
         assert (
             config.stage_idx < config.num_stages
         ), f"Stage {config.stage_idx} is not in the model"
-        print(f"Creating model stage {config.stage_idx} of {config.num_stages}")
+        print(f"Creating model stage {config.stage_idx} of {config.num_stages}\n", end="")
 
         self.embed_tokens = (
             nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
