@@ -211,7 +211,7 @@ def _set_param_or_buffer(model, name, new_tensor):
 
 def get_driver_memory_usage(device_index: int):
     """
-    Gets the used and total GPU memory for the current process directly from
+    Gets the total used GPU memory and total GPU memory directly from
     the driver for a specific device.
 
     This function is useful for verifying memory allocated outside of PyTorch's
@@ -219,13 +219,13 @@ def get_driver_memory_usage(device_index: int):
     extension like the one we built.
 
     Args:
-        device_index: The index of the GPU device (e.g., 0).
+        device_index: The logical index of the GPU device (e.g., 0).
+                     This accounts for CUDA_VISIBLE_DEVICES.
 
     Returns:
-        A tuple of (used_memory_mb, total_memory_mb).
+        A tuple of (total_used_memory_mb, total_memory_mb).
         Returns (None, None) if the driver tool is not found or parsing fails.
     """
-    pid = os.getpid()
     used_mb = None
     total_mb = None
 
@@ -233,36 +233,64 @@ def get_driver_memory_usage(device_index: int):
     nvidia_smi_path = shutil.which("nvidia-smi")
     if nvidia_smi_path:
         try:
+            # Get the actual physical GPU index by querying all GPUs and mapping
+            # the logical device index to the physical one
+            list_cmd = [
+                nvidia_smi_path,
+                "--query-gpu=index",
+                "--format=csv,noheader,nounits"
+            ]
+            result = subprocess.run(
+                list_cmd, capture_output=True, text=True, check=True
+            )
+            
+            # Parse the list of available GPU indices
+            available_gpus = [int(idx.strip()) for idx in result.stdout.strip().split('\n') if idx.strip()]
+            
+            # Get CUDA_VISIBLE_DEVICES if set
+            cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+            if cuda_visible_devices:
+                # Parse CUDA_VISIBLE_DEVICES to get the mapping
+                visible_indices = [int(idx.strip()) for idx in cuda_visible_devices.split(',') if idx.strip()]
+                if device_index < len(visible_indices):
+                    physical_device_index = visible_indices[device_index]
+                else:
+                    print(f"Device index {device_index} out of range for CUDA_VISIBLE_DEVICES={cuda_visible_devices}")
+                    return None, None
+            else:
+                # No CUDA_VISIBLE_DEVICES, use device_index directly
+                physical_device_index = device_index
+            
+            # Verify the physical device index is valid
+            if physical_device_index not in available_gpus:
+                print(f"Physical device index {physical_device_index} not found in available GPUs: {available_gpus}")
+                return None, None
+            
             # Get total memory for the specified device
             total_cmd = [
                 nvidia_smi_path,
                 f"--query-gpu=memory.total",
                 f"--format=csv,noheader,nounits",
-                f"--id={device_index}"
+                f"--id={physical_device_index}"
             ]
             result = subprocess.run(
                 total_cmd, capture_output=True, text=True, check=True
             )
-            total_mb = int(result.stdout.strip())
+            total_mb = int(result.stdout.strip()) * 1024 * 1024
+            # print(f"nvidia-smi output 1: {result.stdout}, total_mb: {total_mb}")
 
-            # Get memory used by the current process
+            # Get total used memory for the specified device
             used_cmd = [
                 nvidia_smi_path,
-                "--query-compute-apps=pid,used_gpu_memory",
-                "--format=csv,noheader,nounits"
+                f"--query-gpu=memory.used",
+                f"--format=csv,noheader,nounits",
+                f"--id={physical_device_index}"
             ]
             result = subprocess.run(
                 used_cmd, capture_output=True, text=True, check=True
             )
-            
-            used_mb = 0 # Default to 0 if process not found
-            for line in result.stdout.strip().split("\n"):
-                if not line:
-                    continue
-                proc_pid, mem_used = line.split(", ")
-                if int(proc_pid) == pid:
-                    used_mb = int(mem_used)
-                    break
+            used_mb = int(result.stdout.strip()) * 1024 * 1024
+            # print(f"nvidia-smi output 2: {result.stdout}, used_mb: {used_mb}")
             
             return used_mb, total_mb
         except Exception as e:
@@ -348,9 +376,14 @@ def test_memory_management(rank, device):
             tensors.append(shared_tensor)
         if rank == 0:
             size = shared_tensor.element_size() * shared_tensor.numel()
-            if size < 2 * 1024 * 1024:
-                # The driver allocates in 2MiB chunks, so we need to round up
-                size = 2 * 1024 * 1024
+            if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+                if size < 2 * 1024 * 1024:
+                    # The AMD driver allocates in 2MiB chunks, so we need to round up
+                    size = 2 * 1024 * 1024
+            else:
+                if size < 512 * 1024:
+                    # The NVIDIA driver allocates in 512KiB chunks, so we need to round up
+                    size = 512 * 1024
             size *= num_alloc
         dist.barrier()
         
@@ -1071,7 +1104,8 @@ def main():
     # the model while other ranks proceed.
     dist.barrier()
 
-    model_id = "deepseek-ai/deepseek-v2-lite"
+    model_id = "deepseek-ai/DeepSeek-V2-lite-chat"
+    # model_id = "moonshotai/Moonlight-16B-A3B"
     model_dtype = torch.float16
 
     if rank == 0:
@@ -1110,7 +1144,7 @@ def main():
         print("--- Parameter sharing verification PASSED ---")
 
     # --- STAGE 2: Forward Pass (Logits) Verification ---
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         

@@ -26,11 +26,25 @@ if hasattr(torch.version, 'hip') and torch.version.hip is not None:
     library_dirs.append(os.path.join(rocm_path, 'lib'))
     
     # Add the specific library needed for roctx functions
-    libraries.append('roctracer64')
+    # libraries.append('roctracer64')
     
 else:
-    # Add nvtx for profiling if in a CUDA environment.
-    libraries.append('nvtx3')
+    # CUDA environment - add CUDA include and library directories
+    cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+    if os.path.exists(cuda_home):
+        include_dirs.append(os.path.join(cuda_home, 'include'))
+        library_dirs.append(os.path.join(cuda_home, 'lib64'))
+        # Add nvtx for profiling if in a CUDA environment.
+        # libraries.append('nvtx3')
+    else:
+        # Fallback: try to find CUDA in common locations
+        common_cuda_paths = ['/usr/local/cuda', '/usr/cuda', '/opt/cuda']
+        for cuda_path in common_cuda_paths:
+            if os.path.exists(cuda_path):
+                include_dirs.append(os.path.join(cuda_path, 'include'))
+                library_dirs.append(os.path.join(cuda_path, 'lib64'))
+                # libraries.append('nvtx3')
+                break
 
 # --- Define the single source file to be compiled ---
 source_file = os.path.join(
