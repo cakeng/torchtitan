@@ -117,8 +117,6 @@ class _MbpSchedule(ABC):
         target_mbs: Optional[list] = None,
         losses: Optional[list] = None,
         mbp_ctrl=None,
-        smb_group_idx: int = 0,
-        smb_grp: dist.ProcessGroup = None,
         mbp_group_idx: int = 0,
         mbp_grp: dist.ProcessGroup = None,
     ):
@@ -307,8 +305,6 @@ class MbpScheduleSingle(_MbpSchedule):
 
     def step(self, *args, target=None, losses: Optional[list] = None,
             mbp_ctrl=None,
-            smb_group_idx: int = 0,
-            smb_grp: dist.ProcessGroup = None,
             mbp_group_idx: int = 0,
             mbp_grp: dist.ProcessGroup = None,
             **kwargs):
@@ -338,8 +334,6 @@ class MbpScheduleSingle(_MbpSchedule):
         # Run microbatches
         self._step_microbatches(args_split, kwargs_split, targets_split, losses,
                                 mbp_ctrl,
-                                smb_group_idx,
-                                smb_grp,
                                 mbp_group_idx,
                                 mbp_grp)
 
@@ -363,8 +357,6 @@ class ScheduleMbp(MbpScheduleSingle):
         target_mbs: Optional[list] = None,
         losses: Optional[list] = None,
         mbp_ctrl=None,
-        smb_group_idx: int = 0,
-        smb_grp: dist.ProcessGroup = None,
         mbp_group_idx: int = 0,
         mbp_grp: dist.ProcessGroup = None,
     ):
@@ -393,16 +385,17 @@ class ScheduleMbp(MbpScheduleSingle):
             logging.info(g_str(f"Rank {self._global_rank}: ") + b_str(f"Forwarding {i}") + f", receiving {ops}")
 
             output = self._stage.forward_one_chunk(i, arg_mbs[i], kwarg_mbs[i])  # type: ignore[index]
-
-            if mbp_ctrl is not None and mbp_group_idx == 0:
-                # Let other MBP groups enter the forward pass
-                # May still get blocked by the semaphore if too many MBP groups are in the critical section
-                mbp_ctrl.add(1)
-
+ 
             ops = self._stage.get_fwd_send_ops(i)
             logging.info(g_str(f"Rank {self._global_rank}: ") + b_str(f"Forwarded {i}") + f", sending {ops}")
             works = _sorted_batch_p2p(ops, desc="fwd_send")
             fwd_sends_to_wait.extend(works.values())
+            
+            if mbp_ctrl is not None:
+                # Let other MBP groups enter the forward pass
+                # May still get blocked by the semaphore if too many MBP groups are in the critical section
+                mbp_ctrl.add(1)
+
 
         self._maybe_compute_loss(self._stage, output, target_mbs, i)
 

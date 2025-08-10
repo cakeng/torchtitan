@@ -49,9 +49,8 @@ class SharedGradientManager:
                 if param.requires_grad and param.grad is not None:
                     grad = param.grad
                     if isinstance(grad, DTensor):
-                        grad_metadata[name] = (grad.shape, grad.dtype, grad.placements)
-                    else:
-                        grad_metadata[name] = (grad.shape, grad.dtype, [Replicate()])
+                        grad = grad.to_local()
+                    grad_metadata[name] = (grad.shape, grad.dtype)
 
         metadata_list = [grad_metadata]
         src_global_rank = dist.get_global_rank(group=self.group, group_rank=src_rank)
@@ -60,17 +59,11 @@ class SharedGradientManager:
         if self.rank != src_rank:
             grad_metadata = metadata_list[0]
 
-        for name, (global_shape, dtype, placements) in grad_metadata.items():
-            meta_tensor = torch.empty(global_shape, dtype=dtype, device="meta")
-            conceptual_dtensor = distribute_tensor(meta_tensor, self.mesh, placements)
-            local_shard_shape = conceptual_dtensor.to_local().shape
-
-            if torch.Size(local_shard_shape).numel() == 0:
-                continue
-
+        for name, (shape, dtype) in grad_metadata.items():
             # This creates a plain torch.Tensor backed by shared memory
+            device = torch.device("cuda", torch.cuda.current_device())
             shared_local_tensor, _ = torch_ipc_extension.create_tensor_and_get_ipc(
-                local_shard_shape, dtype, torch.device(self.mesh.device_type)
+                shape, dtype, device
             )
             
             # The cache correctly stores the plain tensor
