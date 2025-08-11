@@ -23,6 +23,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 
+from datetime import datetime
 
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
@@ -87,7 +88,7 @@ def run_full_model(
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
 
     # Synthetic setting
-    microbatches = 10
+    microbatches = 4
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -151,8 +152,13 @@ if __name__ == "__main__":
     # set device before init_device mesh, otherwise ep will have duplicate device mapping
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    mesh = dist.init_device_mesh("cuda", (2, 2, 2), mesh_dim_names=("pp", "ep", "fsdp"))
+    mesh = dist.init_device_mesh("cuda", (2, 2, 1), mesh_dim_names=("pp", "ep", "fsdp"))
+
+    start_time = datetime.now()
 
     run_full_model(mesh)
+    
+    end_time = datetime.now()
+    print(f"Time taken: {end_time - start_time}")
 
     dist.destroy_process_group()
