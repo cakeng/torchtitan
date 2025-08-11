@@ -5,6 +5,7 @@ import shutil
 import math
 import time
 import random
+import gc
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -22,52 +23,93 @@ def b_str(s):
 def y_str(s):
     return "\033[33m" + s + "\033[0m"
 
+def _analyze_referrers(obj, name):
+    """A helper function to print detailed information about an object's referrers."""
+    print(f"--- Analyzing referrers for: {name} ---")
+    referrers = gc.get_referrers(obj)
+    print(f"Found {len(referrers)} referrers.")
+    for i, ref in enumerate(referrers):
+        print(f"  Referrer {i+1}:")
+        print(f"    Type: {type(ref)}")
+        if isinstance(ref, dict):
+            for k, v in ref.items():
+                if v is obj:
+                    print(f"    Found in dict with key: '{k}'")
+        elif isinstance(ref, (list, tuple, set)):
+            print(f"    Found in a container of length {len(ref)}")
+        elif isinstance(ref, types.FrameType):
+            print(f"    It's a frame object (temporary reference from code execution)")
+            print(f"      Code: {ref.f_code.co_name} in {ref.f_code.co_filename}:{ref.f_lineno}")
+        else:
+            try:
+                print(f"    Content (snippet): {str(ref)[:200]}")
+            except Exception:
+                print("    Content could not be displayed.")
+    print("-" * (20 + len(name)))
+
+
 def share_model_parameters_ipc(
     model: nn.Module,
     group: dist.ProcessGroup = None,
     src_rank: int = 0
 ):
-    """Shares model parameters from a source rank using the C++ IPC extension."""
-    # Add a barrier to ensure all processes enter the function together.
+    """
+    Shares model parameters from a source rank using the C++ IPC extension,
+    ensuring original tensor memory is freed.
+    """
     if group is None:
         group = dist.group.WORLD
     rank = dist.get_rank(group=group)
 
     if rank == src_rank:
         handles_and_meta = []
-        tensors_to_share = list(model.named_parameters()) + list(
-            model.named_buffers()
-        )
+        # Get a list of all parameter and buffer names first.
+        param_names = [(True, name) for name, _ in model.named_parameters()]
+        buffer_names = [(False, name) for name, _ in model.named_buffers()]
         
-        # Store original tensors to prevent premature deallocation
-        original_tensors = {}
-        
-        for name, tensor in tensors_to_share:
-            check_tensor_ipc_comptability(tensor)
+        for is_param, name in param_names + buffer_names:
+            # Get the parent module and the attribute name (e.g., 'weight', 'bias')
+            module_path, _, attr_name = name.rpartition('.')
+            parent_module = model.get_submodule(module_path)
             
-            # Store original tensor reference to prevent deallocation
-            original_tensors[name] = tensor
+            # Get the original tensor object just-in-time.
+            original_tensor = getattr(parent_module, attr_name)
+
+            # --- Optional Debugging ---
+            # Uncomment the line below to see a detailed breakdown of referrers.
+            # _analyze_referrers(original_tensor, name)
+
+            check_tensor_ipc_comptability(original_tensor)
             
-            shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(tensor)
-            device = torch.device("cuda", torch.cuda.current_device())
-            device_index = device.index if hasattr(device, "index") else device
-            device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+            # Create the shared tensor by copying the original.
+            shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(original_tensor)
+            
+            # Prepare metadata for broadcasting.
+            device = original_tensor.device
+            device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
             meta = (
-                name, handle, tensor.shape, tensor.dtype,
-                tensor.stride(), tensor.storage_offset(),
+                name, handle, original_tensor.shape, original_tensor.dtype,
+                original_tensor.stride(), original_tensor.storage_offset(),
                 device_uuid
             )
             handles_and_meta.append(meta)
             
-            # CRITICAL: Replace the parameter/buffer immediately to avoid duplicates
-            _set_param_or_buffer(model, name, shared_tensor)
-            
-            # Clear original tensor reference after replacement
-            del original_tensors[name]
-        
+            # CRITICAL FIX: Replace the parameter/buffer using setattr.
+            # This correctly de-registers the old tensor and registers the new one.
+            if is_param:
+                # Wrap the shared tensor in nn.Parameter to register it correctly.
+                setattr(parent_module, attr_name, nn.Parameter(shared_tensor))
+            else:
+                setattr(parent_module, attr_name, shared_tensor)
+
+        # Broadcast all handles and metadata at once.
         object_to_broadcast = [handles_and_meta]
         src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
         dist.broadcast_object_list(object_to_broadcast, src=src_global_rank, group=group)
+
+        # Force garbage collection and clear CUDA cache after the loop.
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
         received_objects = [None]
         src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
@@ -1064,14 +1106,19 @@ def main():
         print("\n" + "="*40)
         print("RUNNING TEST 3: SimpleModel")
         print("="*40)
+        
+    dist.barrier()
     
     if rank == 0:
         simple_model = SimpleModel().to(device)
     else:
         with init_empty_weights():
             simple_model = SimpleModel()
-
+    simple_model.eval()
+            
     share_model_parameters_ipc(simple_model)
+    
+    simple_model.train()
     
     if rank == 0:
         optimizer = torch.optim.SGD(simple_model.parameters(), lr=0.1)
@@ -1120,8 +1167,35 @@ def main():
             model = AutoModelForCausalLM.from_config(
                 config, torch_dtype=model_dtype, trust_remote_code=True
             )
+            
+    model.train()
+            
+    dist.barrier()
+    
+    mem_before_used, mem_before_total = get_driver_memory_usage(torch.cuda.current_device())
+    print(g_str(f"Rank {rank} ") + "mem_before_used: " + f"{mem_before_used/1024**2:.2f} MB, "
+          f"mem_before_total: {mem_before_total/1024**2:.2f} MB\n", end="")
+    
+    dist.barrier()
 
     share_model_parameters_ipc(model)
+    
+    dist.barrier()
+
+    mem_after_used, mem_after_total = get_driver_memory_usage(torch.cuda.current_device())
+    print(g_str(f"Rank {rank} ") + "mem_after_used: " + f"{mem_after_used/1024**2:.2f} MB, "
+          f"mem_after_total: {mem_after_total/1024**2:.2f} MB\n", end="")
+
+    assert mem_after_used < mem_before_used + 100*1024**2, (
+        r_str(f"Rank {rank} Memory leak detected after sharing model parameters!") + \
+        f"mem_before_used: {mem_before_used/1024**2:.2f} MB, " + \
+        f"mem_after_used: {mem_after_used/1024**2:.2f} MB, " + \
+        f"mem_after_total: {mem_after_total/1024**2:.2f} MB"
+    )
+
+    dist.barrier()
+    
+    simple_model.train()
     
     # --- STAGE 1: Direct Parameter Verification ---
     target_param_name = "model.layers.1.mlp.experts.0.up_proj.weight"

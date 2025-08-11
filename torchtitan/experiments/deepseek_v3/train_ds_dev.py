@@ -11,7 +11,9 @@
 # and is intended to be used for debugging and development
 
 import os
+from re import T
 
+from accelerate.utils.megatron_lm import F
 import torch
 import torch.distributed as dist
 
@@ -43,6 +45,20 @@ def b_str(s):
     return "\033[34m" + s + "\033[0m"
 def y_str(s):
     return "\033[33m" + s + "\033[0m"
+
+def print_memory_usage():
+    allocated_mem = torch.cuda.memory_allocated()
+    cached_mem = torch.cuda.memory_reserved()
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    total_used_mem = total_mem - free_mem
+    other_process_mem = total_used_mem - cached_mem
+    str = (f"Total memory: {total_mem/1024**2:.2f} MB, "
+          f"Free memory: {free_mem/1024**2:.2f} MB, "
+          f"Total used memory: {total_used_mem/1024**2:.2f} MB, "
+          f"Allocated memory: {allocated_mem/1024**2:.2f} MB, "
+          f"Cached memory: {cached_mem/1024**2:.2f} MB, "
+          f"Other process memory: {other_process_mem/1024**2:.2f} MB")
+    return str
 
 # Run full model
 def run_full_model(
@@ -129,6 +145,8 @@ def run_full_model(
     dist.barrier(group=global_cpu_grp)
 
     # Instantiate model
+    print(g_str(f"Rank {rank} ") + "Before model instantiation " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
     with device, mesh:
         if mbp_rank == 0:    
             # Only MBP rank 0 creates the model with weights
@@ -137,11 +155,15 @@ def run_full_model(
             # Other ranks create the model without weights
             with init_empty_weights():
                 model = DeepseekForCausalLM(model_args)
-
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After model instantiation " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
     if mbp_size > 1:
         # Share model parameters across MBP group
         share_model_parameters_ipc(model, mbp_grp)
-
+        
+    print(g_str(f"Rank {rank} ") + "After sharing model parameters " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
     # Load weights
     # load_weights_from_hf(model, model_id, device)
     model.train()
@@ -162,7 +184,9 @@ def run_full_model(
 
     # Apply HSDP on root model (lm_head, embeddings, etc)
     fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
-
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
     # Synthetic setting
     microbatches = mbp_size 
     max_concurrent_process_groups = 2
@@ -174,14 +198,16 @@ def run_full_model(
 
     # Example inputs
     torch.manual_seed(ep_rank)
-    bs = 1
-    seqlen = 64
+    bs = 4
+    seqlen = 128
     x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
     label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
 
     if rank == 0:
         print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
-
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy 
 
@@ -197,7 +223,8 @@ def run_full_model(
             name=mbp_ctrl_name, is_creator=False
         )
     dist.barrier(group=global_cpu_grp)
-
+    print(g_str(f"Rank {rank} ") + "After MBP control setup " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
     # Setup MBP shared gradient manage
     # Only the first rank in each MBP group captures the weight gradients
     mbp_grad_manager = SharedGradientManager(model, mesh=fsdp_mesh, group=mbp_grp)
@@ -226,7 +253,8 @@ def run_full_model(
         else:
             pp_schedule.step()
     dist.barrier(group=global_cpu_grp)
-
+    print(g_str(f"Rank {rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
     # Now, all ranks in the MBP group participate in creating the shared cache.
     # Rank 0 will broadcast the metadata it discovered.
     mbp_grad_manager.setup_shared_cache()
@@ -234,6 +262,8 @@ def run_full_model(
         del pp_schedule, stage
     torch.cuda.empty_cache()
     print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After shared gradient cache setup " + print_memory_usage() + "\n", end="")
     dist.barrier(group=global_cpu_grp)
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     dist.barrier(group=global_cpu_grp)
@@ -273,6 +303,8 @@ def run_full_model(
                 pp_schedule.step(mbp_ctrl=mbp_ctrl,
                                  mbp_group_idx=mbp_group_idx,
                                  mbp_grp=mbp_grp)
+            
+            print(g_str(f"Rank {rank} ") + "After F/B pass" + print_memory_usage() + "\n", end="")
 
             # Release the semaphore
             print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
@@ -285,6 +317,8 @@ def run_full_model(
             model.zero_grad()
             del pp_schedule, stage
             torch.cuda.empty_cache()
+            print(g_str(f"Rank {rank} ") + "After gradient accumulation" + print_memory_usage() + "\n", end="")
+
             mbp_ctrl.sem_post()
 
         # Wait for all MBP members to finish gradient accumulation before running optimizer
@@ -314,7 +348,7 @@ def run_full_model(
 
 
 if __name__ == "__main__":
-    mbp_size = 4
+    mbp_size = 2
     pp_size = 2
     ep_size = 2
     fsdp_size = 1

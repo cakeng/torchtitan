@@ -51,6 +51,8 @@ class SharedGradientManager:
                     if isinstance(grad, DTensor):
                         grad = grad.to_local()
                     grad_metadata[name] = (grad.shape, grad.dtype)
+                    param.grad = None
+                    grad = None
 
         metadata_list = [grad_metadata]
         src_global_rank = dist.get_global_rank(group=self.group, group_rank=src_rank)
@@ -68,7 +70,8 @@ class SharedGradientManager:
             
             # The cache correctly stores the plain tensor
             self.grad_cache[name] = shared_local_tensor
-        
+            
+        torch.cuda.empty_cache()
         self.zero_grad()
 
     def accumulate_grad(self):
