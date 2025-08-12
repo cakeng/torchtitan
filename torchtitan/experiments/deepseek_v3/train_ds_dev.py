@@ -67,22 +67,25 @@ def run_full_model(
     pp_mesh = mesh["pp"]
     ep_mesh = mesh["ep"]
     mbp_mesh = mesh["mbp"]
+    fsdp_mesh = mesh["fsdp"]
     pp_rank = pp_mesh.get_local_rank()
     ep_rank = ep_mesh.get_local_rank()
     mbp_rank = mbp_mesh.get_local_rank()
+    fsdp_rank = fsdp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
     ep_size = ep_mesh.size()
     mbp_size = mbp_mesh.size()
+    fsdp_size = fsdp_mesh.size()
 
     rank = dist.get_rank()
-    device_count = torch.cuda.device_count()
+    device_count = min(torch.cuda.device_count(), pp_size * ep_size * fsdp_size)
     device = torch.device("cuda", rank % device_count)
 
     # Get model configs
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 16
+    model_args.num_hidden_layers = 4
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -92,10 +95,9 @@ def run_full_model(
         print(
             b_str(f"Parallelism Setting: ") + 
             f"Global_{rank=}, {ep_size=}, {pp_size=}, {mbp_size=}, "
-            f"Ranks: {ep_rank=}, {pp_rank=}, {mbp_rank=}, {device=}, "
+            f"Ranks: {mbp_rank=}, {ep_rank=}, {pp_rank=}, {fsdp_rank=}, {device=}, "
             f"{model_args.num_stages=}, {model_args.stage_idx=}"
         )
-        # print(model_args) 
     
     # Setup MBP groups
     global_cpu_grp = dist.new_group(
@@ -177,19 +179,27 @@ def run_full_model(
         # Apply FSDP to experts
         if hasattr(layer.mlp, "experts"):
             for expert in layer.mlp.experts.values():
-                fully_shard(expert, mesh=fsdp_mesh, reshard_after_forward=False)
+                fully_shard(expert, 
+                    mesh=fsdp_mesh, 
+                    reshard_after_forward=False)
         # Apply HSDP to other parts such as attention, layernorm, because they
         # are doing DDP on EP dimension
-        fully_shard(layer, mesh=hsdp_mesh, reshard_after_forward=False)
+        fully_shard(layer, 
+                    mesh=hsdp_mesh, 
+                    reshard_after_forward=False)
 
     # Apply HSDP on root model (lm_head, embeddings, etc)
-    fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
+    fully_shard(model, 
+                mesh=hsdp_mesh, 
+                reshard_after_forward=False)
+    # dist.barrier(group=global_cpu_grp)
+    # print(g_str(f"Rank {rank} ") + f"Model after FSDP {model} \n", end="")
     dist.barrier(group=global_cpu_grp)
     print(g_str(f"Rank {rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
     dist.barrier(group=global_cpu_grp)
     # Synthetic setting
     microbatches = mbp_size 
-    max_concurrent_process_groups = 2
+    max_concurrent_process_groups = 1
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -231,9 +241,6 @@ def run_full_model(
     pp_schedule = None
     stage = None
     if mbp_rank == 0:
-        grad_metadata = {}
-        handles = []
-
         print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
         # Create pipeline stage
         stage = MbpStage(
@@ -244,7 +251,8 @@ def run_full_model(
             group=pp_mesh.get_group(),
         )
 
-        pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, loss_fn=loss_fn, global_rank=rank)
+        pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
+                                  loss_fn=loss_fn, global_rank=rank)
 
         if pp_rank == 0:
             pp_schedule.step(x)
@@ -281,12 +289,15 @@ def run_full_model(
                 device,
                 group=pp_mesh.get_group(),
             )
-            pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, loss_fn=loss_fn, global_rank=rank)
+            pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
+                                      loss_fn=loss_fn, global_rank=rank)
 
             mbp_ctrl.wait_for_value(mbp_rank)
             mbp_ctrl.sem_wait()
             print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
 
+            loss = None
+            y_dict = None
             losses = []
             if pp_rank == 0:
                 pp_schedule.step(x,
@@ -316,6 +327,11 @@ def run_full_model(
             mbp_grad_manager.accumulate_grad()
             model.zero_grad()
             del pp_schedule, stage
+            del losses
+            if loss is not None:
+                del loss
+            if y_dict is not None:
+                del y_dict
             torch.cuda.empty_cache()
             print(g_str(f"Rank {rank} ") + "After gradient accumulation" + print_memory_usage() + "\n", end="")
 
@@ -351,7 +367,7 @@ if __name__ == "__main__":
     mbp_size = 2
     pp_size = 2
     ep_size = 2
-    fsdp_size = 1
+    fsdp_size = 2
     
     assert torch.cuda.device_count() >= pp_size * ep_size * fsdp_size
     num_gpus = min(torch.cuda.device_count(), pp_size * ep_size * fsdp_size)
