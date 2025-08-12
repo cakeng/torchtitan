@@ -29,7 +29,7 @@ from accelerate import init_empty_weights
 from ipc_pipeline_src.ipc_share import share_model_parameters_ipc
 from ipc_pipeline_src.mbp_schedule import ScheduleMbp
 from ipc_pipeline_src.mbp_stage import MbpStage
-from ipc_pipeline_src.ipc_gradient import SharedGradientManager, get_gradient_weight_info
+from ipc_pipeline_src.ipc_gradient import SharedGradientManager
 import torch_ipc_extension 
 
 from datetime import datetime
@@ -85,7 +85,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 2
+    model_args.num_hidden_layers = 4
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -146,97 +146,81 @@ def run_full_model(
     
     dist.barrier(group=global_cpu_grp)
 
-    if mbp_rank == 0:  
-        # Instantiate model
-        print(g_str(f"Rank {rank} ") + "Before model instantiation " + print_memory_usage() + "\n", end="")
-        with device, mesh:
+    # Instantiate model
+    print(g_str(f"Rank {rank} ") + "Before model instantiation " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    with device, mesh:
+        if mbp_rank == 0:    
             # Only MBP rank 0 creates the model with weights
             model = DeepseekForCausalLM(model_args)
-        print(g_str(f"Rank {rank} ") + "After model instantiation " + print_memory_usage() + "\n", end="")
-        # Load weights
-        # load_weights_from_hf(model, model_id, device)
-        model.train()
+        else:
+            # Other ranks create the model without weights
+            with init_empty_weights():
+                model = DeepseekForCausalLM(model_args)
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After model instantiation " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    if mbp_size > 1:
+        # Share model parameters across MBP group
+        share_model_parameters_ipc(model, mbp_grp)
+        
+    print(g_str(f"Rank {rank} ") + "After sharing model parameters " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    # Load weights
+    # load_weights_from_hf(model, model_id, device)
+    model.train()
 
-        # Apply data parallelism
-        # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
-        # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
-        # Reason: the MoE is "sparsely activated" compared to the dense model, thus
-        # it will be ineconomical re-gather the weights.
-        for layer in model.model.layers.values():
-            # Apply FSDP to experts
-            if hasattr(layer.mlp, "experts"):
-                for expert in layer.mlp.experts.values():
-                    fully_shard(expert, 
-                        mesh=fsdp_mesh, 
-                        reshard_after_forward=False)
-            # Apply HSDP to other parts such as attention, layernorm, because they
-            # are doing DDP on EP dimension
-            fully_shard(layer, 
-                        mesh=hsdp_mesh, 
-                        reshard_after_forward=False)
-
-        # Apply HSDP on root model (lm_head, embeddings, etc)
-        fully_shard(model, 
+    # Apply data parallelism
+    # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
+    # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
+    # Reason: the MoE is "sparsely activated" compared to the dense model, thus
+    # it will be ineconomical re-gather the weights.
+    for layer in model.model.layers.values():
+        # Apply FSDP to experts
+        if hasattr(layer.mlp, "experts"):
+            for expert in layer.mlp.experts.values():
+                fully_shard(expert, 
+                    mesh=fsdp_mesh, 
+                    reshard_after_forward=False)
+        # Apply HSDP to other parts such as attention, layernorm, because they
+        # are doing DDP on EP dimension
+        fully_shard(layer, 
                     mesh=hsdp_mesh, 
                     reshard_after_forward=False)
-        print(g_str(f"Rank {rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
-        # Synthetic setting
-        microbatches = mbp_size 
-        max_concurrent_process_groups = 1
 
-        # Use Symmetric Memory for MoE token shuffle.
-        # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
-        # currently supported for forward only. See `generate.py`.
-        # model.setup_symm_mem(torch.bfloat16, device)
-
-        # Example inputs
-        torch.manual_seed(ep_rank)
-        bs = 4
-        seqlen = 128
-        x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
-        label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
-
-        if rank == 0:
-            print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
-        print(g_str(f"Rank {rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
-        # Create loss function
-        loss_fn = torch.nn.functional.cross_entropy 
-
-        print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
-        # Create pipeline stage
-        stage = MbpStage(
-            model,
-            pp_rank,
-            pp_size,
-            device,
-            group=pp_mesh.get_group(),
-        )
-
-        pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
-                                    loss_fn=loss_fn, global_rank=rank)
-
-        if pp_rank == 0:
-            pp_schedule.step(x)
-        elif pp_rank == pp_size - 1:
-            y_dict = pp_schedule.step(target=label)
-        else:
-            pp_schedule.step()
-        print(g_str(f"Rank {rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
-    
-        grad_weight_info = get_gradient_weight_info(model)
-        print(b_str(f"Rank {rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
-    return 
-    # Now, all ranks in the MBP group participate in creating the shared cache.
-    # Rank 0 will broadcast the metadata it discovered.
-    mbp_grad_manager = SharedGradientManager(model, group=mbp_grp)
-    mbp_grad_manager.setup_shared_cache()
-    if mbp_rank == 0:
-        del pp_schedule, stage
-    torch.cuda.empty_cache()
-    print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.\n", end="")
+    # Apply HSDP on root model (lm_head, embeddings, etc)
+    fully_shard(model, 
+                mesh=hsdp_mesh, 
+                reshard_after_forward=False)
+    # dist.barrier(group=global_cpu_grp)
+    # print(g_str(f"Rank {rank} ") + f"Model after FSDP {model} \n", end="")
     dist.barrier(group=global_cpu_grp)
-    print(g_str(f"Rank {rank} ") + "After shared gradient cache setup " + print_memory_usage() + "\n", end="")
-    
+    print(g_str(f"Rank {rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    # Synthetic setting
+    microbatches = mbp_size 
+    max_concurrent_process_groups = 1
+
+    # Use Symmetric Memory for MoE token shuffle.
+    # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
+    # currently supported for forward only. See `generate.py`.
+    # model.setup_symm_mem(torch.bfloat16, device)
+
+    # Example inputs
+    torch.manual_seed(ep_rank)
+    bs = 4
+    seqlen = 128
+    x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
+    label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
+
+    if rank == 0:
+        print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    # Create loss function
+    loss_fn = torch.nn.functional.cross_entropy 
+
     # Setup MBP control synchronization primitives for each MBP group
     mbp_ctrl_name = f"mbp_ctrl_{mbp_group_idx}"
     if mbp_rank == 0:
@@ -248,6 +232,46 @@ def run_full_model(
         mbp_ctrl = torch_ipc_extension.SharedData(
             name=mbp_ctrl_name, is_creator=False
         )
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After MBP control setup " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    # Setup MBP shared gradient manage
+    # Only the first rank in each MBP group captures the weight gradients
+    mbp_grad_manager = SharedGradientManager(model, mesh=fsdp_mesh, group=mbp_grp)
+    pp_schedule = None
+    stage = None
+    if mbp_rank == 0:
+        print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
+        # Create pipeline stage
+        stage = MbpStage(
+            model,
+            pp_rank,
+            pp_size,
+            device,
+            group=pp_mesh.get_group(),
+        )
+
+        pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
+                                  loss_fn=loss_fn, global_rank=rank)
+
+        if pp_rank == 0:
+            pp_schedule.step(x)
+        elif pp_rank == pp_size - 1:
+            y_dict = pp_schedule.step(target=label)
+        else:
+            pp_schedule.step()
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    # Now, all ranks in the MBP group participate in creating the shared cache.
+    # Rank 0 will broadcast the metadata it discovered.
+    mbp_grad_manager.setup_shared_cache()
+    if mbp_rank == 0:
+        del pp_schedule, stage
+    torch.cuda.empty_cache()
+    print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.\n", end="")
+    dist.barrier(group=global_cpu_grp)
+    print(g_str(f"Rank {rank} ") + "After shared gradient cache setup " + print_memory_usage() + "\n", end="")
     dist.barrier(group=global_cpu_grp)
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     dist.barrier(group=global_cpu_grp)
