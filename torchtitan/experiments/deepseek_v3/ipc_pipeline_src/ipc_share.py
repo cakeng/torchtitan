@@ -1,3 +1,15 @@
+"""
+IPC (Inter-Process Communication) Tensor Sharing Module
+
+This module provides high-level functions for sharing PyTorch tensors and model parameters
+across multiple processes using shared memory and IPC mechanisms.
+
+The underlying C++ extension (torch_ipc_extension) provides:
+- SharedData: A robust, process-shared data class using pthreads
+- IPC tensor creation, copying, and sharing functions
+- Process synchronization primitives (barriers, mutexes, semaphores)
+"""
+
 import subprocess
 import os
 import json
@@ -6,13 +18,117 @@ import math
 import time
 import random
 import gc
+import pickle
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights
+from typing import Tuple, List, Optional, Union, Any, Dict
 
+# Import the C++ extension
 import torch_ipc_extension
+
+# Type hints for the C++ extension functions and classes
+# This makes Pylance aware of the available functions and their signatures
+
+# SharedData class type hints
+class SharedData:
+    """
+    A robust, process-shared data class using pthreads for inter-process synchronization.
+    
+    This class provides:
+    - Process barriers for synchronization
+    - Atomic integer operations with condition variables
+    - Generic data buffer for arbitrary data exchange
+    - Mutex-based exclusive access control
+    - Semaphore-based resource management
+    
+    Attributes:
+        name (str): The unique name of the shared memory segment
+        is_creator (bool): Whether this process created the shared memory
+        barrier_size (int): Number of processes that must reach the barrier
+        initial_value (int): Initial value for the shared integer
+        semaphore_count (int): Initial semaphore count
+    """
+    
+    def __init__(self, name: str, is_creator: bool, barrier_size: int, 
+                 initial_value: int = 0, semaphore_count: int = 1) -> None:
+        """
+        Initialize or attach to a shared memory segment.
+        
+        Args:
+            name: Unique name for the shared memory segment
+            is_creator: Whether this process should create the shared memory
+            barrier_size: Number of processes that must reach the barrier
+            initial_value: Initial value for the shared integer (creator only)
+            semaphore_count: Initial semaphore count (creator only)
+        """
+        pass
+    
+    def barrier(self) -> None:
+        """Wait for all processes to reach this barrier."""
+        pass
+    
+    def get(self) -> int:
+        """Get the current value of the shared integer."""
+        pass
+    
+    def set(self, value: int) -> None:
+        """Set the value of the shared integer."""
+        pass
+    
+    def add(self, delta: int) -> None:
+        """Atomically add to the shared integer and return the new value."""
+        pass
+    
+    def wait_for_value(self, target_value: int) -> None:
+        """Wait until the shared integer reaches a target value."""
+        pass
+    
+    def write_data(self, data: bytes) -> None:
+        """Write bytes to the shared data buffer."""
+        pass
+    
+    def read_data(self) -> bytes:
+        """Read bytes from the shared data buffer."""
+        pass
+    
+    def sem_wait(self) -> None:
+        """Wait on (decrement) the semaphore."""
+        pass
+    
+    def sem_post(self) -> None:
+        """Post to (increment) the semaphore."""
+        pass
+
+def acquire(tensor: torch.Tensor) -> None:
+    """Acquire the lock for a given IPC tensor."""
+    pass
+
+def release(tensor: torch.Tensor) -> None:
+    """Release the lock for a given IPC tensor with device synchronization."""
+    pass
+
+def release_async(tensor: torch.Tensor) -> None:
+    """Release the lock for a given IPC tensor without device synchronization."""
+    pass
+
+def destroy_shared_data(shared_data: torch_ipc_extension.SharedData) -> None:
+    """Destroy and unlink shared memory for a SharedData object."""
+    pass
+
+# Re-export the actual C++ extension classes and functions
+# This ensures the type hints are available while maintaining the real functionality
+__all__ = [
+    'SharedData',
+    'acquire', 'release', 'release_async',
+    'destroy_shared_data',
+    'get_shared_data',
+    'share_model_parameters_ipc',
+    'create_and_share_tensor_ipc',
+    'copy_and_share_tensor_ipc'
+]
 
 def g_str(s):
     return "\033[32m" + s + "\033[0m"
@@ -22,6 +138,14 @@ def b_str(s):
     return "\033[34m" + s + "\033[0m"
 def y_str(s):
     return "\033[33m" + s + "\033[0m"
+
+def _check_tensor_ipc_comptability(tensor: torch.Tensor):
+    "IPC does not support tensors that are not contiguous, has offset > 0, or number of elements less than 1."
+    assert tensor is not None, "Tensors must not be None."
+    assert tensor.is_contiguous(), "Non-contiguous tensors are not supported by IPC."
+    tensor_size = torch.Size(tensor.shape)
+    assert tensor_size.numel() >= 1, "Tensors with fewer than 1 elements are not supported by IPC."
+    assert tensor.storage_offset() == 0, "Tensors with storage offset > 0 are not supported by IPC."
 
 def _analyze_referrers(obj, name):
     """A helper function to print detailed information about an object's referrers."""
@@ -48,43 +172,73 @@ def _analyze_referrers(obj, name):
     print("-" * (20 + len(name)))
 
 
+def _set_param_or_buffer(model, name, tensor):
+    """Helper to set a parameter or buffer in a model by its FQN."""
+    module_path, _, attr_name = name.rpartition('.')
+    parent_module = model.get_submodule(module_path)
+    # Check if the original attribute was a parameter
+    is_param = name in dict(model.named_parameters())
+    if is_param:
+        setattr(parent_module, attr_name, nn.Parameter(tensor))
+    else:
+        setattr(parent_module, attr_name, tensor)
+    
+_shm_name_history = set()
+def get_shared_data(shm_name: str, is_creator: bool, group_size: int,
+                    initial_value: int = 0, semaphore_count: int = 1,
+                    data_buffer_size: int = 4*1024) -> torch_ipc_extension.SharedData:
+    """Wraps the SharedData class constructor and checks if the shared memory name is valid."""
+    assert shm_name not in _shm_name_history, \
+        r_str(f"Shared memory name {shm_name} already exists.")
+    run_id = os.getenv('RUN_ID', "0")
+    if run_id == "0":
+        raise Warning(r_str(f"Environment variable RUN_ID is not set. " + \
+            "Please set it to a unique value to avoid shared memory name collision."))
+    shm_name = f"torch_ipc_extension_{shm_name}_{run_id}"
+    _shm_name_history.add(shm_name)
+    return torch_ipc_extension.SharedData(
+        name=shm_name, is_creator=is_creator, barrier_size=group_size,
+        initial_value=initial_value, semaphore_count=semaphore_count,
+        data_buffer_size=data_buffer_size
+    )
+    
+def destroy_shared_data(shared_data: torch_ipc_extension.SharedData):
+    """Destroy and unlink shared memory for a SharedData object."""
+    if shared_data.get_name() not in _shm_name_history:
+        raise Warning(r_str(f"Shared memory name {shared_data.get_name()} does not exist."))
+    _shm_name_history.remove(shared_data.get_name())
+    shared_data.destroy()
+    
+
 def share_model_parameters_ipc(
     model: nn.Module,
-    group: dist.ProcessGroup = None,
-    src_rank: int = 0
+    is_creator: bool,
+    group_size: int,
+    shm_name: str,
 ):
     """
-    Shares model parameters from a source rank using the C++ IPC extension,
-    ensuring original tensor memory is freed.
+    Shares model parameters from a source rank using C++-level IPC,
+    independent of torch.distributed.
     """
-    if group is None:
-        group = dist.group.WORLD
-    rank = dist.get_rank(group=group)
+    shm = get_shared_data(shm_name, is_creator, group_size, 
+                          data_buffer_size=128*1024*1024)
 
-    if rank == src_rank:
+    if is_creator:
         handles_and_meta = []
-        # Get a list of all parameter and buffer names first.
         param_names = [(True, name) for name, _ in model.named_parameters()]
         buffer_names = [(False, name) for name, _ in model.named_buffers()]
         
         for is_param, name in param_names + buffer_names:
-            # Get the parent module and the attribute name (e.g., 'weight', 'bias')
             module_path, _, attr_name = name.rpartition('.')
             parent_module = model.get_submodule(module_path)
-            
-            # Get the original tensor object just-in-time.
             original_tensor = getattr(parent_module, attr_name)
 
-            # --- Optional Debugging ---
-            # Uncomment the line below to see a detailed breakdown of referrers.
-            # _analyze_referrers(original_tensor, name)
-
-            check_tensor_ipc_comptability(original_tensor)
+            _check_tensor_ipc_comptability(original_tensor)
             
-            # Create the shared tensor by copying the original.
-            shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(original_tensor)
+            shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
+                original_tensor
+            )
             
-            # Prepare metadata for broadcasting.
             device = original_tensor.device
             device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
             meta = (
@@ -94,140 +248,130 @@ def share_model_parameters_ipc(
             )
             handles_and_meta.append(meta)
             
-            # CRITICAL FIX: Replace the parameter/buffer using setattr.
-            # This correctly de-registers the old tensor and registers the new one.
             if is_param:
-                # Wrap the shared tensor in nn.Parameter to register it correctly.
                 setattr(parent_module, attr_name, nn.Parameter(shared_tensor))
             else:
                 setattr(parent_module, attr_name, shared_tensor)
-
-        # Broadcast all handles and metadata at once.
-        object_to_broadcast = [handles_and_meta]
-        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
-        dist.broadcast_object_list(object_to_broadcast, src=src_global_rank, group=group)
-
-        # Force garbage collection and clear CUDA cache after the loop.
-        gc.collect()
-        torch.cuda.empty_cache()
-    else:
-        received_objects = [None]
-        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
-        dist.broadcast_object_list(received_objects, src=src_global_rank, group=group)
-        handles_and_meta = received_objects[0]
         
-        for name, handle, shape, dtype, stride, storage_offset, source_uuid in handles_and_meta:
-            device = torch.device("cuda", torch.cuda.current_device())
-            device_index = device.index if hasattr(device, "index") else device
-            device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+        # Serialize and write all metadata at once
+        payload = pickle.dumps(handles_and_meta)
+        shm.write_data(payload)
+        
+
+    # Barrier 1: Wait for src_rank to write data
+    shm.barrier()
+
+    if not is_creator:
+        payload = shm.read_data()
+        handles_and_meta = pickle.loads(payload)
+        
+        device = torch.device("cuda", torch.cuda.current_device())
+        device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
+        for name, handle, shape, dtype, stride, offset, source_uuid \
+            in handles_and_meta:
             assert device_uuid == source_uuid, \
-                r_str("Source tensor and destination tensor must be on the same device.") + \
-                f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
+                r_str("Source and destination tensor not on the same device.") + \
+                f" Source UUID: {source_uuid}, destination UUID: {device_uuid}"
             shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
-                handle, device, dtype, shape, stride, storage_offset)
+                handle, device, dtype, shape, stride, offset
+            )
             _set_param_or_buffer(model, name, shared_tensor)
             
-    # Add a barrier to ensure all processes have completed sharing
-    # before exiting the function.
-    dist.barrier(group=group)
-
-def check_tensor_ipc_comptability(tensor: torch.Tensor):
-    "IPC does not support tensors that are not contiguous, has offset > 0, or number of elements less than 1."
-    assert tensor is not None, "Tensors must not be None."
-    assert tensor.is_contiguous(), "Non-contiguous tensors are not supported by IPC."
-    tensor_size = torch.Size(tensor.shape)
-    assert tensor_size.numel() >= 1, "Tensors with fewer than 1 elements are not supported by IPC."
-    assert tensor.storage_offset() == 0, "Tensors with storage offset > 0 are not supported by IPC."
+    # Barrier 2: Wait for all ranks to finish setting parameters
+    gc.collect()
+    torch.cuda.empty_cache()
+    shm.barrier()
+    if is_creator:
+        destroy_shared_data(shm)
 
 def create_and_share_tensor_ipc(
     shape: torch.Size,
     dtype: torch.dtype,
     device: torch.device,
-    group: dist.ProcessGroup = None,
-    src_rank: int = 0
+    is_creator: bool,
+    group_size: int,
+    shm_name: str
 ):
-    """Creates a shared tensor from a source rank using the C++ IPC extension."""
-    if group is None:
-        group = dist.group.WORLD
-    rank = dist.get_rank(group=group)
-    shared_tensor = None
+    """Creates a shared tensor on src_rank and shares it via C++ IPC."""
+    shm = get_shared_data(shm_name, is_creator, group_size)
     
-    if rank == src_rank:
-        assert torch.Size(shape).numel() >= 1, "Tensors with fewer than 1 elements are not supported by IPC."
+    shared_tensor = None
+    if is_creator:
+        assert torch.Size(shape).numel() >= 1, "Tensor must not be empty."
         shared_tensor, handle = torch_ipc_extension.create_tensor_and_get_ipc(
             shape, dtype, device
         )
-        # Get the device UUID for more robust device identification
-        device_index = device.index if hasattr(device, "index") else device
-        device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+        device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
         meta = (handle, shape, dtype, shared_tensor.stride(), 0, device_uuid)
-        object_to_broadcast = [meta]
-        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
-        dist.broadcast_object_list(object_to_broadcast, src=src_global_rank, group=group)
-    else:
-        received_objects = [None]
-        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
-        dist.broadcast_object_list(received_objects, src=src_global_rank, group=group)
-        handle, shape, dtype, stride, storage_offset, source_uuid = received_objects[0]
-        device_index = device.index if hasattr(device, "index") else device
+        payload = pickle.dumps(meta)
+        shm.write_data(payload)
+
+    # Barrier 1: Wait for src_rank to create tensor and write metadata
+    shm.barrier()
+    
+    if not is_creator:
+        payload = shm.read_data()
+        handle, shape, dtype, stride, offset, source_uuid = pickle.loads(payload)
+        device = torch.device("cuda", torch.cuda.current_device())
         device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
         assert device_uuid == source_uuid, \
-            r_str("Source tensor and destination tensor must be on the same device.") + \
-            f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
+            r_str("Source and destination tensor not on the same device.") + \
+            f" Source UUID: {source_uuid}, destination UUID: {device_uuid}"
         shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
-            handle, device, dtype, shape, stride, storage_offset)
+            handle, device, dtype, shape, stride, offset
+        )
 
-    dist.barrier(group=group)
-    return shared_tensor, handle
+    # Barrier 2: Wait for all ranks to receive the tensor
+    shm.barrier()
+    if is_creator:
+        destroy_shared_data(shm)
+    return shared_tensor
+
 
 def copy_and_share_tensor_ipc(
-    tensor: torch.Tensor = None,
-    group: dist.ProcessGroup = None,
-    src_rank: int = 0
+    tensor: torch.Tensor,
+    is_creator: bool,
+    group_size: int,
+    shm_name: str,
 ):
-    """Creates a shared tensor from an existing tensor using the C++ IPC extension."""
-    if group is None:
-        group = dist.group.WORLD
-    rank = dist.get_rank(group=group)
+    """Copies a tensor to shared memory on src_rank and shares it via C++ IPC."""
+    shm = get_shared_data(shm_name, is_creator, group_size)
+
     shared_tensor = None
-    
-    if rank == src_rank:
-        check_tensor_ipc_comptability(tensor)
-        
-        # Keep reference to original tensor during IPC creation
-        original_tensor_ref = tensor
-        
-        shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(tensor)
-        device = torch.device("cuda", torch.cuda.current_device())
-        device_index = device.index if hasattr(device, "index") else device
-        device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+    if is_creator:
+        _check_tensor_ipc_comptability(tensor)
+        shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
+            tensor
+        )
+        device_uuid = str(torch.cuda.get_device_properties(tensor.device.index).uuid)
         meta = (
             handle, tensor.shape, tensor.dtype,
             tensor.stride(), tensor.storage_offset(),
             device_uuid
         )
-        object_to_broadcast = [meta]
-        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
-        dist.broadcast_object_list(object_to_broadcast, src=src_global_rank, group=group)
-        
-        # Clear reference after successful sharing
-        del original_tensor_ref
-    else:
-        received_objects = [None]
-        src_global_rank = dist.get_global_rank(group=group, group_rank=src_rank)
-        dist.broadcast_object_list(received_objects, src=src_global_rank, group=group)
-        handle, shape, dtype, stride, storage_offset, source_uuid = received_objects[0]
+        payload = pickle.dumps(meta)
+        shm.write_data(payload)
+    
+    # Barrier 1: Wait for src_rank to copy tensor and write metadata
+    shm.barrier()
+
+    if not is_creator:
+        payload = shm.read_data()
+        handle, shape, dtype, stride, offset, source_uuid = pickle.loads(payload)
         device = torch.device("cuda", torch.cuda.current_device())
-        device_index = device.index if hasattr(device, "index") else device
-        device_uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+        device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
         assert device_uuid == source_uuid, \
-            r_str("Source tensor and destination tensor must be on the same device.") + \
-            f" Source device UUID: {source_uuid}, destination device UUID: {device_uuid}"
+            r_str("Source and destination tensor not on the same device.") + \
+            f" Source UUID: {source_uuid}, destination UUID: {device_uuid}"
         shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
-            handle, device, dtype, shape, stride, storage_offset)
-        
-    dist.barrier(group=group)      
-    return shared_tensor, handle
+            handle, device, dtype, shape, stride, offset
+        )
+
+    # Barrier 2: Wait for all ranks to receive the tensor
+    shm.barrier()
+    if is_creator:
+        destroy_shared_data(shm)
+    return shared_tensor
 
 def _set_param_or_buffer(model, name, new_tensor):
     """Recursively finds and replaces a parameter or buffer in a model."""
@@ -240,7 +384,9 @@ def _set_param_or_buffer(model, name, new_tensor):
     if attr_name in target_module._parameters:
         old_tensor = target_module._parameters[attr_name]
         # CRITICAL: Use nn.Parameter wrapper for parameters
-        target_module._parameters[attr_name] = nn.Parameter(new_tensor, requires_grad=old_tensor.requires_grad if old_tensor is not None else True)
+        target_module._parameters[attr_name] = \
+            nn.Parameter(new_tensor, requires_grad=old_tensor.requires_grad \
+                             if old_tensor is not None else True)
     elif attr_name in target_module._buffers:
         old_tensor = target_module._buffers[attr_name]
         target_module._buffers[attr_name] = new_tensor
@@ -251,7 +397,7 @@ def _set_param_or_buffer(model, name, new_tensor):
     if old_tensor is not None:
         del old_tensor
 
-def get_driver_memory_usage(device_index: int):
+def _get_driver_memory_usage(device_index: int):
     """
     Gets the total used GPU memory and total GPU memory directly from
     the driver for a specific device.
@@ -375,8 +521,321 @@ def get_driver_memory_usage(device_index: int):
 
     print("Could not find 'nvidia-smi' or 'rocm-smi' in PATH.")
     return None, None
+              
+def test_barrier_synchronization(rank, world_size):
+    """
+    Tests the pthread barrier for correct synchronization. This must be the
+    first test as others rely on a working barrier.
+    """
+    test_name = "barrier_sync_test"
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Barrier Synchronization ---"))
 
-def test_memory_management(rank, device):
+    shm = None
+    try:
+        # All ranks create/open the object. The barrier_size is critical.
+        shm = get_shared_data(test_name, rank == 0, world_size)
+        
+        # Phase 1: Ensure all processes wait
+        if rank == 0:
+            # Rank 0 will set a value *after* the barrier.
+            # If the barrier works, other ranks should see the new value.
+            pass
+        else:
+            # Other ranks sleep for a variable amount of time.
+            time.sleep(random.uniform(0.01, 0.05))
+
+        starting_val = shm.get()
+        assert starting_val == 0, \
+            r_str(f"[Rank {rank}] Barrier test failed! Expected 0, got {starting_val}")
+        print(b_str(f"[Rank {rank}] Arrived at barrier 1" + 
+                    f" value: {shm.get()}\n"), end="")
+        shm.barrier()
+        print(y_str(f"[Rank {rank}] Passed barrier 1" + 
+                    f" value: {shm.get()}\n"), end="")
+
+        for _ in range(10):
+            shm.add(1)
+
+        print(b_str(f"[Rank {rank}] Arrived at barrier 2") + 
+              f" value: {shm.get()}\n", end="")
+        shm.barrier()
+        print(y_str(f"[Rank {rank}] Passed barrier 2") + 
+              f" value: {shm.get()}\n", end="")
+
+        final_val = shm.get()
+        assert final_val == world_size * 10, \
+            r_str(f"[Rank {rank}] Barrier test failed! Expected {world_size * 10}, "
+                  f"got {final_val}")
+
+        # Final barrier to ensure clean exit before destruction.
+        shm.barrier()
+        if rank == 0:
+            print(g_str("[Rank 0] ✓ Test 'barrier' passed.\n"), end="")
+
+    finally:
+        # Final barrier and cleanup
+        if shm:
+            shm.barrier()
+        if rank == 0:
+            destroy_shared_data(shm)
+
+def test_data_exchange(rank, world_size):
+    """Tests writing and reading arbitrary data from the shared buffer."""
+    test_name = "data_exchange_test"
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Data Exchange ---"))
+
+    shm = None
+    try:
+        shm = get_shared_data(test_name, rank == 0, world_size)
+
+        original_data = {
+            'message': f'hello_world_from_rank_{rank}',
+            'rank': rank,
+            'data': [1, 2, 3, {'nested': True}]
+        }
+
+        if rank == 0:
+            # Rank 0 serializes and writes the data
+            payload = pickle.dumps(original_data)
+            shm.write_data(payload)
+            print(g_str(f"[Rank 0] Wrote {len(payload)} bytes to shared buffer\n\t") + 
+                  f"Payload: {original_data}\n", end="")
+
+        print(b_str(f"[Rank {rank}] Arrived at barrier\n"), end="")
+        shm.barrier()
+        print(y_str(f"[Rank {rank}] Passed barrier 1\n"), end="")
+
+        # All other ranks read, deserialize, and verify
+        if rank != 0:
+            payload = shm.read_data()
+            received_data = pickle.loads(payload)
+            
+            # We check against rank 0's original data
+            original_rank_0_data = {
+                'message': f'hello_world_from_rank_{0}',
+                'rank': 0, # The data was from rank 0
+                'data': [1, 2, 3, {'nested': True}]
+            }
+            print(b_str(f"[Rank {rank}] Received data: ") + 
+                  f"{received_data}\n\t" + 
+                  f"Original data: {original_rank_0_data}\n", end="")
+            assert received_data == original_rank_0_data, \
+                r_str(f"[Rank {rank}] Data exchange failed!")
+
+        print(b_str(f"[Rank {rank}] Arrived at barrier 2\n"), end="")
+        shm.barrier()
+        print(y_str(f"[Rank {rank}] Passed barrier 2\n"), end="")
+        
+        # Test 2: Data exchange with multiple ranks
+        if world_size > 1:
+            if rank == 1:
+                payload = pickle.dumps(original_data)
+                shm.write_data(payload)
+                print(g_str(f"[Rank {rank}] Wrote {len(payload)} bytes to shared buffer\n\t") + 
+                      f"Payload: {original_data}\n", end="")
+                
+            shm.barrier()
+            
+            if rank != 1:
+                payload = shm.read_data()
+                received_data = pickle.loads(payload)
+                original_rank_1_data = {
+                    'message': f'hello_world_from_rank_{1}',
+                    'rank': 1, # The data was from rank 1
+                    'data': [1, 2, 3, {'nested': True}]
+                }
+                print(b_str(f"[Rank {rank}] Received data: ") + 
+                      f"{received_data}\n\t" + 
+                      f"Original data: {original_rank_1_data}\n", end="")
+                assert received_data == original_rank_1_data, \
+                    r_str(f"[Rank {rank}] Data exchange failed!")
+        
+        shm.barrier()
+        if rank == 0:
+            print(g_str("[Rank 0] ✓ Test 'data_exchange' passed.\n"), end="")
+
+    finally:
+        if shm:
+            shm.barrier()
+        if rank == 0:
+            destroy_shared_data(shm)
+    
+def test_atomic_operations(rank, world_size):
+    """Tests the atomic integer operations (get, set, add, etc.)."""
+    test_name = "atomic_operations_test"
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Atomic Operations ---"))
+
+    shm = None
+    try:
+        shm = get_shared_data(test_name, rank == 0, world_size,
+                              initial_value=100, semaphore_count=1)
+        
+        shm.barrier()
+
+        # Test 1: get/set
+        if rank == 0:
+            shm.set(42)
+        
+        shm.barrier()
+        
+        val = shm.get()
+        assert val == 42, \
+            r_str(f"[Rank {rank}] failed get/set test! Expected 42, got {val}")
+        if rank == 0:
+            print(g_str("[Rank 0] ✓ Test 'get/set' passed."))
+        
+        shm.barrier()
+
+        # Test 2: add (replaces fetch_add logic)
+        for _ in range(rank):
+            shm.add(1)
+        
+        shm.barrier()
+        
+        if rank == 0:
+            expected_sum = 42 + sum(range(world_size))
+            final_val = shm.get()
+            assert final_val == expected_sum, \
+                r_str(f"[Rank {rank}] Atomic 'add' failed! Expected {expected_sum}, got {final_val}")
+            print(g_str("[Rank 0] ✓ Test 'add' passed."))
+
+        shm.barrier()
+
+        # Test 3: wait_for_value
+        if rank == 0:
+            shm.set(world_size - 1)
+        shm.barrier()
+
+        # Ranks wait for their turn in reverse order
+        target_val = world_size - 1 - rank
+        shm.wait_for_value(target_val)
+        
+        val = shm.get()
+        print(b_str(f"[Rank {rank}] wait_for_value section, value: {val}."))
+        assert val == target_val, \
+            f"Atomic 'wait_for_value' failed! Expected {target_val}, got {val}"
+        
+        # Signal the next rank
+        if val > 0:
+            shm.set(val - 1)
+        
+        shm.barrier()
+        if rank == 0:
+            print(g_str(f"[Rank {rank}] ✓ Test 'wait_for_value' passed."))
+
+    finally:
+        if shm:
+            shm.barrier()
+        if rank == 0:
+            destroy_shared_data(shm)
+
+def test_mutex_synchronization(rank, world_size):
+    """Tests the mutex for exclusive access to a critical section."""
+    test_name = "mutex_sync_test"
+    num_adds = 100
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Mutex Synchronization ({num_adds} adds/rank) ---"))
+
+    shm = None
+    try:
+        shm = get_shared_data(test_name, rank == 0, world_size)
+        shm.barrier()
+
+        # --- Part 1: Demonstrate the race condition WITHOUT a mutex ---
+        # This read-modify-write pattern is a classic race condition.
+        # Do not use add, it will not work as add is atomic.
+        for _ in range(num_adds):
+            current_val = shm.get()
+            shm.set(current_val + 1)
+        
+        shm.barrier()
+
+        if rank == 0:
+            final_val = shm.get()
+            expected_val = num_adds * world_size
+            print(f"[Rank 0] Without mutex, expected {expected_val}, got {final_val}.")
+            # This will likely fail, which is the point of the test.
+            if final_val != expected_val:
+                print(g_str("[Rank 0] ✓ Race condition correctly demonstrated (as expected)."))
+            else:
+                print(r_str("[Rank 0] ✗ Race condition did not occur (unlikely, but possible)."))
+            # Reset for the real test
+            shm.set(0)
+
+        shm.barrier()
+
+        # --- Part 2: Test the mutex for correctness ---
+        for _ in range(num_adds):
+            shm.mutex_acquire()
+            # Critical Section
+            current_val = shm.get()
+            shm.set(current_val + 1)
+            # End Critical Section
+            shm.mutex_release()
+        
+        shm.barrier()
+
+        # Verification
+        if rank == 0:
+            final_val = shm.get()
+            expected_val = num_adds * world_size
+            assert final_val == expected_val, \
+                r_str(f"[Rank 0] Mutex test failed! Expected {expected_val}, got {final_val}")
+            print(g_str(f"[Rank 0] ✓ Test 'mutex' passed. Final value: {final_val}"))
+
+    finally:
+        if shm:
+            shm.barrier()
+        if rank == 0:
+            destroy_shared_data(shm)
+
+def test_semaphore_synchronization(rank, world_size):
+    """Tests the semaphore for controlling concurrent access."""
+    semaphore_slots = max(1, world_size // 2)
+    test_name = "semaphore_sync_test"
+    if rank == 0:
+        print(y_str(f"\n--- Running Test: Semaphore ({semaphore_slots} slots) ---"))
+
+    shm = None
+    try:
+        shm = get_shared_data(test_name, rank == 0, world_size,
+                              initial_value=0, semaphore_count=semaphore_slots)
+        shm.barrier()
+
+        shm.sem_wait()
+
+        print(b_str(f"[Rank {rank}] Entering") + " critical section.")
+        
+        active_procs = shm.add(1)
+        print (f"[Rank {rank}] Active processes inside: {active_procs}")
+        assert active_procs <= semaphore_slots, \
+            r_str(f"[Rank {rank}] Semaphore failed! {active_procs} procs inside, limit {semaphore_slots}")
+        
+        time.sleep(random.uniform(0.05, 0.15))
+        
+        shm.add(-1)
+        
+        print(y_str(f"[Rank {rank}] Exiting") + " critical section.")
+        shm.sem_post()
+        
+        shm.barrier()
+
+        if rank == 0:
+            final_active_procs = shm.get()
+            assert final_active_procs == 0, \
+                r_str(f"[Rank 0] Semaphore cleanup failed! Expected 0, got {final_active_procs}")
+            print(g_str(f"[Rank 0] ✓ Test 'semaphore' passed."))
+
+    finally:
+        if shm:
+            shm.barrier()
+        if rank == 0:
+            destroy_shared_data(shm)
+
+def test_memory_management(rank, world_size, device):
     """Test to verify no memory leaks in IPC tensor operations."""
     if rank == 0:
         print(f"\n[Rank {rank}] Testing memory management...")
@@ -406,15 +865,19 @@ def test_memory_management(rank, device):
         (torch.Size([1024, 1024, 1024]), torch.float32, 1),
         (torch.Size([512, 1024, 1024]), torch.float16, 3),
     ]
+    
+    shm_name = f"test_memory_management"
+    shm = get_shared_data(shm_name, rank == 0, world_size)
 
     for i, (shape, dtype, num_alloc) in enumerate(configs):
-
-        initial_allocated, _ = get_driver_memory_usage(device.index)
-        dist.barrier()
+        initial_allocated, _ = _get_driver_memory_usage(device.index)
+        shm.barrier()
 
         tensors = []
-        for i in range(num_alloc):
-            shared_tensor, handle = create_and_share_tensor_ipc(shape, dtype, device, src_rank=0)
+        for j in range(num_alloc):
+            shared_tensor = create_and_share_tensor_ipc(
+                shape, dtype, device, is_creator=(rank == 0),
+                group_size=world_size, shm_name=f"{shm_name}_{i}_{j}")
             tensors.append(shared_tensor)
         if rank == 0:
             size = shared_tensor.element_size() * shared_tensor.numel()
@@ -427,11 +890,11 @@ def test_memory_management(rank, device):
                     # The NVIDIA driver allocates in 512KiB chunks, so we need to round up
                     size = 512 * 1024
             size *= num_alloc
-        dist.barrier()
+        shm.barrier()
         
-        mid_allocated, _ = get_driver_memory_usage(device.index)
+        mid_allocated, _ = _get_driver_memory_usage(device.index)
 
-        dist.barrier()
+        shm.barrier()
         
         # Test 2: Delete references and check memory cleanup
         shared_tensor = None
@@ -441,9 +904,9 @@ def test_memory_management(rank, device):
         gc.collect()
         torch.cuda.synchronize()  # Ensure CUDA operations complete
 
-        dist.barrier()
+        shm.barrier()
         
-        final_allocated, _ = get_driver_memory_usage(device.index)
+        final_allocated, _ = _get_driver_memory_usage(device.index)
         
         if rank == 0:
             print (f"--- Test {i+1}, config: shape={shape}, dtype={dtype}, num_alloc={num_alloc}, size={size/1024**2:.3f}MB ---")
@@ -469,261 +932,14 @@ def test_memory_management(rank, device):
             
             if not fail:
                 print(g_str("✓ Memory management test passed"))
+        shm.barrier()
+            
+    shm.barrier()
+    if rank == 0:
+        destroy_shared_data(shm)
     
-def _test_atomic_operations(rank, world_size, group):
-    """Tests the atomic integer operations (get, set, add, etc.)."""
-    test_name = "atomic_operations_test"
-    if rank == 0:
-        print(y_str(f"\n--- Running Test: Atomic Operations ---"))
-
-    shared_obj = None
-    try:
-        # Step 1: Create/Open the SharedData object
-        # Creator (rank 0) initializes the object.
-        if rank == 0:
-            shared_obj = torch_ipc_extension.SharedData(
-                name=test_name, is_creator=True, initial_value=100
-            )
-        else:
-            shared_obj = torch_ipc_extension.SharedData(
-                name=test_name, is_creator=False
-            )
-        
-        dist.barrier(group=group)
-
-        # Test 1: get/set
-        if rank == 0:
-            shared_obj.set(42)
-        
-        dist.barrier(group=group)
-        
-        val = shared_obj.get()
-        assert val == 42, r_str(f"Rank {rank} failed get/set test! Expected 42, got {val}")
-        if rank == 0:
-            print(g_str("[Rank 0] ✓ Test 'get/set' passed."))
-        
-        dist.barrier(group=group)
-
-        # Test 2: fetch_add
-        # Each rank adds its own rank value
-        old_val = shared_obj.fetch_add(rank)
-        
-        dist.barrier(group=group)
-        
-        # After all ranks add, the final value should be the sum
-        if rank == 0:
-            expected_sum = 42 + sum(range(world_size))
-            final_val = shared_obj.get()
-            assert final_val == expected_sum, \
-                r_str(f"Atomic 'fetch_add' failed! Expected {expected_sum}, got {final_val}")
-            print(g_str("[Rank 0] ✓ Test 'fetch_add' passed."))
-
-        dist.barrier(group=group)
-
-        # Test 3: exchange
-        if rank == 1:
-            # Rank 1 exchanges the value
-            old_val = shared_obj.exchange(999)
-            expected_old_val = 42 + sum(range(world_size))
-            assert old_val == expected_old_val, \
-                r_str(f"Atomic 'exchange' failed! Expected old value {expected_old_val}, got {old_val}")
-        
-        dist.barrier(group=group)
-
-        if rank == 0:
-            final_val = shared_obj.get()
-            assert final_val == 999, \
-                r_str(f"Visibility for 'exchange' failed! Expected 999, got {final_val}")
-            print(g_str("[Rank 0] ✓ Test 'exchange' passed."))
-
-        dist.barrier(group=group)
-
-        # Test 4: wait_for_value
-        
-        if rank == 0:
-            shared_obj.set(world_size - 1)
-        dist.barrier(group=group)
-
-        shared_obj.wait_for_value(rank)
-        val = shared_obj.get()
-        print(b_str(f"[Rank {rank}] Entering") + f" critical section, value: {val}.")
-        assert val == rank, \
-            r_str(f"Atomic 'wait_for_value' failed! Expected {rank}, got {val}")
-        val = val - 1
-        print(y_str(f"[Rank {rank}] Exiting") + f" critical section, setting value to {val}.")
-        shared_obj.set(val)
-        
-        dist.barrier(group=group)
-        if rank == 0:
-            print(g_str(f"[Rank {rank}] ✓ Test 'wait_for_value' passed."))
-
-    finally:
-        # Final barrier and cleanup
-        dist.barrier(group=group)
-        if rank == 0:
-            torch_ipc_extension.destroy_shared_data(test_name)
-
-
-def _test_mutex_synchronization(rank, world_size, group):
-    """Tests the mutex for exclusive access to a critical section."""
-    test_name = "mutex_sync_test"
-    num_adds = 100
-    if rank == 0:
-        print(y_str(f"\n--- Running Test: Mutex Synchronization ({num_adds} adds/rank) ---"))
-
-    shared_obj = None
-    try:
-        # Create/Open the SharedData object with value 0
-        if rank == 0:
-            shared_obj = torch_ipc_extension.SharedData(
-                name=test_name, is_creator=True, initial_value=0
-            )
-        else:
-            shared_obj = torch_ipc_extension.SharedData(
-                name=test_name, is_creator=False
-            )
-        dist.barrier(group=group)
-
-        # All ranks contend to add to the shared value
-        print(b_str(f"[Rank {rank}] Entering") + f" critical section without mutex.")
-        initial_val = shared_obj.get()
-        expected_val = initial_val + num_adds
-        for _ in range(num_adds):
-            # This read-modify-write pattern is a classic race condition
-            # that the mutex is designed to prevent.
-            current_val = shared_obj.get()
-            shared_obj.set(current_val + 1)
-        current_val = shared_obj.get()
-        print(y_str(f"[Rank {rank}] Exiting") + f" critical section with mutex - " +
-              f"Initial value: {initial_val}, Expected final value: {expected_val}, got {current_val}.")
-        
-        dist.barrier(group=group)
-
-        if rank == 0:
-            final_val = shared_obj.get()
-            expected_val = num_adds * world_size
-            print(y_str(f"[Rank 0] Expected final value: {expected_val}, got {final_val} without mutex."))
-            shared_obj.set(0)
-
-        dist.barrier(group=group)
-
-        # All ranks contend to add to the shared value
-        shared_obj.mutex_acquire()
-        print(b_str(f"[Rank {rank}] Entering") + f" critical section with mutex.")
-        initial_val = shared_obj.get()
-        expected_val = initial_val + num_adds
-        for _ in range(num_adds):
-            # This read-modify-write pattern is a classic race condition
-            # that the mutex is designed to prevent.
-            current_val = shared_obj.get()
-            shared_obj.set(current_val + 1)
-        current_val = shared_obj.get()
-        print(y_str(f"[Rank {rank}] Exiting") + f" critical section with mutex - " +
-              f"Initial value: {initial_val}, Expected final value: {expected_val}, got {current_val}.")
-        shared_obj.mutex_release()
-        
-        dist.barrier(group=group)
-
-        # Verification
-        if rank == 0:
-            final_val = shared_obj.get()
-            expected_val = num_adds * world_size
-            print(y_str(f"[Rank 0] Expected final value: {expected_val}, got {final_val} with mutex."))
-            assert final_val == expected_val, \
-                r_str(f"Mutex test failed! Expected final value {expected_val}, got {final_val}")
-            print(g_str(f"[Rank 0] ✓ Test 'mutex' passed. Final value: {final_val}"))
-
-    finally:
-        dist.barrier(group=group)
-        if rank == 0:
-            torch_ipc_extension.destroy_shared_data(test_name)
-
-
-def _test_semaphore_synchronization(rank, world_size, group):
-    """Tests the semaphore for controlling concurrent access."""
-    semaphore_slots = max(1, world_size // 2)
-    test_name = "semaphore_sync_test"
-    if rank == 0:
-        print(y_str(f"\n--- Running Test: Semaphore ({semaphore_slots} slots) ---"))
-
-    shared_obj = None
-    try:
-        # Create/Open SharedData. The integer will track active processes.
-        if rank == 0:
-            shared_obj = torch_ipc_extension.SharedData(
-                name=test_name, is_creator=True, initial_value=0,
-                semaphore_count=semaphore_slots
-            )
-        dist.barrier(group=group)
-        if rank != 0:
-            shared_obj = torch_ipc_extension.SharedData(
-                name=test_name, is_creator=False
-            )
-        dist.barrier(group=group)
-
-        # All ranks attempt to enter the critical section
-        shared_obj.sem_wait()
-
-        print(b_str(f"[Rank {rank}] Entering") + " critical section.")
-        
-        # --- Critical Section ---
-        # Increment a counter to track how many processes are inside
-        active_procs = shared_obj.fetch_add(1) + 1
-
-        print (f"[Rank {rank}] Active processes inside: {active_procs}")
-        
-        # The number of active processes should never exceed the semaphore count
-        assert active_procs <= semaphore_slots, \
-            r_str(f"Semaphore failed! Rank {rank} found {active_procs} processes inside, but limit is {semaphore_slots}")
-        
-        time.sleep(random.uniform(0.01, 0.05)) # Simulate work
-        
-        # Decrement the counter upon exit
-        shared_obj.fetch_add(-1)
-        # --- End Critical Section ---
-        
-        print(y_str(f"[Rank {rank}] Exiting") + " critical section.")
-        shared_obj.sem_post()
-        
-        dist.barrier(group=group)
-
-        # Verification
-        if rank == 0:
-            final_active_procs = shared_obj.get()
-            assert final_active_procs == 0, \
-                r_str(f"Semaphore cleanup failed! Expected 0 active procs, got {final_active_procs}")
-            print(g_str(f"[Rank 0] ✓ Test 'semaphore' passed."))
-
-    finally:
-        dist.barrier(group=group)
-        if rank == 0:
-            torch_ipc_extension.destroy_shared_data(test_name)
-
-
-def test_shared_cpu_data(rank, group=None):
-    """
-    Main entry point for testing the shared CPU data extension.
-    """
-    if group is None:
-        group = dist.group.WORLD
-    
-    world_size = dist.get_world_size(group=group)
-
-    try:
-        _test_atomic_operations(rank, world_size, group)
-        _test_mutex_synchronization(rank, world_size, group)
-        _test_semaphore_synchronization(rank, world_size, group)
-        
-        dist.barrier(group=group)
-        if rank == 0:
-            print(g_str("\n✓ All shared CPU data tests passed successfully!"))
-
-    except Exception as e:
-        print(r_str(f"[Rank {rank}] ✗ A test failed with an exception."))
-        # Ensure the exception is re-raised to be visible
-        raise e
-
-def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storage_offset):
+def _test_single_tensor_sharing(rank, world_size, device, shape, dtype, 
+                               custom_stride, storage_offset):
     original_tensor = None
     shared_tensor_created = None
     shared_tensor_copied = None
@@ -732,7 +948,12 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
     def config_to_str():
         return f"shape {shape}, dtype {dtype}, stride {custom_stride}, offset {storage_offset}"
 
+    shm_name = f"test_single_tensor_sharing_{config_to_str()}"
+    shm = None
+
     try:
+        # Create shared object
+        shm = get_shared_data(shm_name, rank == 0, world_size)
         # Create base tensor with enough storage for offset
         if rank == 0:
             if storage_offset > 0:
@@ -769,19 +990,19 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
                         raise ValueError(f"Unsupported dtype: {dtype}")
             
         # Create shared tensor from original tensor
-        shared_tensor_created, handle_created = create_and_share_tensor_ipc(
-            shape, dtype, device, src_rank=0
-        )
-        shared_tensor_copied, handle_copied = copy_and_share_tensor_ipc(
-            original_tensor, src_rank=0
-        )
-        dist.barrier()
+        shared_tensor_created = create_and_share_tensor_ipc(
+            shape, dtype, device, is_creator=(rank == 0), group_size=world_size,
+            shm_name=f"{shm_name}_created")
+        shared_tensor_copied = copy_and_share_tensor_ipc(
+            original_tensor, is_creator=(rank == 0), group_size=world_size,
+            shm_name=f"{shm_name}_copied")
+        shm.barrier()
         
         # Test 1: Bit-level comparison
         if rank == 0:
             # Send original data for comparison
             dist.broadcast(original_tensor, src=0)
-            dist.barrier()
+            shm.barrier()
             dist.broadcast(shared_tensor_created, src=0)
         else:
             # Receive and compare
@@ -798,7 +1019,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
                 f"\nReceived tensor:\n{received_tensor}"
             print(g_str(f"[Rank {rank}] ✓ Bit-level comparison passed for created IPC tensor, ") +
                   "config " + config_to_str())
-            dist.barrier()
+            shm.barrier()
             # Receive and compare
             received_tensor = torch.empty_like(shared_tensor_created)
             dist.broadcast(received_tensor, src=0)
@@ -814,7 +1035,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             print(g_str(f"[Rank {rank}] ✓ Bit-level comparison passed for copied IPC tensor, ") +
                   "config " + config_to_str())
             
-        dist.barrier()
+        shm.barrier()
         
         # Test 2: Modify from rank 0 and verify on rank 1
         if rank == 0:
@@ -830,7 +1051,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             
             modified_data = shared_tensor_created.clone()
             dist.broadcast(modified_data, src=0)
-            dist.barrier()
+            shm.barrier()
 
             if dtype in [torch.float16, torch.float32, torch.float64]:
                 shared_tensor_copied.fill_(3.14159)
@@ -859,7 +1080,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             print(g_str(f"[Rank {rank}] ✓ Rank 0 modification visible for created IPC tensor, ") +
                   "config " + config_to_str())
 
-            dist.barrier()
+            shm.barrier()
             # Verify changes are visible
             received_tensor = torch.empty_like(shared_tensor_copied)
             dist.broadcast(received_tensor, src=0)
@@ -874,7 +1095,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             print(g_str(f"[Rank {rank}] ✓ Rank 0 modification visible for copied IPC tensor, ") +
                   "config " + config_to_str())
         
-        dist.barrier()
+        shm.barrier()
         
         # Test 3: Modify from rank 1 and verify on rank 0
         if rank == 1:
@@ -892,7 +1113,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
                 modified_data = shared_tensor_created.clone()
                 dist.broadcast(modified_data, src=1)
 
-                dist.barrier()
+                shm.barrier()
                 # Modify the tensor from rank 1
                 if dtype in [torch.float16, torch.float32, torch.float64]:
                     shared_tensor_copied[0] = float('inf')
@@ -920,7 +1141,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             print(g_str(f"[Rank {rank}] ✓ Rank 1 modification visible for created IPC tensor, ") +
                   "config " + config_to_str())
             
-            dist.barrier()
+            shm.barrier()
             # Verify changes are visible on rank 0
             received_tensor = torch.empty_like(shared_tensor_copied)
             dist.broadcast(received_tensor, src=1)
@@ -935,13 +1156,13 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             print(g_str(f"[Rank {rank}] ✓ Rank 1 modification visible for copied IPC tensor, ") +
                   "config " + config_to_str())
         
-        dist.barrier()
+        shm.barrier()
 
-        # Test 4: Locked modification on all ranks
+        # Test 4: Mutex-locked modification on all ranks
         num_adds = 10
         if dtype != torch.bool and dtype != torch.int8 and dtype != torch.uint8 and shared_tensor_created.numel() > 0:
             shared_tensor_created.flatten()[0] = 0
-            dist.barrier()
+            shm.barrier()
             init_val = shared_tensor_created.flatten()[0].item()
             print(b_str(f"[Rank {rank}] Entering")+ " critical section without mutex, " +
                         f"Shared tensor value: {init_val} ")
@@ -951,15 +1172,15 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             expected_val = init_val + (num_adds * (rank + 1))
             print(y_str(f"[Rank {rank}] Exiting") + " critical section without mutex, " +
                         f"Shared tensor value: {final_val}, expected: {expected_val} ")
-            dist.barrier()
+            shm.barrier()
 
             if rank == 0:
                 print(y_str(f"[Rank {rank}] Concurrent tensor modification without mutex result: ") + 
                       f"{shared_tensor_created.flatten()[0]}")
-            dist.barrier()
+            shm.barrier()
                 
             shared_tensor_created.flatten()[0] = 0
-            dist.barrier()
+            shm.barrier()
             torch_ipc_extension.acquire(shared_tensor_created)
             init_val = shared_tensor_created.flatten()[0].item()
             print(b_str(f"[Rank {rank}] Entering") + " critical section with mutex, " +
@@ -971,11 +1192,11 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
             print(y_str(f"[Rank {rank}] Exiting") + " critical section with mutex, " +
                         f"Shared tensor value: {final_val}, expected: {expected_val} ")
             torch_ipc_extension.release(shared_tensor_created)
-            dist.barrier()
+            shm.barrier()
 
             if rank == 0:
                 # Verify changes are visible on rank 0
-                expected_result = (sum(range(dist.get_world_size())) + dist.get_world_size()) * num_adds
+                expected_result = (sum(range(world_size)) + world_size) * num_adds
                 result = shared_tensor_created.flatten()[0].item()
                 
                 print(y_str(f"[Rank {rank}] Concurrent tensor modification with mutex result: ") + 
@@ -995,7 +1216,7 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
                     "config " + config_to_str())
 
             
-        dist.barrier()
+        shm.barrier()
         
         if rank == 0:
             print(g_str(f"[Rank {rank}] ✓ All tests passed for config " + config_to_str()))
@@ -1003,8 +1224,14 @@ def single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storag
     except Exception as e:
         print(r_str(f"[Rank {rank}] ✗ Test failed for config " + config_to_str()))
         raise
+    finally:
+        if shm is not None:
+            shm.barrier()
+            if rank == 0:
+                destroy_shared_data(shm)
 
-def test_single_tensor_sharing(rank, device):
+def test_single_tensor_sharing(rank, world_size, device):
+    
     """Comprehensive test for single tensor IPC sharing across various configurations."""
     print(f"\n[Rank {rank}] Starting single tensor sharing tests...")
     
@@ -1036,12 +1263,11 @@ def test_single_tensor_sharing(rank, device):
         if rank == 0:
             print(f"\n--- Test {i+1}: shape={shape}, dtype={dtype}, "
                   f"stride={custom_stride}, offset={storage_offset} ---")
-        single_tensor_sharing_test(rank, device, shape, dtype, custom_stride, storage_offset)
-        dist.barrier()
+        _test_single_tensor_sharing(rank, world_size, device, shape, dtype, custom_stride, storage_offset)
     if rank == 0:
         print(g_str(f"\n[Rank {rank}] ✓ All single tensor sharing tests completed successfully!"))
 
-class SimpleModel(nn.Module):
+class _SimpleModel(nn.Module):
     """A basic model for initial testing."""
     def __init__(self):
         super().__init__()
@@ -1059,7 +1285,7 @@ def main():
         raise RuntimeError("This script requires a CUDA/HIP enabled GPU.")
 
     dist.init_process_group("gloo")
-    
+    world_size = dist.get_world_size()
     rank = int(os.environ["RANK"])
     target_device_id = 0
     torch.cuda.set_device(target_device_id)
@@ -1071,7 +1297,16 @@ def main():
         print("RUNNING TEST 0: Shared CPU Data")
         print("="*50)
             
-    test_shared_cpu_data(rank)
+    test_barrier_synchronization(rank, world_size)
+    dist.barrier()
+    test_data_exchange(rank, world_size)
+    dist.barrier()
+    test_atomic_operations(rank, world_size)
+    dist.barrier()
+    test_mutex_synchronization(rank, world_size)
+    dist.barrier()
+    test_semaphore_synchronization(rank, world_size)
+    dist.barrier()
 
     dist.barrier()
     if rank == 0:
@@ -1083,7 +1318,7 @@ def main():
         print("RUNNING TEST 1: Memory Management")
         print("="*50)
     
-    test_memory_management(rank, device)
+    test_memory_management(rank, world_size, device)
     
     dist.barrier()
     if rank == 0:
@@ -1095,7 +1330,7 @@ def main():
         print("RUNNING TEST 2: Single Tensor Sharing")
         print("="*50)
     
-    test_single_tensor_sharing(rank, device)
+    test_single_tensor_sharing(rank, world_size, device)
     
     dist.barrier()
     if rank == 0:
@@ -1110,13 +1345,15 @@ def main():
     dist.barrier()
     
     if rank == 0:
-        simple_model = SimpleModel().to(device)
+        simple_model = _SimpleModel().to(device)
     else:
         with init_empty_weights():
-            simple_model = SimpleModel()
+            simple_model = _SimpleModel()
     simple_model.eval()
             
-    share_model_parameters_ipc(simple_model)
+    share_model_parameters_ipc(simple_model, is_creator=(rank == 0),
+                               group_size=world_size,
+                               shm_name=f"simple_model_test")
     
     simple_model.train()
     
@@ -1172,17 +1409,19 @@ def main():
             
     dist.barrier()
     
-    mem_before_used, mem_before_total = get_driver_memory_usage(torch.cuda.current_device())
+    mem_before_used, mem_before_total = _get_driver_memory_usage(torch.cuda.current_device())
     print(g_str(f"Rank {rank} ") + "mem_before_used: " + f"{mem_before_used/1024**2:.2f} MB, "
           f"mem_before_total: {mem_before_total/1024**2:.2f} MB\n", end="")
     
     dist.barrier()
 
-    share_model_parameters_ipc(model)
+    share_model_parameters_ipc(model, is_creator=(rank == 0),
+                               group_size=world_size,
+                               shm_name=f"deepseek_v2_lite_test")
     
     dist.barrier()
 
-    mem_after_used, mem_after_total = get_driver_memory_usage(torch.cuda.current_device())
+    mem_after_used, mem_after_total = _get_driver_memory_usage(torch.cuda.current_device())
     print(g_str(f"Rank {rank} ") + "mem_after_used: " + f"{mem_after_used/1024**2:.2f} MB, "
           f"mem_after_total: {mem_after_total/1024**2:.2f} MB\n", end="")
 

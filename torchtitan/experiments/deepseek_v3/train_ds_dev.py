@@ -23,13 +23,14 @@ from model_config import deepseek_config_registry
 
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
+from torch.distributed._tensor import DTensor
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 from accelerate import init_empty_weights
 
 from ipc_pipeline_src.ipc_share import share_model_parameters_ipc
 from ipc_pipeline_src.mbp_schedule import ScheduleMbp
 from ipc_pipeline_src.mbp_stage import MbpStage
-from ipc_pipeline_src.ipc_gradient import SharedGradientManager, get_gradient_weight_info
+from ipc_pipeline_src.ipc_gradient import SharedGradientManager
 import torch_ipc_extension 
 
 from datetime import datetime
@@ -59,6 +60,49 @@ def print_memory_usage():
           f"Cached memory: {cached_mem/1024**2:.2f} MB, "
           f"Other process memory: {other_process_mem/1024**2:.2f} MB")
     return str
+
+def get_gradient_weight_info(model: torch.nn.Module):
+    """
+    Returns a dictionary of gradient weight information for the model.
+    """
+    grad_weight_info = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # The parameter itself is the DTensor after fully_shard.
+            # Do NOT use .data, as it returns the underlying torch.Tensor.
+            weight = param
+            grad = param.grad
+
+            # Default to None for non-DTensor params or missing grads
+            weight_mesh, weight_placements = None, None
+            grad_mesh, grad_placements = None, None
+            grad_shape, grad_dtype = None, None
+
+            # Check the weight tensor
+            if isinstance(weight, DTensor):
+                weight_mesh = weight.device_mesh
+                weight_placements = weight.placements
+
+            # Check the gradient tensor
+            if grad is not None:
+                grad_shape = grad.shape
+                grad_dtype = grad.dtype
+                if isinstance(grad, DTensor):
+                    grad_mesh = grad.device_mesh
+                    grad_placements = grad.placements
+            
+            # If the weight is a DTensor, its shape attribute will still
+            # correctly report the global shape.
+            grad_weight_info[name] = {
+                "Gradient": (
+                    grad_shape, grad_dtype, grad_mesh, grad_placements
+                ),
+                "Weight": (
+                    weight.shape, weight.dtype, weight_mesh, weight_placements
+                )
+            }
+
+    return grad_weight_info
 
 # Run full model
 def run_full_model(
@@ -145,87 +189,107 @@ def run_full_model(
           b_str("hsdp_mesh: ") + f"{hsdp_mesh} \n", end="")
     
     dist.barrier(group=global_cpu_grp)
+    
+    # Setup MBP control synchronization primitives for each MBP group
+    max_concurrent_process_groups = 1
+    # mbp_ctrl_name = f"mbp_ctrl_{mbp_group_idx}"
+    # if mbp_rank == 0:
+    #     mbp_ctrl = torch_ipc_extension.SharedData(
+    #         name=mbp_ctrl_name, is_creator=True, initial_value=0,
+    #         semaphore_count = max_concurrent_process_groups
+    #     )
+    # else:
+    #     mbp_ctrl = torch_ipc_extension.SharedData(
+    #         name=mbp_ctrl_name, is_creator=False
+    #     )
+        
+    # dist.barrier(group=global_cpu_grp)
 
-    if mbp_rank == 0:  
-        # Instantiate model
-        print(g_str(f"Rank {rank} ") + "Before model instantiation " + print_memory_usage() + "\n", end="")
-        with device, mesh:
-            # Only MBP rank 0 creates the model with weights
-            model = DeepseekForCausalLM(model_args)
-        print(g_str(f"Rank {rank} ") + "After model instantiation " + print_memory_usage() + "\n", end="")
-        # Load weights
-        # load_weights_from_hf(model, model_id, device)
-        model.train()
+    # mbp_ctrl.wait_for_value(mbp_rank)
+    if mbp_rank > 0:
+        return
+      
+    # Instantiate model
+    print(g_str(f"Rank {rank} ") + "Before model instantiation " + print_memory_usage() + "\n", end="")
+    with device, mesh:
+        # Only MBP rank 0 creates the model with weights
+        model = DeepseekForCausalLM(model_args)
+    print(g_str(f"Rank {rank} ") + "After model instantiation " + print_memory_usage() + "\n", end="")
+    # Load weights
+    # load_weights_from_hf(model, model_id, device)
+    model.train()
 
-        # Apply data parallelism
-        # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
-        # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
-        # Reason: the MoE is "sparsely activated" compared to the dense model, thus
-        # it will be ineconomical re-gather the weights.
-        for layer in model.model.layers.values():
-            # Apply FSDP to experts
-            if hasattr(layer.mlp, "experts"):
-                for expert in layer.mlp.experts.values():
-                    fully_shard(expert, 
-                        mesh=fsdp_mesh, 
-                        reshard_after_forward=False)
-            # Apply HSDP to other parts such as attention, layernorm, because they
-            # are doing DDP on EP dimension
-            fully_shard(layer, 
-                        mesh=hsdp_mesh, 
-                        reshard_after_forward=False)
-
-        # Apply HSDP on root model (lm_head, embeddings, etc)
-        fully_shard(model, 
+    # Apply data parallelism
+    # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
+    # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
+    # Reason: the MoE is "sparsely activated" compared to the dense model, thus
+    # it will be ineconomical re-gather the weights.
+    for layer in model.model.layers.values():
+        # Apply FSDP to experts
+        if hasattr(layer.mlp, "experts"):
+            for expert in layer.mlp.experts.values():
+                fully_shard(expert, 
+                    mesh=fsdp_mesh, 
+                    reshard_after_forward=False)
+        # Apply HSDP to other parts such as attention, layernorm, because they
+        # are doing DDP on EP dimension
+        fully_shard(layer, 
                     mesh=hsdp_mesh, 
                     reshard_after_forward=False)
-        print(g_str(f"Rank {rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
-        # Synthetic setting
-        microbatches = mbp_size 
-        max_concurrent_process_groups = 1
 
-        # Use Symmetric Memory for MoE token shuffle.
-        # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
-        # currently supported for forward only. See `generate.py`.
-        # model.setup_symm_mem(torch.bfloat16, device)
-
-        # Example inputs
-        torch.manual_seed(ep_rank)
-        bs = 4
-        seqlen = 128
-        x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
-        label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
-
-        if rank == 0:
-            print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
-        print(g_str(f"Rank {rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
-        # Create loss function
-        loss_fn = torch.nn.functional.cross_entropy 
-
-        print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
-        # Create pipeline stage
-        stage = MbpStage(
-            model,
-            pp_rank,
-            pp_size,
-            device,
-            group=pp_mesh.get_group(),
-        )
-
-        pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
-                                    loss_fn=loss_fn, global_rank=rank)
-
-        if pp_rank == 0:
-            pp_schedule.step(x)
-        elif pp_rank == pp_size - 1:
-            y_dict = pp_schedule.step(target=label)
-        else:
-            pp_schedule.step()
-        print(g_str(f"Rank {rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
+    # Apply HSDP on root model (lm_head, embeddings, etc)
+    fully_shard(model, 
+                mesh=hsdp_mesh, 
+                reshard_after_forward=False)
+    print(g_str(f"Rank {rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
     
-        grad_weight_info = get_gradient_weight_info(model)
-        print(b_str(f"Rank {rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
+    # Use Symmetric Memory for MoE token shuffle.
+    # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
+    # currently supported for forward only. See `generate.py`.
+    # model.setup_symm_mem(torch.bfloat16, device)
+
+    # Example inputs
+    # Synthetic setting
+    microbatches = mbp_size 
+    torch.manual_seed(ep_rank)
+    bs = 4
+    seqlen = 128
+    x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
+    label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
+
+    if rank == 0:
+        print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
+    print(g_str(f"Rank {rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
+    # Create loss function
+    loss_fn = torch.nn.functional.cross_entropy 
+
+    print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
+    # Create pipeline stage
+    stage = MbpStage(
+        model,
+        pp_rank,
+        pp_size,
+        device,
+        group=pp_mesh.get_group(),
+    )
+
+    pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
+                                loss_fn=loss_fn, global_rank=rank)
+
+    if pp_rank == 0:
+        pp_schedule.step(x)
+    elif pp_rank == pp_size - 1:
+        y_dict = pp_schedule.step(target=label)
+    else:
+        pp_schedule.step()
+    print(g_str(f"Rank {rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
+
+    grad_weight_info = get_gradient_weight_info(model)
+    print(b_str(f"Rank {rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
+    
+    # mbp_ctrl.add(1)
     return 
+
     # Now, all ranks in the MBP group participate in creating the shared cache.
     # Rank 0 will broadcast the metadata it discovered.
     mbp_grad_manager = SharedGradientManager(model, group=mbp_grp)
@@ -237,17 +301,7 @@ def run_full_model(
     dist.barrier(group=global_cpu_grp)
     print(g_str(f"Rank {rank} ") + "After shared gradient cache setup " + print_memory_usage() + "\n", end="")
     
-    # Setup MBP control synchronization primitives for each MBP group
-    mbp_ctrl_name = f"mbp_ctrl_{mbp_group_idx}"
-    if mbp_rank == 0:
-        mbp_ctrl = torch_ipc_extension.SharedData(
-            name=mbp_ctrl_name, is_creator=True, initial_value=0,
-            semaphore_count = max_concurrent_process_groups
-        )
-    else:
-        mbp_ctrl = torch_ipc_extension.SharedData(
-            name=mbp_ctrl_name, is_creator=False
-        )
+    
     dist.barrier(group=global_cpu_grp)
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     dist.barrier(group=global_cpu_grp)

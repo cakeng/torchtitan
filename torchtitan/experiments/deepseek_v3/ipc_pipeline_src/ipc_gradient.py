@@ -29,26 +29,6 @@ def get_dtensor_info(name: str, grad: DTensor):
         )
     return out
 
-def get_gradient_weight_info(model: torch.nn.Module):
-    """
-    Returns a dictionary of gradient weight information for the model.
-    """
-    grad_weight_info = {}
-    for name, param in model.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            grad = param.grad
-            weight = param.data
-            grad_mesh = grad.device_mesh if isinstance(grad, DTensor) else None
-            weight_mesh = weight.device_mesh if isinstance(weight, DTensor) else None
-            grad_placements = grad.placements if isinstance(grad, DTensor) else None
-            weight_placements = weight.placements if isinstance(weight, DTensor) else None
-            grad_weight_info[name] = {
-                "Gradient": (grad.shape, grad.dtype, grad_mesh, grad_placements),
-                "Weight": (weight.shape, weight.dtype, weight_mesh, weight_placements)
-            }
-
-    return grad_weight_info
-
 class SharedGradientManager:
     """
     Manages the discovery, creation, and accumulation of gradients into
