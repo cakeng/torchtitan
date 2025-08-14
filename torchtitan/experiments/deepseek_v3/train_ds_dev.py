@@ -11,6 +11,7 @@
 # and is intended to be used for debugging and development
 
 import os
+import sys
 from re import T
 
 from accelerate.utils.megatron_lm import F
@@ -27,7 +28,10 @@ from torch.distributed._tensor import DTensor
 from torch.distributed.pipelining import PipelineStage, Schedule1F1B
 from accelerate import init_empty_weights
 
-from ipc_pipeline_src.ipc_share import share_model_parameters_ipc
+from ipc_pipeline_src.ipc_share import (get_shared_data, destroy_shared_data,
+                                        share_model_parameters_ipc,
+                                        create_and_share_tensor_ipc,
+                                        copy_and_share_tensor_ipc)
 from ipc_pipeline_src.mbp_schedule import ScheduleMbp
 from ipc_pipeline_src.mbp_stage import MbpStage
 from ipc_pipeline_src.ipc_gradient import SharedGradientManager
@@ -107,22 +111,21 @@ def get_gradient_weight_info(model: torch.nn.Module):
 # Run full model
 def run_full_model(
     mesh: DeviceMesh,
+    mbp_rank: int,
+    mbp_size: int,
 ):
     pp_mesh = mesh["pp"]
     ep_mesh = mesh["ep"]
-    mbp_mesh = mesh["mbp"]
     fsdp_mesh = mesh["fsdp"]
     pp_rank = pp_mesh.get_local_rank()
     ep_rank = ep_mesh.get_local_rank()
-    mbp_rank = mbp_mesh.get_local_rank()
     fsdp_rank = fsdp_mesh.get_local_rank()
     pp_size = pp_mesh.size()
     ep_size = ep_mesh.size()
-    mbp_size = mbp_mesh.size()
     fsdp_size = fsdp_mesh.size()
-
-    rank = dist.get_rank()
-    device_count = min(torch.cuda.device_count(), pp_size * ep_size * fsdp_size)
+    
+    rank = dist.get_rank() # PP x EP x FSDP Rank, exists per GPU
+    device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
 
     # Get model configs
@@ -135,86 +138,51 @@ def run_full_model(
     model_args.ep_size = ep_size
     model_args.num_stages = pp_size
     model_args.stage_idx = pp_rank
-    if rank == 0:
+    if rank == 0 and mbp_rank == 0:
         print(
             b_str(f"Parallelism Setting: ") + 
-            f"Global_{rank=}, {ep_size=}, {pp_size=}, {mbp_size=}, "
-            f"Ranks: {mbp_rank=}, {ep_rank=}, {pp_rank=}, {fsdp_rank=}, {device=}, "
-            f"{model_args.num_stages=}, {model_args.stage_idx=}"
+            f"Parallelism: {mbp_size=}, {ep_size=}, {pp_size=}, {fsdp_size=}, "
+            f"Ranks: {mbp_rank=}, {rank=}, {ep_rank=}, {pp_rank=}, {fsdp_rank=}, "
+            f"{model_args.num_stages=}, {model_args.stage_idx=}\n"
         )
     
     # Setup MBP groups
-    global_cpu_grp = dist.new_group(
-        backend="gloo",
-        group_desc=f"global_cpu_group"
-    )
-    # Microbatch parallelism group (MBP) = Process group on the SAME GPU
-    # Get all unique MBP groups first
-    all_mbp_groups = []
-    num_mbp_groups = dist.get_world_size() // mbp_size
-    for mbp_grp_idx in range(num_mbp_groups):
-        # Calculate ranks for this MBP group
-        mbp_group_ranks = [(mbp_grp_idx + i * num_mbp_groups) for i in range(mbp_size)]
-        all_mbp_groups.append(mbp_group_ranks)
-
-    mbp_groups = []
-    for group_idx, mbp_ranks in enumerate(all_mbp_groups):
-        group = dist.new_group(
-            ranks=mbp_ranks,
-            backend="gloo",
-            group_desc=f"mbp_group_{group_idx}_{mbp_ranks}"
-        )
-        mbp_groups.append((group_idx, group, mbp_ranks))
-
-    dist.barrier(group=global_cpu_grp)
-    # Find the group this rank belongs to
-    current_rank = dist.get_rank()
-    for group_idx, group, mbp_ranks in mbp_groups:
-        if current_rank in mbp_ranks:
-            mbp_group_idx = group_idx
-            mbp_grp = group
-            print(b_str(f"Rank {rank} ") + f"Found my MBP group: " +
-                    f"{mbp_group_idx} with ranks: {mbp_ranks} on device {device}\n", end="")
-            break
-    dist.barrier(group=global_cpu_grp)
+    max_concurrent_process_groups = 1
+    mbp_ctrl_name = f"mbp_ctrl_gpu_{rank}"
+    if mbp_rank == 0:
+        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
+                                   group_size=mbp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
+    else:
+        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
+                                   group_size=mbp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
 
     fsdp_mesh = mesh["fsdp"]
     fsdp_rank = fsdp_mesh.get_local_rank()
     hsdp_mesh = mesh["ep", "fsdp"]
-    print(g_str(f"Rank {rank} Mesh: ") + 
-          b_str("mbp_mesh ") + f"{mbp_group_idx}: {mbp_mesh} - " + y_str("mbp rank: ") + f"{mbp_rank}, " +
-          b_str("pp_mesh: ") + f"{pp_mesh} - " + y_str("pp rank: ") + f"{pp_rank}, " +
-          b_str("ep_mesh: ") + f"{ep_mesh} - " + y_str("ep rank: ") + f"{ep_rank}, " +
-          b_str("fsdp_mesh: ") + f"{fsdp_mesh} - " + y_str("fsdp rank: ") + f"{fsdp_rank}, " + 
-          b_str("hsdp_mesh: ") + f"{hsdp_mesh} \n", end="")
+    print(g_str(f"Rank {mbp_rank}_{rank} Mesh: ") + 
+          y_str("\n\tmbp rank: ") + f"{mbp_rank}" +
+          b_str("\n\tpp_mesh: ") + f"{pp_mesh} - " + y_str("pp rank: ") + f"{pp_rank}" +
+          b_str("\n\tep_mesh: ") + f"{ep_mesh} - " + y_str("ep rank: ") + f"{ep_rank}" +
+          b_str("\n\tfsdp_mesh: ") + f"{fsdp_mesh} - " + y_str("fsdp rank: ") + f"{fsdp_rank}" + 
+          b_str("\n\thsdp_mesh: ") + f"{hsdp_mesh} \n", end="")
     
-    dist.barrier(group=global_cpu_grp)
+    mbp_ctrl.barrier()
+    print(g_str(f"Rank {mbp_rank}_{rank} ") + "Synced with all ranks in the MBP group\n", end="")
     
-    # Setup MBP control synchronization primitives for each MBP group
-    max_concurrent_process_groups = 1
-    # mbp_ctrl_name = f"mbp_ctrl_{mbp_group_idx}"
-    # if mbp_rank == 0:
-    #     mbp_ctrl = torch_ipc_extension.SharedData(
-    #         name=mbp_ctrl_name, is_creator=True, initial_value=0,
-    #         semaphore_count = max_concurrent_process_groups
-    #     )
-    # else:
-    #     mbp_ctrl = torch_ipc_extension.SharedData(
-    #         name=mbp_ctrl_name, is_creator=False
-    #     )
-        
-    # dist.barrier(group=global_cpu_grp)
-
-    # mbp_ctrl.wait_for_value(mbp_rank)
-    if mbp_rank > 0:
-        return
       
     # Instantiate model
-    print(g_str(f"Rank {rank} ") + "Before model instantiation " + print_memory_usage() + "\n", end="")
+    print(g_str(f"Rank {mbp_rank}_{rank} ") + 
+          "Before model instantiation " + print_memory_usage() + "\n", end="")
     with device, mesh:
-        # Only MBP rank 0 creates the model with weights
-        model = DeepseekForCausalLM(model_args)
-    print(g_str(f"Rank {rank} ") + "After model instantiation " + print_memory_usage() + "\n", end="")
+        if mbp_rank == 0:
+            model = DeepseekForCausalLM(model_args)
+        else:
+            with init_empty_weights():
+                model = DeepseekForCausalLM(model_args)
+    print(g_str(f"Rank {mbp_rank}_{rank} ") + 
+          "After model instantiation " + print_memory_usage() + "\n", end="")
     # Load weights
     # load_weights_from_hf(model, model_id, device)
     model.train()
@@ -241,7 +209,7 @@ def run_full_model(
     fully_shard(model, 
                 mesh=hsdp_mesh, 
                 reshard_after_forward=False)
-    print(g_str(f"Rank {rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
+    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
     
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -257,13 +225,17 @@ def run_full_model(
     x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
     label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
 
+    if mbp_rank > 0:
+        return
+
     if rank == 0:
-        print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
-    print(g_str(f"Rank {rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
+        print(g_str(f"Rank {mbp_rank}_{rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
+    
+    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy 
 
-    print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
+    print(g_str(f"Rank {mbp_rank}_{rank}: ") + "Starting gradient discovery run...\n", end="")
     # Create pipeline stage
     stage = MbpStage(
         model,
@@ -282,10 +254,10 @@ def run_full_model(
         y_dict = pp_schedule.step(target=label)
     else:
         pp_schedule.step()
-    print(g_str(f"Rank {rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
+    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
 
     grad_weight_info = get_gradient_weight_info(model)
-    print(b_str(f"Rank {rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
+    print(b_str(f"Rank {mbp_rank}_{rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
     
     # mbp_ctrl.add(1)
     return 
@@ -297,13 +269,13 @@ def run_full_model(
     if mbp_rank == 0:
         del pp_schedule, stage
     torch.cuda.empty_cache()
-    print(b_str(f"Rank {rank} ") + "Shared gradient cache setup complete.\n", end="")
+    print(b_str(f"Rank {mbp_rank}_{rank} ") + "Shared gradient cache setup complete.\n", end="")
     dist.barrier(group=global_cpu_grp)
-    print(g_str(f"Rank {rank} ") + "After shared gradient cache setup " + print_memory_usage() + "\n", end="")
+    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After shared gradient cache setup " + print_memory_usage() + "\n", end="")
     
     
     dist.barrier(group=global_cpu_grp)
-    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
+    print(b_str(f"Rank {mbp_rank}_{rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     dist.barrier(group=global_cpu_grp)
 
     # Run forward and backward
@@ -324,7 +296,7 @@ def run_full_model(
 
             mbp_ctrl.wait_for_value(mbp_rank)
             mbp_ctrl.sem_wait()
-            print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
+            print(g_str(f"Rank {mbp_rank}_{rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
 
             loss = None
             y_dict = None
@@ -345,14 +317,14 @@ def run_full_model(
                                  mbp_group_idx=mbp_group_idx,
                                  mbp_grp=mbp_grp)
             
-            print(g_str(f"Rank {rank} ") + "After F/B pass" + print_memory_usage() + "\n", end="")
+            print(g_str(f"Rank {mbp_rank}_{rank} ") + "After F/B pass" + print_memory_usage() + "\n", end="")
 
             # Release the semaphore
-            print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
+            print(g_str(f"Rank {mbp_rank}_{rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
 
             if pp_rank == pp_size - 1:
                 first_key = next(iter(y_dict))
-                print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
+                print(y_str(f"Rank {mbp_rank}_{rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
 
             mbp_grad_manager.accumulate_grad()
             model.zero_grad()
@@ -363,7 +335,7 @@ def run_full_model(
             if y_dict is not None:
                 del y_dict
             torch.cuda.empty_cache()
-            print(g_str(f"Rank {rank} ") + "After gradient accumulation" + print_memory_usage() + "\n", end="")
+            print(g_str(f"Rank {mbp_rank}_{rank} ") + "After gradient accumulation" + print_memory_usage() + "\n", end="")
 
             mbp_ctrl.sem_post()
 
@@ -374,7 +346,7 @@ def run_full_model(
             # Run optimizer here
             if rank == 0:
                 grad = mbp_grad_manager.get_grad("model.layers.0.self_attn.q_proj.weight")
-                print(y_str(f"Rank {rank} ") + f"{torch.linalg.norm(grad)=}")
+                print(y_str(f"Rank {mbp_rank}_{rank} ") + f"{torch.linalg.norm(grad)=}")
 
         dist.barrier(group=mbp_grp)
         mbp_grad_manager.zero_grad()
@@ -385,29 +357,28 @@ def run_full_model(
             # Reset microbatch counter
             mbp_ctrl.set(0)
             if rank == 0:
-                print(g_str(f"Rank {rank} ") + f"/////// Finished iteration {_} ///////\n", end="")
+                print(g_str(f"Rank {mbp_rank}_{rank} ") + f"/////// Finished iteration {_} ///////\n", end="")
 
-    print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
+    print(b_str(f"Rank {mbp_rank}_{rank} ") + f"All processes finished training loop\n", end="")
     mbp_grad_manager.destroy()
     if mbp_rank == 0:
         torch_ipc_extension.destroy_shared_data(f"mbp_ctrl")
 
 
 if __name__ == "__main__":
-    mbp_size = 2
-    pp_size = 2
-    ep_size = 2
-    fsdp_size = 2
+    pp_size = int(sys.argv[1])
+    ep_size = int(sys.argv[2])
+    fsdp_size = int(sys.argv[3])
+    mbp_size = int(sys.argv[4])
+    mbp_rank = int(sys.argv[5])
     
-    assert torch.cuda.device_count() >= pp_size * ep_size * fsdp_size
-    num_gpus = min(torch.cuda.device_count(), pp_size * ep_size * fsdp_size)
     # set device before init_device mesh, otherwise ep will have duplicate device mapping
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % num_gpus)
-    mesh = dist.init_device_mesh("cuda", (mbp_size, pp_size, ep_size, fsdp_size), 
-                                 mesh_dim_names=("mbp", "pp", "ep", "fsdp"))
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size), 
+                                 mesh_dim_names=("pp", "ep", "fsdp"))
     
     time_start = datetime.now()
-    run_full_model(mesh)
+    run_full_model(mesh, mbp_rank, mbp_size)
     time_end = datetime.now()
     print(f"Time elapsed: {time_end - time_start}\n", end="")
 
