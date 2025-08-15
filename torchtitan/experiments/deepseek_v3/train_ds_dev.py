@@ -111,8 +111,8 @@ def get_gradient_weight_info(model: torch.nn.Module):
 # Run full model
 def run_full_model(
     mesh: DeviceMesh,
-    mbp_rank: int,
-    mbp_size: int,
+    mbp_rank: int = 0,
+    mbp_size: int = 1,
 ):
     pp_mesh = mesh["pp"]
     ep_mesh = mesh["ep"]
@@ -149,14 +149,14 @@ def run_full_model(
     # Setup MBP groups
     max_concurrent_process_groups = 1
     mbp_ctrl_name = f"mbp_ctrl_gpu_{rank}"
-    if mbp_rank == 0:
-        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
-                                   group_size=mbp_size, initial_value=0, 
-                                   semaphore_count=max_concurrent_process_groups)
-    else:
-        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
-                                   group_size=mbp_size, initial_value=0, 
-                                   semaphore_count=max_concurrent_process_groups)
+    # if mbp_rank == 0:
+    #     mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
+    #                                group_size=mbp_size, initial_value=0, 
+    #                                semaphore_count=max_concurrent_process_groups)
+    # else:
+    #     mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
+    #                                group_size=mbp_size, initial_value=0, 
+    #                                semaphore_count=max_concurrent_process_groups)
 
     fsdp_mesh = mesh["fsdp"]
     fsdp_rank = fsdp_mesh.get_local_rank()
@@ -168,7 +168,7 @@ def run_full_model(
           b_str("\n\tfsdp_mesh: ") + f"{fsdp_mesh} - " + y_str("fsdp rank: ") + f"{fsdp_rank}" + 
           b_str("\n\thsdp_mesh: ") + f"{hsdp_mesh} \n", end="")
     
-    mbp_ctrl.barrier()
+    # mbp_ctrl.barrier()
     print(g_str(f"Rank {mbp_rank}_{rank} ") + "Synced with all ranks in the MBP group\n", end="")
     
       
@@ -176,11 +176,12 @@ def run_full_model(
     print(g_str(f"Rank {mbp_rank}_{rank} ") + 
           "Before model instantiation " + print_memory_usage() + "\n", end="")
     with device, mesh:
-        if mbp_rank == 0:
-            model = DeepseekForCausalLM(model_args)
-        else:
-            with init_empty_weights():
-                model = DeepseekForCausalLM(model_args)
+        model = DeepseekForCausalLM(model_args)
+        # if mbp_rank == 0:
+        #     model = DeepseekForCausalLM(model_args)
+        # else:
+        #     with init_empty_weights():
+        #         model = DeepseekForCausalLM(model_args)
     print(g_str(f"Rank {mbp_rank}_{rank} ") + 
           "After model instantiation " + print_memory_usage() + "\n", end="")
     # Load weights
@@ -218,15 +219,12 @@ def run_full_model(
 
     # Example inputs
     # Synthetic setting
-    microbatches = mbp_size 
+    microbatches = mbp_size
     torch.manual_seed(ep_rank)
     bs = 4
     seqlen = 128
     x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
     label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
-
-    if mbp_rank > 0:
-        return
 
     if rank == 0:
         print(g_str(f"Rank {mbp_rank}_{rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
@@ -239,14 +237,15 @@ def run_full_model(
     # Create pipeline stage
     stage = MbpStage(
         model,
+        mbp_rank,
         pp_rank,
         pp_size,
         device,
         group=pp_mesh.get_group(),
     )
 
-    pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
-                                loss_fn=loss_fn, global_rank=rank)
+    pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches,
+                              loss_fn=loss_fn, global_rank=rank)
 
     if pp_rank == 0:
         pp_schedule.step(x)
@@ -257,7 +256,8 @@ def run_full_model(
     print(g_str(f"Rank {mbp_rank}_{rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
 
     grad_weight_info = get_gradient_weight_info(model)
-    print(b_str(f"Rank {mbp_rank}_{rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
+    if rank == 0:
+        print(b_str(f"Rank {mbp_rank}_{rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
     
     # mbp_ctrl.add(1)
     return 

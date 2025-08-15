@@ -41,6 +41,7 @@ for i in range(mbp_size):
         str(mbp_size),
         str(i)
     ]
+    cmd_str = " ".join(cmd)
     
     # Launch process asynchronously with real-time output streaming
     process = subprocess.Popen(
@@ -63,7 +64,7 @@ for i in range(mbp_size):
     stderr_thread.start()
     
     processes.append((process, stdout_thread, stderr_thread))
-    print(f"Launched MBP rank {i} with PID {process.pid}, cmd: {cmd}")
+    print(f"Launched MBP rank {i} with PID {process.pid}, cmd: {cmd_str}")
 
 # Wait for all processes to complete
 print(f"\nWaiting for all {len(processes)} processes to complete...")
