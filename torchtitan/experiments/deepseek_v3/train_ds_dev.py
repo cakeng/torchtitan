@@ -30,6 +30,7 @@ from accelerate import init_empty_weights
 
 from ipc_pipeline_src.ipc_share import (get_shared_data, destroy_shared_data,
                                         share_model_parameters_ipc,
+                                        share_model_gradients_ipc,
                                         create_and_share_tensor_ipc,
                                         copy_and_share_tensor_ipc)
 from ipc_pipeline_src.mbp_schedule import ScheduleMbp
@@ -51,7 +52,7 @@ def b_str(s):
 def y_str(s):
     return "\033[33m" + s + "\033[0m"
 
-def print_memory_usage():
+def get_memory_usage():
     allocated_mem = torch.cuda.memory_allocated()
     cached_mem = torch.cuda.memory_reserved()
     free_mem, total_mem = torch.cuda.mem_get_info()
@@ -65,48 +66,11 @@ def print_memory_usage():
           f"Other process memory: {other_process_mem/1024**2:.2f} MB")
     return str
 
-def get_gradient_weight_info(model: torch.nn.Module):
-    """
-    Returns a dictionary of gradient weight information for the model.
-    """
-    grad_weight_info = {}
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            # The parameter itself is the DTensor after fully_shard.
-            # Do NOT use .data, as it returns the underlying torch.Tensor.
-            weight = param
-            grad = param.grad
-
-            # Default to None for non-DTensor params or missing grads
-            weight_mesh, weight_placements = None, None
-            grad_mesh, grad_placements = None, None
-            grad_shape, grad_dtype = None, None
-
-            # Check the weight tensor
-            if isinstance(weight, DTensor):
-                weight_mesh = weight.device_mesh
-                weight_placements = weight.placements
-
-            # Check the gradient tensor
-            if grad is not None:
-                grad_shape = grad.shape
-                grad_dtype = grad.dtype
-                if isinstance(grad, DTensor):
-                    grad_mesh = grad.device_mesh
-                    grad_placements = grad.placements
-            
-            # If the weight is a DTensor, its shape attribute will still
-            # correctly report the global shape.
-            grad_weight_info[name] = {
-                "Gradient": (
-                    grad_shape, grad_dtype, grad_mesh, grad_placements
-                ),
-                "Weight": (
-                    weight.shape, weight.dtype, weight_mesh, weight_placements
-                )
-            }
-
-    return grad_weight_info
+def print_memory_usage(rank, mbp_ctrl, str):
+    mbp_ctrl.barrier()
+    if rank == 0:
+        print(g_str(f"Rank {rank} ") + str + ": " + get_memory_usage() + "\n", end="")
+    mbp_ctrl.barrier()
 
 # Run full model
 def run_full_model(
@@ -149,41 +113,39 @@ def run_full_model(
     # Setup MBP groups
     max_concurrent_process_groups = 1
     mbp_ctrl_name = f"mbp_ctrl_gpu_{rank}"
-    # if mbp_rank == 0:
-    #     mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
-    #                                group_size=mbp_size, initial_value=0, 
-    #                                semaphore_count=max_concurrent_process_groups)
-    # else:
-    #     mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
-    #                                group_size=mbp_size, initial_value=0, 
-    #                                semaphore_count=max_concurrent_process_groups)
+    if mbp_rank == 0:
+        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
+                                   group_size=mbp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
+    else:
+        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
+                                   group_size=mbp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
 
     fsdp_mesh = mesh["fsdp"]
     fsdp_rank = fsdp_mesh.get_local_rank()
     hsdp_mesh = mesh["ep", "fsdp"]
-    print(g_str(f"Rank {mbp_rank}_{rank} Mesh: ") + 
+    print(g_str(f"Rank {rank} Mesh: ") + 
           y_str("\n\tmbp rank: ") + f"{mbp_rank}" +
           b_str("\n\tpp_mesh: ") + f"{pp_mesh} - " + y_str("pp rank: ") + f"{pp_rank}" +
           b_str("\n\tep_mesh: ") + f"{ep_mesh} - " + y_str("ep rank: ") + f"{ep_rank}" +
           b_str("\n\tfsdp_mesh: ") + f"{fsdp_mesh} - " + y_str("fsdp rank: ") + f"{fsdp_rank}" + 
           b_str("\n\thsdp_mesh: ") + f"{hsdp_mesh} \n", end="")
     
-    # mbp_ctrl.barrier()
-    print(g_str(f"Rank {mbp_rank}_{rank} ") + "Synced with all ranks in the MBP group\n", end="")
+    mbp_ctrl.barrier()
+    print(g_str(f"Rank {rank} ") + "Synced with all ranks in the MBP group\n", end="")
     
       
     # Instantiate model
-    print(g_str(f"Rank {mbp_rank}_{rank} ") + 
-          "Before model instantiation " + print_memory_usage() + "\n", end="")
+    print_memory_usage(rank, mbp_ctrl, "Before model instantiation")
     with device, mesh:
-        model = DeepseekForCausalLM(model_args)
-        # if mbp_rank == 0:
-        #     model = DeepseekForCausalLM(model_args)
-        # else:
-        #     with init_empty_weights():
-        #         model = DeepseekForCausalLM(model_args)
-    print(g_str(f"Rank {mbp_rank}_{rank} ") + 
-          "After model instantiation " + print_memory_usage() + "\n", end="")
+        # model = DeepseekForCausalLM(model_args)
+        if mbp_rank == 0:
+            model = DeepseekForCausalLM(model_args)
+        else:
+            with init_empty_weights():
+                model = DeepseekForCausalLM(model_args)
+    print_memory_usage(rank, mbp_ctrl, "After model instantiation")
     # Load weights
     # load_weights_from_hf(model, model_id, device)
     model.train()
@@ -210,7 +172,7 @@ def run_full_model(
     fully_shard(model, 
                 mesh=hsdp_mesh, 
                 reshard_after_forward=False)
-    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After applying FSDP " + print_memory_usage() + "\n", end="")
+    print_memory_usage(rank, mbp_ctrl, "After applying FSDP")
     
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -223,59 +185,71 @@ def run_full_model(
     torch.manual_seed(ep_rank)
     bs = 4
     seqlen = 128
-    x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
-    label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
+    if mbp_rank == 0:
+        x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
+        label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
+        x = copy_and_share_tensor_ipc(x, is_creator=True, group_size=mbp_size, 
+                                      shm_name=f"mbp_share_model_params_{rank}")
+        label = copy_and_share_tensor_ipc(label, is_creator=True, group_size=mbp_size, 
+                                          shm_name=f"mbp_share_model_params_{rank}")
+    else:
+        x = copy_and_share_tensor_ipc(None, is_creator=False, group_size=mbp_size, 
+                                      shm_name=f"mbp_share_model_params_{rank}")
+        label = copy_and_share_tensor_ipc(None, is_creator=False, group_size=mbp_size, 
+                                          shm_name=f"mbp_share_model_params_{rank}")
+
 
     if rank == 0:
-        print(g_str(f"Rank {mbp_rank}_{rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
+        print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
     
-    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After synthetic data generation " + print_memory_usage() + "\n", end="")
+    print_memory_usage(rank, mbp_ctrl, "After synthetic data generation")
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy 
 
-    print(g_str(f"Rank {mbp_rank}_{rank}: ") + "Starting gradient discovery run...\n", end="")
-    # Create pipeline stage
-    stage = MbpStage(
-        model,
-        mbp_rank,
-        pp_rank,
-        pp_size,
-        device,
-        group=pp_mesh.get_group(),
-    )
-
-    pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches,
-                              loss_fn=loss_fn, global_rank=rank)
-
-    if pp_rank == 0:
-        pp_schedule.step(x)
-    elif pp_rank == pp_size - 1:
-        y_dict = pp_schedule.step(target=label)
-    else:
-        pp_schedule.step()
-    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After gradient discovery run " + print_memory_usage() + "\n", end="")
-
-    grad_weight_info = get_gradient_weight_info(model)
-    if rank == 0:
-        print(b_str(f"Rank {mbp_rank}_{rank} ") + f"Gradient weight info: {grad_weight_info}\n", end="")
-    
-    # mbp_ctrl.add(1)
-    return 
-
-    # Now, all ranks in the MBP group participate in creating the shared cache.
-    # Rank 0 will broadcast the metadata it discovered.
-    mbp_grad_manager = SharedGradientManager(model, group=mbp_grp)
-    mbp_grad_manager.setup_shared_cache()
     if mbp_rank == 0:
+        print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
+        # Create pipeline stage
+        stage = MbpStage(
+            model,
+            mbp_rank,
+            pp_rank,
+            pp_size,
+            device,
+            group=pp_mesh.get_group(),
+        )
+
+        pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches,
+                                loss_fn=loss_fn, global_rank=rank)
+
+        if pp_rank == 0:
+            pp_schedule.step(x)
+        elif pp_rank == pp_size - 1:
+            y_dict = pp_schedule.step(target=label)
+        else:
+            pp_schedule.step()
         del pp_schedule, stage
+    print_memory_usage(rank, mbp_ctrl, "After gradient discovery run")
+    
+    # Now, all ranks in the MBP group participate sharing model parameters and gradients.
+    if mbp_rank == 0:
+        share_model_parameters_ipc(model, is_creator=True, group_size=mbp_size, 
+                                   shm_name=f"mbp_share_model_params_{rank}")
+        # share_model_gradients_ipc(model, is_creator=True, group_size=mbp_size, 
+        #                           shm_name=f"mbp_share_model_grads_{rank}")
+    else:
+        share_model_parameters_ipc(model, is_creator=False, group_size=mbp_size, 
+                                   shm_name=f"mbp_share_model_params_{rank}")
+        # share_model_gradients_ipc(model, is_creator=False, group_size=mbp_size, 
+        #                           shm_name=f"mbp_share_model_grads_{rank}")
+        
     torch.cuda.empty_cache()
-    print(b_str(f"Rank {mbp_rank}_{rank} ") + "Shared gradient cache setup complete.\n", end="")
-    dist.barrier(group=global_cpu_grp)
-    print(g_str(f"Rank {mbp_rank}_{rank} ") + "After shared gradient cache setup " + print_memory_usage() + "\n", end="")
+    print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
+    mbp_ctrl.barrier()
     
+    return 
     
     dist.barrier(group=global_cpu_grp)
-    print(b_str(f"Rank {mbp_rank}_{rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
+    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     dist.barrier(group=global_cpu_grp)
 
     # Run forward and backward
@@ -296,7 +270,7 @@ def run_full_model(
 
             mbp_ctrl.wait_for_value(mbp_rank)
             mbp_ctrl.sem_wait()
-            print(g_str(f"Rank {mbp_rank}_{rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
+            print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
 
             loss = None
             y_dict = None
@@ -317,14 +291,14 @@ def run_full_model(
                                  mbp_group_idx=mbp_group_idx,
                                  mbp_grp=mbp_grp)
             
-            print(g_str(f"Rank {mbp_rank}_{rank} ") + "After F/B pass" + print_memory_usage() + "\n", end="")
+            print(g_str(f"Rank {rank} ") + "After F/B pass" + print_memory_usage() + "\n", end="")
 
             # Release the semaphore
-            print(g_str(f"Rank {mbp_rank}_{rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
+            print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
 
             if pp_rank == pp_size - 1:
                 first_key = next(iter(y_dict))
-                print(y_str(f"Rank {mbp_rank}_{rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
+                print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
 
             mbp_grad_manager.accumulate_grad()
             model.zero_grad()
@@ -335,7 +309,7 @@ def run_full_model(
             if y_dict is not None:
                 del y_dict
             torch.cuda.empty_cache()
-            print(g_str(f"Rank {mbp_rank}_{rank} ") + "After gradient accumulation" + print_memory_usage() + "\n", end="")
+            print(g_str(f"Rank {rank} ") + "After gradient accumulation" + print_memory_usage() + "\n", end="")
 
             mbp_ctrl.sem_post()
 
@@ -346,7 +320,7 @@ def run_full_model(
             # Run optimizer here
             if rank == 0:
                 grad = mbp_grad_manager.get_grad("model.layers.0.self_attn.q_proj.weight")
-                print(y_str(f"Rank {mbp_rank}_{rank} ") + f"{torch.linalg.norm(grad)=}")
+                print(y_str(f"Rank {rank} ") + f"{torch.linalg.norm(grad)=}")
 
         dist.barrier(group=mbp_grp)
         mbp_grad_manager.zero_grad()
@@ -357,9 +331,9 @@ def run_full_model(
             # Reset microbatch counter
             mbp_ctrl.set(0)
             if rank == 0:
-                print(g_str(f"Rank {mbp_rank}_{rank} ") + f"/////// Finished iteration {_} ///////\n", end="")
+                print(g_str(f"Rank {rank} ") + f"/////// Finished iteration {_} ///////\n", end="")
 
-    print(b_str(f"Rank {mbp_rank}_{rank} ") + f"All processes finished training loop\n", end="")
+    print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
     mbp_grad_manager.destroy()
     if mbp_rank == 0:
         torch_ipc_extension.destroy_shared_data(f"mbp_ctrl")
@@ -380,6 +354,6 @@ if __name__ == "__main__":
     time_start = datetime.now()
     run_full_model(mesh, mbp_rank, mbp_size)
     time_end = datetime.now()
-    print(f"Time elapsed: {time_end - time_start}\n", end="")
+    print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
 
     dist.destroy_process_group()

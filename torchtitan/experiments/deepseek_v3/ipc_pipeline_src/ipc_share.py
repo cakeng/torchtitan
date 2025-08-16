@@ -19,9 +19,12 @@ import time
 import random
 import gc
 import pickle
+from sympy import O
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights
 from typing import Tuple, List, Optional, Union, Any, Dict
@@ -171,6 +174,48 @@ def _analyze_referrers(obj, name):
                 print("    Content could not be displayed.")
     print("-" * (20 + len(name)))
 
+def _get_gradient_weight_info(model: torch.nn.Module):
+    """
+    Returns a dictionary of gradient weight information for the model.
+    """
+    grad_weight_info = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # The parameter itself is the DTensor after fully_shard.
+            # Do NOT use .data, as it returns the underlying torch.Tensor.
+            weight = param
+            grad = param.grad
+
+            # Default to None for non-DTensor params or missing grads
+            weight_mesh, weight_placements = None, None
+            grad_mesh, grad_placements = None, None
+            grad_shape, grad_dtype = None, None
+
+            # Check the weight tensor
+            if isinstance(weight, DTensor):
+                weight_mesh = weight.device_mesh
+                weight_placements = weight.placements
+
+            # Check the gradient tensor
+            if grad is not None:
+                grad_shape = grad.shape
+                grad_dtype = grad.dtype
+                if isinstance(grad, DTensor):
+                    grad_mesh = grad.device_mesh
+                    grad_placements = grad.placements
+            
+            # If the weight is a DTensor, its shape attribute will still
+            # correctly report the global shape.
+            grad_weight_info[name] = {
+                "Gradient": (
+                    grad_shape, grad_dtype, grad_mesh, grad_placements
+                ),
+                "Weight": (
+                    weight.shape, weight.dtype, weight_mesh, weight_placements
+                )
+            }
+
+    return grad_weight_info
 
 def _set_param_or_buffer(model, name, tensor):
     """Helper to set a parameter or buffer in a model by its FQN."""
@@ -208,16 +253,15 @@ def destroy_shared_data(shared_data: torch_ipc_extension.SharedData):
         raise Warning(r_str(f"Shared memory name {shared_data.get_name()} does not exist."))
     _shm_name_history.remove(shared_data.get_name())
     shared_data.destroy()
-    
-
-def share_model_parameters_ipc(
+ 
+def share_model_gradients_ipc(
     model: nn.Module,
     is_creator: bool,
     group_size: int,
     shm_name: str,
 ):
     """
-    Shares model parameters from a source rank using C++-level IPC,
+    Shares model gradient cache from a source rank using C++-level IPC,
     independent of torch.distributed.
     """
     shm = get_shared_data(shm_name, is_creator, group_size, 
@@ -284,6 +328,100 @@ def share_model_parameters_ipc(
     if is_creator:
         destroy_shared_data(shm)
 
+def share_model_parameters_ipc(
+    model: nn.Module,
+    is_creator: bool,
+    group_size: int,
+    shm_name: str,
+):
+    """
+    Shares model parameters from a source rank using C++-level IPC,
+    independent of torch.distributed.
+    """
+    shm = get_shared_data(shm_name, is_creator, group_size, 
+                          data_buffer_size=128*1024*1024)
+
+    if is_creator:
+        handles_and_meta = []
+        param_names = [(True, name) for name, _ in model.named_parameters()]
+        buffer_names = [(False, name) for name, _ in model.named_buffers()]
+        
+        for is_param, name in param_names + buffer_names:
+            module_path, _, attr_name = name.rpartition('.')
+            parent_module = model.get_submodule(module_path)
+            original_tensor = getattr(parent_module, attr_name)
+            is_dtensor = isinstance(original_tensor, DTensor)
+            device_mesh = None
+            placements = None
+            # print(f"Original tensor {name} is_dtensor: {is_dtensor}\n", end="")
+            if is_dtensor:
+                device_mesh = original_tensor.device_mesh
+                placements = original_tensor.placements
+                original_tensor = original_tensor.to_local()
+
+            _check_tensor_ipc_comptability(original_tensor)
+            
+            shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
+                original_tensor
+            )
+            
+            device = original_tensor.device
+            device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
+            meta = (
+                name, handle, original_tensor.shape, original_tensor.dtype,
+                original_tensor.stride(), original_tensor.storage_offset(),
+                device_uuid, is_dtensor, device_mesh, placements
+            )
+            handles_and_meta.append(meta)
+            
+            if is_dtensor:
+                shared_tensor = DTensor.from_local(shared_tensor,
+                                                   device_mesh=device_mesh,
+                                                   placements=placements)
+                
+            if is_param:
+                setattr(parent_module, attr_name, nn.Parameter(shared_tensor))
+            else:
+                setattr(parent_module, attr_name, shared_tensor)
+        
+        # Serialize and write all metadata at once
+        payload = pickle.dumps(handles_and_meta)
+        shm.write_data(payload)
+        
+
+    # Barrier 1: Wait for src_rank to write data
+    shm.barrier()
+
+    if not is_creator:
+        payload = shm.read_data()
+        handles_and_meta = pickle.loads(payload)
+        
+        device = torch.device("cuda", torch.cuda.current_device())
+        device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
+        for name, handle, shape, dtype, stride, offset, source_uuid, \
+            is_dtensor, device_mesh, placements \
+                in handles_and_meta:
+            assert device_uuid == source_uuid, \
+                r_str("Rank ") + f"{dist.get_rank()} " + \
+                r_str("Source and destination tensor not on the same device.") + \
+                f" Source UUID: {source_uuid}, destination UUID: {device_uuid}"
+                
+            shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
+                handle, device, dtype, shape, stride, offset
+            )
+            if is_dtensor:
+                shared_tensor = DTensor.from_local(shared_tensor,
+                                                   device_mesh=device_mesh,
+                                                   placements=placements)
+            _set_param_or_buffer(model, name, shared_tensor)
+            
+    # Barrier 2: Wait for all ranks to finish setting parameters
+    gc.collect()
+    torch.cuda.empty_cache()
+    shm.barrier()
+    if is_creator:
+        destroy_shared_data(shm)
+
 def create_and_share_tensor_ipc(
     shape: torch.Size,
     dtype: torch.dtype,
@@ -315,6 +453,7 @@ def create_and_share_tensor_ipc(
         device = torch.device("cuda", torch.cuda.current_device())
         device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
         assert device_uuid == source_uuid, \
+            r_str("Rank ") + f"{dist.get_rank()} " + \
             r_str("Source and destination tensor not on the same device.") + \
             f" Source UUID: {source_uuid}, destination UUID: {device_uuid}"
         shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
@@ -339,6 +478,7 @@ def copy_and_share_tensor_ipc(
 
     shared_tensor = None
     if is_creator:
+        assert tensor is not None, "Tensor must not be None for creator rank."
         _check_tensor_ipc_comptability(tensor)
         shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
             tensor
@@ -356,11 +496,13 @@ def copy_and_share_tensor_ipc(
     shm.barrier()
 
     if not is_creator:
+        assert tensor is None, "Tensor must be None for non-creator rank."
         payload = shm.read_data()
         handle, shape, dtype, stride, offset, source_uuid = pickle.loads(payload)
         device = torch.device("cuda", torch.cuda.current_device())
         device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
         assert device_uuid == source_uuid, \
+            r_str("Rank ") + f"{dist.get_rank()} " + \
             r_str("Source and destination tensor not on the same device.") + \
             f" Source UUID: {source_uuid}, destination UUID: {device_uuid}"
         shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(

@@ -21,9 +21,9 @@ def stream_output(process, rank, stream_type):
     for line in iter(process.stdout.readline if stream_type == "stdout" else process.stderr.readline, ''):
         if line:
             # Prefix each line with rank info for clarity
-            prefix = f"[MBP-{rank}] "
+            prefix = f"[MBP {rank}] "
             if stream_type == "stderr":
-                prefix = f"[MBP-{rank}-ERR] "
+                prefix = f"[MBP {rank}-ERR] "
             print(f"{prefix}{line.rstrip()}", flush=True)
 
 # Launch four different training jobs asynchronously
@@ -53,17 +53,21 @@ for i in range(mbp_size):
         universal_newlines=True
     )
     
-    # Start output streaming threads
-    stdout_thread = threading.Thread(target=stream_output, args=(process, i, "stdout"))
-    stderr_thread = threading.Thread(target=stream_output, args=(process, i, "stderr"))
-    
-    stdout_thread.daemon = True
-    stderr_thread.daemon = True
-    
-    stdout_thread.start()
-    stderr_thread.start()
-    
-    processes.append((process, stdout_thread, stderr_thread))
+    # Start output streaming threads only for first 2 instances
+    if i < 15:
+        stdout_thread = threading.Thread(target=stream_output, args=(process, i, "stdout"))
+        stderr_thread = threading.Thread(target=stream_output, args=(process, i, "stderr"))
+        
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        
+        stdout_thread.start()
+        stderr_thread.start()
+        
+        processes.append((process, stdout_thread, stderr_thread))
+    else:
+        # For instances beyond the first 3, just append the process without streaming threads
+        processes.append((process, None, None))
     print(f"Launched MBP rank {i} with PID {process.pid}, cmd: {cmd_str}")
 
 # Wait for all processes to complete
