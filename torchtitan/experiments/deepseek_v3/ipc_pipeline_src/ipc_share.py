@@ -261,7 +261,7 @@ def share_model_gradients_ipc(
     shm_name: str,
 ):
     """
-    Shares model gradient cache from a source rank using C++-level IPC,
+    Shares model gradients from a source rank using C++-level IPC,
     independent of torch.distributed.
     """
     shm = get_shared_data(shm_name, is_creator, group_size, 
@@ -269,33 +269,48 @@ def share_model_gradients_ipc(
 
     if is_creator:
         handles_and_meta = []
-        param_names = [(True, name) for name, _ in model.named_parameters()]
-        buffer_names = [(False, name) for name, _ in model.named_buffers()]
+        param_names = [(True, name) for name, param in model.named_parameters()
+                       if param.requires_grad]
+        buffer_names = [(False, name) for name, buffer in model.named_buffers()
+                        if buffer.requires_grad]
         
         for is_param, name in param_names + buffer_names:
             module_path, _, attr_name = name.rpartition('.')
             parent_module = model.get_submodule(module_path)
             original_tensor = getattr(parent_module, attr_name)
+            original_grad = original_tensor.grad
+            is_dtensor = isinstance(original_grad, DTensor)
+            device_mesh = None
+            placements = None
+            print(f"Original grad {name} is_dtensor: {is_dtensor}, is_param: {is_param}, "
+                  f"requires_grad: {original_tensor.requires_grad}, "
+                  f"grad is None: {original_grad is None}\n", end="")
+            # if is_dtensor:
+            #     device_mesh = original_grad.device_mesh
+            #     placements = original_grad.placements
+            #     original_grad = original_grad.to_local()
 
-            _check_tensor_ipc_comptability(original_tensor)
+            # _check_tensor_ipc_comptability(original_grad)
             
-            shared_tensor, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
-                original_tensor
-            )
+            # shared_grad, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
+            #     original_grad
+            # )
+            # shared_grad.zero_()
             
-            device = original_tensor.device
-            device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
-            meta = (
-                name, handle, original_tensor.shape, original_tensor.dtype,
-                original_tensor.stride(), original_tensor.storage_offset(),
-                device_uuid
-            )
-            handles_and_meta.append(meta)
+            # device = original_grad.device
+            # device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
+            # meta = (
+            #     name, handle, original_grad.shape, original_grad.dtype,
+            #     original_grad.stride(), original_grad.storage_offset(),
+            #     device_uuid, is_dtensor, device_mesh, placements
+            # )
+            # handles_and_meta.append(meta)
             
-            if is_param:
-                setattr(parent_module, attr_name, nn.Parameter(shared_tensor))
-            else:
-                setattr(parent_module, attr_name, shared_tensor)
+            # if is_dtensor:
+            #     shared_grad = DTensor.from_local(shared_grad,
+            #                                      device_mesh=device_mesh,
+            #                                      placements=placements)
+            # setattr(original_tensor, "grad", shared_grad)
         
         # Serialize and write all metadata at once
         payload = pickle.dumps(handles_and_meta)
@@ -311,15 +326,26 @@ def share_model_gradients_ipc(
         
         device = torch.device("cuda", torch.cuda.current_device())
         device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
-        for name, handle, shape, dtype, stride, offset, source_uuid \
-            in handles_and_meta:
+        for name, handle, shape, dtype, stride, offset, source_uuid, \
+            is_dtensor, device_mesh, placements \
+                in handles_and_meta:
             assert device_uuid == source_uuid, \
+                r_str("Rank ") + f"{dist.get_rank()} " + \
                 r_str("Source and destination tensor not on the same device.") + \
                 f" Source UUID: {source_uuid}, destination UUID: {device_uuid}"
-            shared_tensor = torch_ipc_extension.open_ipc_and_get_tensor(
+                
+            shared_grad = torch_ipc_extension.open_ipc_and_get_tensor(
                 handle, device, dtype, shape, stride, offset
             )
-            _set_param_or_buffer(model, name, shared_tensor)
+            if is_dtensor:
+                shared_grad = DTensor.from_local(shared_grad,
+                                                 device_mesh=device_mesh,
+                                                 placements=placements)
+                
+            module_path, _, attr_name = name.rpartition('.')
+            parent_module = model.get_submodule(module_path)
+            original_tensor = getattr(parent_module, attr_name)
+            setattr(original_tensor, "grad", shared_grad)
             
     # Barrier 2: Wait for all ranks to finish setting parameters
     gc.collect()

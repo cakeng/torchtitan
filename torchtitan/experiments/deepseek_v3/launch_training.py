@@ -8,7 +8,7 @@ import random
 mbp_size = 2
 pp_size = 2
 ep_size = 2
-fsdp_size = 2
+fsdp_size = 1
 
 num_gpus = pp_size * ep_size * fsdp_size
 

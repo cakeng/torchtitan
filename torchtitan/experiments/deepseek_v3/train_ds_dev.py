@@ -189,14 +189,14 @@ def run_full_model(
         x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
         label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
         x = copy_and_share_tensor_ipc(x, is_creator=True, group_size=mbp_size, 
-                                      shm_name=f"mbp_share_model_params_{rank}")
+                                      shm_name=f"mbp_share_input_{rank}")
         label = copy_and_share_tensor_ipc(label, is_creator=True, group_size=mbp_size, 
-                                          shm_name=f"mbp_share_model_params_{rank}")
+                                          shm_name=f"mbp_share_label_{rank}")
     else:
         x = copy_and_share_tensor_ipc(None, is_creator=False, group_size=mbp_size, 
-                                      shm_name=f"mbp_share_model_params_{rank}")
+                                      shm_name=f"mbp_share_input_{rank}")
         label = copy_and_share_tensor_ipc(None, is_creator=False, group_size=mbp_size, 
-                                          shm_name=f"mbp_share_model_params_{rank}")
+                                          shm_name=f"mbp_share_label_{rank}")
 
 
     if rank == 0:
@@ -207,7 +207,6 @@ def run_full_model(
     loss_fn = torch.nn.functional.cross_entropy 
 
     if mbp_rank == 0:
-        print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
         # Create pipeline stage
         stage = MbpStage(
             model,
@@ -220,6 +219,8 @@ def run_full_model(
 
         pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches,
                                 loss_fn=loss_fn, global_rank=rank)
+        
+        print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
 
         if pp_rank == 0:
             pp_schedule.step(x)
@@ -227,6 +228,7 @@ def run_full_model(
             y_dict = pp_schedule.step(target=label)
         else:
             pp_schedule.step()
+            
         del pp_schedule, stage
     print_memory_usage(rank, mbp_ctrl, "After gradient discovery run")
     
@@ -234,23 +236,35 @@ def run_full_model(
     if mbp_rank == 0:
         share_model_parameters_ipc(model, is_creator=True, group_size=mbp_size, 
                                    shm_name=f"mbp_share_model_params_{rank}")
-        # share_model_gradients_ipc(model, is_creator=True, group_size=mbp_size, 
-        #                           shm_name=f"mbp_share_model_grads_{rank}")
+        share_model_gradients_ipc(model, is_creator=True, group_size=mbp_size, 
+                                  shm_name=f"mbp_share_model_grads_{rank}")
     else:
         share_model_parameters_ipc(model, is_creator=False, group_size=mbp_size, 
                                    shm_name=f"mbp_share_model_params_{rank}")
-        # share_model_gradients_ipc(model, is_creator=False, group_size=mbp_size, 
-        #                           shm_name=f"mbp_share_model_grads_{rank}")
+        share_model_gradients_ipc(model, is_creator=False, group_size=mbp_size, 
+                                  shm_name=f"mbp_share_model_grads_{rank}")
         
     torch.cuda.empty_cache()
     print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
+    
     mbp_ctrl.barrier()
-    
-    return 
-    
-    dist.barrier(group=global_cpu_grp)
+    dist.barrier()
+    return
+    stage = MbpStage(
+                model,
+                pp_rank,
+                pp_size,
+                device,
+                group=pp_mesh.get_group(),
+            )
+    pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
+                              loss_fn=loss_fn, global_rank=rank)
+    print_memory_usage(rank, mbp_ctrl, "After stage and schedule creation")
+
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
-    dist.barrier(group=global_cpu_grp)
+    
+    mbp_ctrl.barrier()
+    dist.barrier()
 
     # Run forward and backward
     steps = 2
@@ -258,16 +272,7 @@ def run_full_model(
         # Only the first process in each SMB group captures the weight gradients
         if pp_size > 1:
             # Create pipeline stage
-            stage = MbpStage(
-                model,
-                pp_rank,
-                pp_size,
-                device,
-                group=pp_mesh.get_group(),
-            )
-            pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
-                                      loss_fn=loss_fn, global_rank=rank)
-
+            
             mbp_ctrl.wait_for_value(mbp_rank)
             mbp_ctrl.sem_wait()
             print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
@@ -276,20 +281,13 @@ def run_full_model(
             y_dict = None
             losses = []
             if pp_rank == 0:
-                pp_schedule.step(x,
-                                 mbp_ctrl=mbp_ctrl,
-                                 mbp_group_idx=mbp_group_idx,
-                                 mbp_grp=mbp_grp)
+                pp_schedule.step(x, mbp_ctrl=mbp_ctrl)
             elif pp_rank == pp_size - 1:
                 y_dict = pp_schedule.step(target=label, losses=losses,
-                                          mbp_ctrl=mbp_ctrl,
-                                          mbp_group_idx=mbp_group_idx,
-                                          mbp_grp=mbp_grp)
+                                          mbp_ctrl=mbp_ctrl)
                 loss = torch.mean(torch.stack(losses))
             else:
-                pp_schedule.step(mbp_ctrl=mbp_ctrl,
-                                 mbp_group_idx=mbp_group_idx,
-                                 mbp_grp=mbp_grp)
+                pp_schedule.step(mbp_ctrl=mbp_ctrl)
             
             print(g_str(f"Rank {rank} ") + "After F/B pass" + print_memory_usage() + "\n", end="")
 
@@ -300,33 +298,11 @@ def run_full_model(
                 first_key = next(iter(y_dict))
                 print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
 
-            mbp_grad_manager.accumulate_grad()
-            model.zero_grad()
-            del pp_schedule, stage
-            del losses
-            if loss is not None:
-                del loss
-            if y_dict is not None:
-                del y_dict
-            torch.cuda.empty_cache()
-            print(g_str(f"Rank {rank} ") + "After gradient accumulation" + print_memory_usage() + "\n", end="")
-
             mbp_ctrl.sem_post()
 
         # Wait for all MBP members to finish gradient accumulation before running optimizer
-        dist.barrier(group=mbp_grp)
+        mbp_ctrl.barrier()
 
-        if mbp_rank == 0:
-            # Run optimizer here
-            if rank == 0:
-                grad = mbp_grad_manager.get_grad("model.layers.0.self_attn.q_proj.weight")
-                print(y_str(f"Rank {rank} ") + f"{torch.linalg.norm(grad)=}")
-
-        dist.barrier(group=mbp_grp)
-        mbp_grad_manager.zero_grad()
-
-        # Wait for all processes to finish before the next iteration
-        dist.barrier(group=global_cpu_grp)
         if mbp_rank == 0:
             # Reset microbatch counter
             mbp_ctrl.set(0)
@@ -334,9 +310,8 @@ def run_full_model(
                 print(g_str(f"Rank {rank} ") + f"/////// Finished iteration {_} ///////\n", end="")
 
     print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
-    mbp_grad_manager.destroy()
     if mbp_rank == 0:
-        torch_ipc_extension.destroy_shared_data(f"mbp_ctrl")
+        destroy_shared_data(mbp_ctrl)
 
 
 if __name__ == "__main__":
