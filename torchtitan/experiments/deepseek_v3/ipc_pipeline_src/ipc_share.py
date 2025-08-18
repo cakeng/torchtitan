@@ -231,11 +231,11 @@ def _set_param_or_buffer(model, name, new_tensor):
         target_module._parameters[attr_name] = \
             nn.Parameter(new_tensor, requires_grad=old_tensor.requires_grad \
                              if old_tensor is not None else True)
-        new_tensor.grad = old_tensor.grad
-        del old_tensor.grad
+        target_module._parameters[attr_name].grad = old_tensor.grad
     elif attr_name in target_module._buffers:
         old_tensor = target_module._buffers[attr_name]
         target_module._buffers[attr_name] = new_tensor
+        target_module._buffers[attr_name].grad = old_tensor.grad
     else:
         raise AttributeError(f"{name} is not a parameter or buffer in the model.")
 
@@ -407,6 +407,7 @@ def share_model_parameters_ipc(
             module_path, _, attr_name = name.rpartition('.')
             parent_module = model.get_submodule(module_path)
             original_tensor = getattr(parent_module, attr_name)
+            original_grad = original_tensor.grad
             if is_param:
                 original_tensor = original_tensor.data
             requires_grad = original_tensor.requires_grad
@@ -417,9 +418,9 @@ def share_model_parameters_ipc(
                 device_mesh = original_tensor.device_mesh
                 placements = original_tensor.placements
                 original_tensor = original_tensor.to_local()
-                print(f"Original tensor {name} is_dtensor: {is_dtensor}, "
-                      f"is_param: {is_param}, device_mesh: {device_mesh}, "
-                      f"placements: {placements}\n", end="")
+            # print(f"Original tensor {name} is_dtensor: {is_dtensor}, "
+            #       f"is_param: {is_param}, device_mesh: {device_mesh}, "
+            #       f"placements: {placements}, grad is None: {original_grad is None}\n", end="")
 
             _check_tensor_ipc_comptability(original_tensor)
             

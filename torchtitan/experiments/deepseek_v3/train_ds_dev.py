@@ -197,59 +197,22 @@ def run_full_model(
                                       shm_name=f"mbp_share_input_{rank}")
         label = copy_and_share_tensor_ipc(None, is_creator=False, group_size=mbp_size, 
                                           shm_name=f"mbp_share_label_{rank}")
-
+    print_memory_usage(rank, mbp_ctrl, "After sharing inputs")
+    
+    if mbp_rank == 0:
+        share_model_parameters_ipc(model, is_creator=True, group_size=mbp_size, 
+                                   shm_name=f"mbp_share_model_params_{rank}")
+    else:
+        share_model_parameters_ipc(model, is_creator=False, group_size=mbp_size, 
+                                   shm_name=f"mbp_share_model_params_{rank}")
+    print_memory_usage(rank, mbp_ctrl, "After sharing model parameters")
 
     if rank == 0:
         print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
     
-    print_memory_usage(rank, mbp_ctrl, "After synthetic data generation")
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy 
-
-    # if mbp_rank == 0:
-    #     # Create pipeline stage
-    #     stage = MbpStage(
-    #         model,
-    #         mbp_rank,
-    #         pp_rank,
-    #         pp_size,
-    #         device,
-    #         group=pp_mesh.get_group(),
-    #     )
-
-    #     pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches,
-    #                               loss_fn=loss_fn, global_rank=rank)
-        
-    #     print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
-
-    #     if pp_rank == 0:
-    #         pp_schedule.step(x)
-    #     elif pp_rank == pp_size - 1:
-    #         y_dict = pp_schedule.step(target=label)
-    #     else:
-    #         pp_schedule.step()
-            
-    #     del pp_schedule, stage
-    # print_memory_usage(rank, mbp_ctrl, "After gradient discovery run")
     
-    # Now, all ranks in the MBP group participate sharing model parameters and gradients.
-    if mbp_rank == 0:
-        share_model_parameters_ipc(model, is_creator=True, group_size=mbp_size, 
-                                   shm_name=f"mbp_share_model_params_{rank}")
-        share_model_gradients_ipc(model, is_creator=True, group_size=mbp_size, 
-                                  shm_name=f"mbp_share_model_grads_{rank}")
-    else:
-        share_model_parameters_ipc(model, is_creator=False, group_size=mbp_size, 
-                                   shm_name=f"mbp_share_model_params_{rank}")
-        share_model_gradients_ipc(model, is_creator=False, group_size=mbp_size, 
-                                  shm_name=f"mbp_share_model_grads_{rank}")
-    return
-    torch.cuda.empty_cache()
-    print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
-    
-    mbp_ctrl.barrier()
-    dist.barrier()
-
     stage = MbpStage(
                 model,
                 mbp_rank,
@@ -260,6 +223,39 @@ def run_full_model(
             )
     pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches, 
                               loss_fn=loss_fn, global_rank=rank)
+
+    print(g_str(f"Rank {rank}: ") + "Starting initialization run...\n", end="")
+
+    if pp_rank == 0:
+        pp_schedule.step(x, init_stage_only=(mbp_rank != 0))
+    elif pp_rank == pp_size - 1:
+        y_dict = pp_schedule.step(target=label, init_stage_only=(mbp_rank != 0))
+    else:
+        pp_schedule.step(init_stage_only=(mbp_rank != 0))
+        
+    print_memory_usage(rank, mbp_ctrl, "After initialization run")
+    mbp_ctrl.barrier()
+    
+    # Now, all ranks in the MBP group participate sharing model parameters and gradients.
+    # We share model params again as FSDP may change the model parameters.
+    if mbp_rank == 0:
+        share_model_parameters_ipc(model, is_creator=True, group_size=mbp_size, 
+                                   shm_name=f"mbp_share_model_params_{rank}")
+        share_model_gradients_ipc(model, is_creator=True, group_size=mbp_size, 
+                                  shm_name=f"mbp_share_model_grads_{rank}")
+    else:
+        share_model_parameters_ipc(model, is_creator=False, group_size=mbp_size, 
+                                   shm_name=f"mbp_share_model_params_{rank}")
+        share_model_gradients_ipc(model, is_creator=False, group_size=mbp_size, 
+                                  shm_name=f"mbp_share_model_grads_{rank}")
+
+    torch.cuda.empty_cache()
+    print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
+    
+    mbp_ctrl.barrier()
+    dist.barrier()
+
+    
     print_memory_usage(rank, mbp_ctrl, "After stage and schedule creation")
 
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
@@ -274,12 +270,12 @@ def run_full_model(
         if pp_size > 1:
             # Create pipeline stage
             loss = None
-            y_dict = None
+            y = None
             losses = []
             if pp_rank == 0:
                 pp_schedule.step(x, mbp_ctrl=mbp_ctrl)
             elif pp_rank == pp_size - 1:
-                y_dict = pp_schedule.step(target=label, losses=losses,
+                y = pp_schedule.step(target=label, losses=losses,
                                           mbp_ctrl=mbp_ctrl)
                 loss = torch.mean(torch.stack(losses))
             else:
@@ -290,8 +286,9 @@ def run_full_model(
             print_memory_usage(rank, mbp_ctrl, "After F/B pass")
 
             if pp_rank == pp_size - 1:
-                first_key = next(iter(y_dict))
-                print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
+                print(y_str(f"Rank {rank} ") + f"{loss=}, " +
+                      f"logits: {y.shape}, " +
+                      f"label: {label.shape}\n", end="")
 
         # Wait for all MBP members to finish gradient accumulation before running optimizer
         mbp_ctrl.barrier()

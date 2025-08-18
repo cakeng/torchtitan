@@ -94,7 +94,7 @@ class _MbpSchedule(ABC):
             # Clean external container first
             losses.clear()
             # Copy internal losses to external container
-            losses.extend(self._internal_loss)
+            losses.append(self._internal_loss)
 
         self._internal_loss = None
 
@@ -106,6 +106,7 @@ class _MbpSchedule(ABC):
         target: Optional[torch.Tensor] = None,
         losses: Optional[list] = None,
         mbp_ctrl=None,
+        init_stage_only=False,
     ):
         """
         Run one iteration of the pipeline schedule with single microbatch.
@@ -201,7 +202,7 @@ class MbpScheduleSingle(_MbpSchedule):
         # Set the same has_backward flag for stage object
         self._stage.has_backward = self._has_backward
         self._stage_initialized = False
-
+        
     def _initialize_stage(self, args, kwargs):
         # For single microbatch, we only need to prepare for 1 chunk
         self._stage._prepare_forward_infra(args, kwargs)
@@ -211,6 +212,7 @@ class MbpScheduleSingle(_MbpSchedule):
 
     def step(self, *args, target=None, losses: Optional[list] = None,
             mbp_ctrl=None,
+            init_stage_only=False,
             **kwargs):
         """
         Run one iteration with single microbatch input.
@@ -220,7 +222,7 @@ class MbpScheduleSingle(_MbpSchedule):
         self._stage.clear_runtime_states()
         # Run single microbatch
         self._step_microbatches(args, kwargs, target, losses,
-                                mbp_ctrl)
+                                mbp_ctrl, init_stage_only)
 
         # Return outputs directly (no merging needed)
         if self._stage.is_last:
@@ -242,6 +244,7 @@ class ScheduleMbp(MbpScheduleSingle):
         target_mb: Optional[torch.Tensor] = None,
         losses: Optional[list] = None,
         mbp_ctrl=None,
+        init_stage_only=False,
     ):
         """
         Run single microbatch - simplified version of GPipe schedule.
@@ -253,8 +256,12 @@ class ScheduleMbp(MbpScheduleSingle):
             kwargs = {}
         if target_mb is None:
             target_mb = None
-
-        if not self._stage_initialized:
+            
+        if init_stage_only:
+            if not self._stage_initialized:
+                self._initialize_stage(args, kwargs)
+            return
+        elif not self._stage_initialized:
             self._initialize_stage(args, kwargs)
 
         works = {}
@@ -287,11 +294,7 @@ class ScheduleMbp(MbpScheduleSingle):
                 mbp_ctrl.add(1)
 
         # Compute loss if this is the last stage
-        if self._stage.is_last and self._has_backward and target_mb is not None:
-            loss = self._compute_loss(output, target_mb)
-            if losses is not None:
-                losses.clear()
-                losses.append(loss)
+        self._maybe_compute_loss(self._stage, output, target_mb)
 
         # No loss function, no need to run backward
         if not self._has_backward:
@@ -306,7 +309,7 @@ class ScheduleMbp(MbpScheduleSingle):
             logging.info(g_str(f"Rank {self._global_rank}: ")+ r_str(f"Backwarding {self._microbatch_idx}") + f", receiving {ops}")
 
             # For single microbatch, loss is directly available
-            loss = loss if self._stage.is_last else None
+            loss = self._maybe_get_loss(self._stage)
             self._stage.backward_one_chunk(loss=loss)
 
             ops = self._stage.get_bwd_send_ops()
