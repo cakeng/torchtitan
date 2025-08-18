@@ -266,11 +266,11 @@ class ScheduleMbp(MbpScheduleSingle):
 
         works = {}
         # Wait for the current microbatch to be scheduled
-        if mbp_ctrl is not None:
-            mbp_ctrl.wait_for_value(self._microbatch_idx)
-            mbp_ctrl.sem_wait()
-            print(g_str(f"Rank {self._global_rank} ") + 
-                  b_str(f"Executing ") + f"F/B pass on microbatch {self._microbatch_idx}\n", end="")
+        # if mbp_ctrl is not None:
+        #     mbp_ctrl.wait_for_value(self._microbatch_idx)
+        #     mbp_ctrl.sem_wait()
+        #     print(g_str(f"Rank {self._global_rank} ") + 
+        #           b_str(f"Executing ") + f"F/B pass on microbatch {self._microbatch_idx}\n", end="")
 
         # Forward pass
         with record_function(f"Forward {self._microbatch_idx}"):
@@ -290,8 +290,8 @@ class ScheduleMbp(MbpScheduleSingle):
             works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
 
             # Schedule the next microbatch
-            if mbp_ctrl is not None:
-                mbp_ctrl.add(1)
+            # if mbp_ctrl is not None:
+            #     mbp_ctrl.add(1)
 
         # Compute loss if this is the last stage
         self._maybe_compute_loss(self._stage, output, target_mb)
@@ -316,9 +316,9 @@ class ScheduleMbp(MbpScheduleSingle):
             logging.info(g_str(f"Rank {self._global_rank}: ")+ r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="bwd_send"))
 
-        if mbp_ctrl is not None:
-            # Release the semaphore
-            mbp_ctrl.sem_post()
+        # if mbp_ctrl is not None:
+        #     # Release the semaphore
+        #     mbp_ctrl.sem_post()
 
         # Wait immediately for single microbatch
         for work in works.values():

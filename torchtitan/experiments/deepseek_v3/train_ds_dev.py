@@ -78,6 +78,7 @@ def run_full_model(
     mbp_rank: int = 0,
     mbp_size: int = 1,
 ):
+    time_start = datetime.now()
     pp_mesh = mesh["pp"]
     ep_mesh = mesh["ep"]
     fsdp_mesh = mesh["fsdp"]
@@ -253,7 +254,8 @@ def run_full_model(
     print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
 
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
-    
+    time_setup = datetime.now()
+    print(b_str(f"Rank {rank} ") + f"Setup time: {time_setup - time_start}\n", end="")
     mbp_ctrl.barrier()
 
     # Run forward and backward
@@ -294,6 +296,9 @@ def run_full_model(
                       f"/////// Finished iteration {_} ///////\n", end="")
 
     print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
+    time_end = datetime.now()
+    print(b_str(f"Rank {rank} ") + f"Execution time: {time_end - time_setup}\n", end="")
+    
     if mbp_rank == 0:
         destroy_shared_data(mbp_ctrl)
 
