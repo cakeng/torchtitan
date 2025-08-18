@@ -206,31 +206,31 @@ def run_full_model(
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy 
 
-    if mbp_rank == 0:
-        # Create pipeline stage
-        stage = MbpStage(
-            model,
-            mbp_rank,
-            pp_rank,
-            pp_size,
-            device,
-            group=pp_mesh.get_group(),
-        )
+    # if mbp_rank == 0:
+    #     # Create pipeline stage
+    #     stage = MbpStage(
+    #         model,
+    #         mbp_rank,
+    #         pp_rank,
+    #         pp_size,
+    #         device,
+    #         group=pp_mesh.get_group(),
+    #     )
 
-        pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches,
-                                loss_fn=loss_fn, global_rank=rank)
+    #     pp_schedule = ScheduleMbp(stage, mbp_rank, microbatches,
+    #                               loss_fn=loss_fn, global_rank=rank)
         
-        print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
+    #     print(g_str(f"Rank {rank}: ") + "Starting gradient discovery run...\n", end="")
 
-        if pp_rank == 0:
-            pp_schedule.step(x)
-        elif pp_rank == pp_size - 1:
-            y_dict = pp_schedule.step(target=label)
-        else:
-            pp_schedule.step()
+    #     if pp_rank == 0:
+    #         pp_schedule.step(x)
+    #     elif pp_rank == pp_size - 1:
+    #         y_dict = pp_schedule.step(target=label)
+    #     else:
+    #         pp_schedule.step()
             
-        del pp_schedule, stage
-    print_memory_usage(rank, mbp_ctrl, "After gradient discovery run")
+    #     del pp_schedule, stage
+    # print_memory_usage(rank, mbp_ctrl, "After gradient discovery run")
     
     # Now, all ranks in the MBP group participate sharing model parameters and gradients.
     if mbp_rank == 0:
@@ -243,15 +243,16 @@ def run_full_model(
                                    shm_name=f"mbp_share_model_params_{rank}")
         share_model_gradients_ipc(model, is_creator=False, group_size=mbp_size, 
                                   shm_name=f"mbp_share_model_grads_{rank}")
-        
+    return
     torch.cuda.empty_cache()
     print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
     
     mbp_ctrl.barrier()
     dist.barrier()
-    return
+
     stage = MbpStage(
                 model,
+                mbp_rank,
                 pp_rank,
                 pp_size,
                 device,
@@ -272,11 +273,6 @@ def run_full_model(
         # Only the first process in each SMB group captures the weight gradients
         if pp_size > 1:
             # Create pipeline stage
-            
-            mbp_ctrl.wait_for_value(mbp_rank)
-            mbp_ctrl.sem_wait()
-            print(g_str(f"Rank {rank} ") + b_str(f"Executing ") + f"F/B pass on microbatch {mbp_rank}\n", end="")
-
             loss = None
             y_dict = None
             losses = []
@@ -288,17 +284,14 @@ def run_full_model(
                 loss = torch.mean(torch.stack(losses))
             else:
                 pp_schedule.step(mbp_ctrl=mbp_ctrl)
-            
-            print(g_str(f"Rank {rank} ") + "After F/B pass" + print_memory_usage() + "\n", end="")
 
-            # Release the semaphore
-            print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + f"F/B pass on microbatch {mbp_rank}\n", end="")  
+            print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + 
+                  f"F/B pass on microbatch {mbp_rank}\n", end="")  
+            print_memory_usage(rank, mbp_ctrl, "After F/B pass")
 
             if pp_rank == pp_size - 1:
                 first_key = next(iter(y_dict))
                 print(y_str(f"Rank {rank} ") + f"{loss=}, logits: {y_dict[first_key].shape}")
-
-            mbp_ctrl.sem_post()
 
         # Wait for all MBP members to finish gradient accumulation before running optimizer
         mbp_ctrl.barrier()
@@ -307,7 +300,8 @@ def run_full_model(
             # Reset microbatch counter
             mbp_ctrl.set(0)
             if rank == 0:
-                print(g_str(f"Rank {rank} ") + f"/////// Finished iteration {_} ///////\n", end="")
+                print(g_str(f"Rank {rank} ") + 
+                      f"/////// Finished iteration {_} ///////\n", end="")
 
     print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
     if mbp_rank == 0:

@@ -217,16 +217,45 @@ def _get_gradient_weight_info(model: torch.nn.Module):
 
     return grad_weight_info
 
-def _set_param_or_buffer(model, name, tensor):
-    """Helper to set a parameter or buffer in a model by its FQN."""
+def _set_param_or_buffer(model, name, new_tensor):
+    """Recursively finds and replaces a parameter or buffer in a model."""
     module_path, _, attr_name = name.rpartition('.')
-    parent_module = model.get_submodule(module_path)
-    # Check if the original attribute was a parameter
-    is_param = name in dict(model.named_parameters())
-    if is_param:
-        setattr(parent_module, attr_name, nn.Parameter(tensor))
+    target_module = model.get_submodule(module_path)
+    
+    # Store old tensor reference before replacement
+    old_tensor = None
+    
+    if attr_name in target_module._parameters:
+        old_tensor = target_module._parameters[attr_name]
+        # CRITICAL: Use nn.Parameter wrapper for parameters
+        target_module._parameters[attr_name] = \
+            nn.Parameter(new_tensor, requires_grad=old_tensor.requires_grad \
+                             if old_tensor is not None else True)
+        new_tensor.grad = old_tensor.grad
+        del old_tensor.grad
+    elif attr_name in target_module._buffers:
+        old_tensor = target_module._buffers[attr_name]
+        target_module._buffers[attr_name] = new_tensor
     else:
-        setattr(parent_module, attr_name, tensor)
+        raise AttributeError(f"{name} is not a parameter or buffer in the model.")
+
+    # Explicitly delete old tensor reference to help with memory cleanup
+    if old_tensor is not None:
+        del old_tensor
+    torch.cuda.empty_cache()
+        
+def _set_grad_in_param_or_buffer(model, name, new_tensor):
+    """Recursively finds and replaces a parameter or buffer in a model."""
+    module_path, _, attr_name = name.rpartition('.')
+    target_module = model.get_submodule(module_path)
+    
+    if attr_name in target_module._parameters:
+        target_module._parameters[attr_name].grad = new_tensor
+    elif attr_name in target_module._buffers:
+        target_module._buffers[attr_name].grad = new_tensor
+    else:
+        raise AttributeError(f"{name} is not a parameter or buffer in the model.")
+    torch.cuda.empty_cache()
     
 _shm_name_history = set()
 def get_shared_data(shm_name: str, is_creator: bool, group_size: int,
@@ -253,7 +282,7 @@ def destroy_shared_data(shared_data: torch_ipc_extension.SharedData):
         raise Warning(r_str(f"Shared memory name {shared_data.get_name()} does not exist."))
     _shm_name_history.remove(shared_data.get_name())
     shared_data.destroy()
- 
+    
 def share_model_gradients_ipc(
     model: nn.Module,
     is_creator: bool,
@@ -282,35 +311,36 @@ def share_model_gradients_ipc(
             is_dtensor = isinstance(original_grad, DTensor)
             device_mesh = None
             placements = None
-            print(f"Original grad {name} is_dtensor: {is_dtensor}, is_param: {is_param}, "
-                  f"requires_grad: {original_tensor.requires_grad}, "
-                  f"grad is None: {original_grad is None}\n", end="")
-            # if is_dtensor:
-            #     device_mesh = original_grad.device_mesh
-            #     placements = original_grad.placements
-            #     original_grad = original_grad.to_local()
+            # print(f"Original grad {name} is_dtensor: {is_dtensor}, is_param: {is_param}, "
+            #       f"requires_grad: {original_tensor.requires_grad}, "
+            #       f"grad is None: {original_grad is None}\n", end="")
+            if is_dtensor:
+                device_mesh = original_grad.device_mesh
+                placements = original_grad.placements
+                original_grad = original_grad.to_local()
 
-            # _check_tensor_ipc_comptability(original_grad)
+            _check_tensor_ipc_comptability(original_grad)
             
-            # shared_grad, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
-            #     original_grad
-            # )
-            # shared_grad.zero_()
+            shared_grad, handle = torch_ipc_extension.copy_tensor_and_get_ipc(
+                original_grad
+            )
+            shared_grad.zero_()
             
-            # device = original_grad.device
-            # device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
-            # meta = (
-            #     name, handle, original_grad.shape, original_grad.dtype,
-            #     original_grad.stride(), original_grad.storage_offset(),
-            #     device_uuid, is_dtensor, device_mesh, placements
-            # )
-            # handles_and_meta.append(meta)
+            device = original_grad.device
+            device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
+            meta = (
+                name, handle, original_grad.shape, original_grad.dtype,
+                original_grad.stride(), original_grad.storage_offset(),
+                device_uuid, is_dtensor, device_mesh, placements
+            )
+            handles_and_meta.append(meta)
             
-            # if is_dtensor:
-            #     shared_grad = DTensor.from_local(shared_grad,
-            #                                      device_mesh=device_mesh,
-            #                                      placements=placements)
+            if is_dtensor:
+                shared_grad = DTensor.from_local(shared_grad,
+                                                 device_mesh=device_mesh,
+                                                 placements=placements)
             # setattr(original_tensor, "grad", shared_grad)
+            _set_grad_in_param_or_buffer(model, name, shared_grad)
         
         # Serialize and write all metadata at once
         payload = pickle.dumps(handles_and_meta)
@@ -345,7 +375,8 @@ def share_model_gradients_ipc(
             module_path, _, attr_name = name.rpartition('.')
             parent_module = model.get_submodule(module_path)
             original_tensor = getattr(parent_module, attr_name)
-            setattr(original_tensor, "grad", shared_grad)
+            # setattr(original_tensor, "grad", shared_grad)
+            _set_grad_in_param_or_buffer(model, name, shared_grad)
             
     # Barrier 2: Wait for all ranks to finish setting parameters
     gc.collect()
@@ -376,14 +407,19 @@ def share_model_parameters_ipc(
             module_path, _, attr_name = name.rpartition('.')
             parent_module = model.get_submodule(module_path)
             original_tensor = getattr(parent_module, attr_name)
+            if is_param:
+                original_tensor = original_tensor.data
+            requires_grad = original_tensor.requires_grad
             is_dtensor = isinstance(original_tensor, DTensor)
             device_mesh = None
             placements = None
-            # print(f"Original tensor {name} is_dtensor: {is_dtensor}\n", end="")
             if is_dtensor:
                 device_mesh = original_tensor.device_mesh
                 placements = original_tensor.placements
                 original_tensor = original_tensor.to_local()
+                print(f"Original tensor {name} is_dtensor: {is_dtensor}, "
+                      f"is_param: {is_param}, device_mesh: {device_mesh}, "
+                      f"placements: {placements}\n", end="")
 
             _check_tensor_ipc_comptability(original_tensor)
             
@@ -396,7 +432,8 @@ def share_model_parameters_ipc(
             meta = (
                 name, handle, original_tensor.shape, original_tensor.dtype,
                 original_tensor.stride(), original_tensor.storage_offset(),
-                device_uuid, is_dtensor, device_mesh, placements
+                device_uuid, is_param, requires_grad, is_dtensor, 
+                device_mesh, placements
             )
             handles_and_meta.append(meta)
             
@@ -404,12 +441,8 @@ def share_model_parameters_ipc(
                 shared_tensor = DTensor.from_local(shared_tensor,
                                                    device_mesh=device_mesh,
                                                    placements=placements)
-                
-            if is_param:
-                setattr(parent_module, attr_name, nn.Parameter(shared_tensor))
-            else:
-                setattr(parent_module, attr_name, shared_tensor)
-        
+            _set_param_or_buffer(model, name, shared_tensor)
+
         # Serialize and write all metadata at once
         payload = pickle.dumps(handles_and_meta)
         shm.write_data(payload)
@@ -425,7 +458,7 @@ def share_model_parameters_ipc(
         device = torch.device("cuda", torch.cuda.current_device())
         device_uuid = str(torch.cuda.get_device_properties(device.index).uuid)
         for name, handle, shape, dtype, stride, offset, source_uuid, \
-            is_dtensor, device_mesh, placements \
+            is_param, requires_grad, is_dtensor, device_mesh, placements \
                 in handles_and_meta:
             assert device_uuid == source_uuid, \
                 r_str("Rank ") + f"{dist.get_rank()} " + \
@@ -540,30 +573,6 @@ def copy_and_share_tensor_ipc(
     if is_creator:
         destroy_shared_data(shm)
     return shared_tensor
-
-def _set_param_or_buffer(model, name, new_tensor):
-    """Recursively finds and replaces a parameter or buffer in a model."""
-    module_path, _, attr_name = name.rpartition('.')
-    target_module = model.get_submodule(module_path)
-    
-    # Store old tensor reference before replacement
-    old_tensor = None
-    
-    if attr_name in target_module._parameters:
-        old_tensor = target_module._parameters[attr_name]
-        # CRITICAL: Use nn.Parameter wrapper for parameters
-        target_module._parameters[attr_name] = \
-            nn.Parameter(new_tensor, requires_grad=old_tensor.requires_grad \
-                             if old_tensor is not None else True)
-    elif attr_name in target_module._buffers:
-        old_tensor = target_module._buffers[attr_name]
-        target_module._buffers[attr_name] = new_tensor
-    else:
-        raise AttributeError(f"{name} is not a parameter or buffer in the model.")
-    
-    # Explicitly delete old tensor reference to help with memory cleanup
-    if old_tensor is not None:
-        del old_tensor
 
 def _get_driver_memory_usage(device_index: int):
     """
@@ -1333,18 +1342,18 @@ def _test_single_tensor_sharing(rank, world_size, device, shape, dtype,
             shm.barrier()
             init_val = shared_tensor_created.flatten()[0].item()
             print(b_str(f"[Rank {rank}] Entering")+ " critical section without mutex, " +
-                        f"Shared tensor value: {init_val} ")
+                        f"Shared tensor value: {init_val} \n", end="")
             for i in range(num_adds):
                 shared_tensor_created.flatten()[0] += (rank + 1)
             final_val = shared_tensor_created.flatten()[0].item()
             expected_val = init_val + (num_adds * (rank + 1))
             print(y_str(f"[Rank {rank}] Exiting") + " critical section without mutex, " +
-                        f"Shared tensor value: {final_val}, expected: {expected_val} ")
+                        f"Shared tensor value: {final_val}, expected: {expected_val} \n", end="")
             shm.barrier()
 
             if rank == 0:
                 print(y_str(f"[Rank {rank}] Concurrent tensor modification without mutex result: ") + 
-                      f"{shared_tensor_created.flatten()[0]}")
+                      f"{shared_tensor_created.flatten()[0]}\n", end="")
             shm.barrier()
                 
             shared_tensor_created.flatten()[0] = 0
@@ -1352,13 +1361,13 @@ def _test_single_tensor_sharing(rank, world_size, device, shape, dtype,
             torch_ipc_extension.acquire(shared_tensor_created)
             init_val = shared_tensor_created.flatten()[0].item()
             print(b_str(f"[Rank {rank}] Entering") + " critical section with mutex, " +
-                        f"Shared tensor value: {init_val} ")      
+                        f"Shared tensor value: {init_val} \n", end="")      
             for i in range(num_adds):
                 shared_tensor_created.flatten()[0] += (rank + 1)
             final_val = shared_tensor_created.flatten()[0].item()
             expected_val = init_val + (num_adds * (rank + 1))
             print(y_str(f"[Rank {rank}] Exiting") + " critical section with mutex, " +
-                        f"Shared tensor value: {final_val}, expected: {expected_val} ")
+                        f"Shared tensor value: {final_val}, expected: {expected_val} \n", end="")
             torch_ipc_extension.release(shared_tensor_created)
             shm.barrier()
 
@@ -1368,7 +1377,7 @@ def _test_single_tensor_sharing(rank, world_size, device, shape, dtype,
                 result = shared_tensor_created.flatten()[0].item()
                 
                 print(y_str(f"[Rank {rank}] Concurrent tensor modification with mutex result: ") + 
-                      f"{result}, " + y_str("expected: ") + f"{expected_result}")
+                      f"{result}, " + y_str("expected: ") + f"{expected_result}\n", end="")
                 
                 if isinstance(result, float) or isinstance(expected_result, float):
                     assert math.isclose(result, expected_result, rel_tol=1e-5), \
@@ -1533,13 +1542,19 @@ def main():
         weight_before = simple_model.layer1.weight.data.clone()
         optimizer.zero_grad(); loss.backward(); optimizer.step()
         weight_after = simple_model.layer1.weight.data
-        assert not torch.equal(weight_before, weight_after)
+        assert not torch.equal(weight_before, weight_after), (
+            r_str(f"[Rank {rank}] Weight mismatch after sharing! \n") +
+            f"Expected:\n{weight_before}\nGot:\n{weight_after}"
+        )
         print(y_str("[Rank 0] SimpleModel weights updated on source rank."))
         dist.broadcast(weight_after, src=0)
     else:
         expected_weight = torch.empty_like(simple_model.layer1.weight.data)
         dist.broadcast(expected_weight, src=0)
-        assert torch.equal(simple_model.layer1.weight.data, expected_weight)
+        assert torch.equal(simple_model.layer1.weight.data, expected_weight), (
+            r_str(f"[Rank {rank}] Weight mismatch after sharing! \n") +
+            f"Expected:\n{expected_weight}\nGot:\n{simple_model.layer1.weight.data}"
+        )
         print(g_str(f"[Rank {rank}] ✓ Verified SimpleModel weight update is visible."))
         
     dist.barrier()
@@ -1561,12 +1576,12 @@ def main():
     model_dtype = torch.float16
 
     if rank == 0:
-        print(f"[Rank 0] Loading {model_id}...")
+        print(f"[Rank 0] Loading {model_id}...\n", end="")
         model = AutoModelForCausalLM.from_pretrained(
             model_id, torch_dtype=model_dtype, trust_remote_code=True
         ).to(device)
     else:
-        print(f"[Rank {rank}] Initializing empty meta model...")
+        print(f"[Rank {rank}] Initializing empty meta model...\n", end="")
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         with init_empty_weights():
             model = AutoModelForCausalLM.from_config(
@@ -1594,15 +1609,13 @@ def main():
           f"mem_after_total: {mem_after_total/1024**2:.2f} MB\n", end="")
 
     assert mem_after_used < mem_before_used + 100*1024**2, (
-        r_str(f"Rank {rank} Memory leak detected after sharing model parameters!") + \
+        r_str(f"[Rank {rank}] Memory leak detected after sharing model parameters!") + \
         f"mem_before_used: {mem_before_used/1024**2:.2f} MB, " + \
         f"mem_after_used: {mem_after_used/1024**2:.2f} MB, " + \
         f"mem_after_total: {mem_after_total/1024**2:.2f} MB"
     )
 
     dist.barrier()
-    
-    simple_model.train()
     
     # --- STAGE 1: Direct Parameter Verification ---
     target_param_name = "model.layers.1.mlp.experts.0.up_proj.weight"
@@ -1615,10 +1628,10 @@ def main():
         expected_param = torch.empty_like(target_param_on_worker)
         dist.broadcast(expected_param, src=0)
         assert torch.equal(target_param_on_worker, expected_param), (
-            r_str(f"Parameter mismatch after sharing! \n") +
+            r_str(f"[Rank {rank}] Parameter mismatch after sharing! \n") +
             f"Expected:\n{expected_param}\nGot:\n{target_param_on_worker}"
         )
-        print(g_str(f"[Rank {rank}] ✓ Verified parameter '{target_param_name}' matches rank 0."))
+        print(g_str(f"[Rank {rank}] ✓ Verified parameter '{target_param_name}' matches rank 0.\n"), end="")
     
     dist.barrier()
     if rank == 0:
@@ -1637,14 +1650,14 @@ def main():
         with torch.no_grad():
             output_before = model(**inputs)
             logits_before = output_before.logits
-            print(y_str(f"\n[Rank 0] Logits sum BEFORE update: {logits_before.sum()}"))
+            print(y_str(f"\n[Rank 0] Logits sum BEFORE update: {logits_before.sum()}\n"), end="")
         dist.broadcast(logits_before, src=0)
     else:
         torch.manual_seed(42)
         with torch.no_grad():
             output_before = model(**inputs)
             logits_before = output_before.logits
-            print(f"\n[Rank {rank}] Logits sum BEFORE update: {logits_before.sum()}")
+            print(f"\n[Rank {rank}] Logits sum BEFORE update: {logits_before.sum()}\n", end="")
 
         expected_logits_before = torch.empty_like(logits_before)
         dist.broadcast(expected_logits_before, src=0)
@@ -1652,26 +1665,25 @@ def main():
         local_bytes = logits_before.view(torch.int8)
         expected_bytes = expected_logits_before.view(torch.int8)
         assert torch.equal(local_bytes, expected_bytes), \
-            r_str("Initial logits do not match between ranks at the byte level!")
-        print(g_str(f"[Rank {rank}] ✓ Verified initial logits match rank 0."))
+            r_str(f"[Rank {rank}] Initial logits do not match between ranks at the byte level!")
+        print(g_str(f"[Rank {rank}] ✓ Verified initial logits match rank 0.\n"), end="")
 
     dist.barrier()
 
     # --- STAGE 3: Verification after weight update ---
     if rank == 0:
-        print(f"\n[Rank 0] Updating weights...")
+        print(f"\n[Rank 0] Updating weights...\n", end="")
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         output = model(**inputs, labels=inputs["input_ids"])
         loss = output.loss
         optimizer.zero_grad(); loss.backward(); optimizer.step()
-        print("[Rank 0] Weights updated successfully.")
+        print("[Rank 0] Weights updated successfully.\n", end="")
         dist.barrier()
         
         torch.manual_seed(42)
         with torch.no_grad():
             output_after = model(**inputs)
             logits_after = output_after.logits
-            print(y_str(f"[Rank 0] Logits sum AFTER update:  {logits_after.sum()}"))
         assert not torch.allclose(logits_before, logits_after)
         dist.broadcast(logits_after, src=0)
     else:
@@ -1680,7 +1692,6 @@ def main():
         with torch.no_grad():
             output_after = model(**inputs)
             logits_after = output_after.logits
-            print(f"\n[Rank {rank}] Logits sum AFTER update:  {logits_after.sum()}")
 
         expected_logits_after = torch.empty_like(logits_after)
         dist.broadcast(expected_logits_after, src=0)
@@ -1688,8 +1699,107 @@ def main():
         local_bytes_after = logits_after.view(torch.int8)
         expected_bytes_after = expected_logits_after.view(torch.int8)
         assert torch.equal(local_bytes_after, expected_bytes_after), \
-            r_str("Final logits do not match between ranks at the byte level!")
-        print(g_str(f"[Rank {rank}] ✓ Verified final logits match rank 0."))
+            r_str(f"[Rank {rank}] Final logits do not match between ranks at the byte level!")
+        print(g_str(f"[Rank {rank}] ✓ Verified final logits match rank 0.\n"), end="")
+
+    dist.barrier()
+
+    # --- STAGE 4: Shared gradient verification ---
+    mem_before_grad, mem_before_grad_total = \
+        _get_driver_memory_usage(torch.cuda.current_device())
+    print(g_str(f"Rank {rank} ") + "mem_before_grad: " + f"{mem_before_grad/1024**2:.2f} MB, "
+          f"mem_before_grad_total: {mem_before_grad_total/1024**2:.2f} MB\n", end="")
+    
+    if rank == 0:
+        print(f"\n[Rank 0] Sharing gradient...\n", end="")
+        share_model_gradients_ipc(model, is_creator=(rank == 0),
+                                  group_size=world_size,
+                                  shm_name=f"deepseek_v2_lite_grad_test")
+        dist.barrier()
+        mem_after_grad, mem_after_grad_total = \
+            _get_driver_memory_usage(torch.cuda.current_device())
+        print(g_str(f"Rank {rank} ") + "mem_after_grad: " + f"{mem_after_grad/1024**2:.2f} MB, "
+              f"mem_after_grad_total: {mem_after_grad_total/1024**2:.2f} MB\n", end="")
+        assert mem_after_grad < mem_before_grad + 100*1024**2, (
+            r_str(f"[Rank {rank}] Memory leak detected after sharing gradient!") + \
+            f"mem_before_grad: {mem_before_grad/1024**2:.2f} MB, " + \
+            f"mem_after_grad: {mem_after_grad/1024**2:.2f} MB, " + \
+            f"mem_after_grad_total: {mem_after_grad_total/1024**2:.2f} MB"
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        dist.barrier() #1
+        # Wait rank 1 to update the gradient
+        dist.barrier() #2
+        print(f"[Rank {rank}] Verifying shared gradient...\n", end="")
+        target_grad = model.get_parameter(target_param_name).grad
+        expected_grad = torch.empty_like(target_grad)
+        dist.broadcast(expected_grad, src=1)
+        assert torch.equal(target_grad, expected_grad), (
+            r_str(f"[Rank {rank}] Gradient mismatch after sharing! \n") +
+            f"Expected:\n{expected_param}\nGot:\n{target_param}"
+        )
+        print(g_str(f"[Rank {rank}] ✓ Verified shared gradient matches rank 1.\n"), end="")
+        # Run the optimizer step to update the weights
+        optimizer.step()
+        dist.barrier() #3
+        print(f"[Rank {rank}] Broadcasting updated parameter '{target_param_name}'...\n", end="")
+        target_param = model.get_parameter(target_param_name).data
+        dist.broadcast(target_param, src=0)
+    elif rank == 1:
+        share_model_gradients_ipc(model, is_creator=(rank == 0),
+                                  group_size=world_size,
+                                  shm_name=f"deepseek_v2_lite_grad_test")
+        dist.barrier()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        dist.barrier() #1
+        # Update the gradient
+        output = model(**inputs, labels=inputs["input_ids"])
+        loss = output.loss
+        # loss.backward() will accumulate new gradients to the shared gradients
+        loss.backward()
+        dist.barrier() #2
+        target_grad = model.get_parameter(target_param_name).grad
+        print(f"[Rank {rank}] Broadcasting shared gradient...\n", end="")
+        dist.broadcast(target_grad, src=1)
+        # Wait rank 0 to run the optimizer step and update the parameter
+        dist.barrier() #3
+        print(f"[Rank {rank}] Verifying updated parameter '{target_param_name}'...\n", end="")
+        target_param = model.get_parameter(target_param_name).data
+        expected_param = torch.empty_like(target_param)
+        dist.broadcast(expected_param, src=0)
+        assert torch.equal(target_param, expected_param), (
+            r_str(f"[Rank {rank}] Parameter mismatch after sharing! \n") +
+            f"Expected:\n{expected_param}\nGot:\n{target_param}"
+        )
+        print(g_str(f"[Rank {rank}] ✓ Verified updated parameter '{target_param_name}' matches rank 0.\n"), end="")
+    else:
+        share_model_gradients_ipc(model, is_creator=(rank == 0),
+                                  group_size=world_size,
+                                  shm_name=f"deepseek_v2_lite_grad_test")
+        dist.barrier()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        dist.barrier() #1
+        # Wait rank 1 to update the gradient
+        dist.barrier() #2
+        print(f"[Rank {rank}] Verifying shared gradient...\n", end="")
+        target_grad = model.get_parameter(target_param_name).grad
+        expected_grad = torch.empty_like(target_grad)
+        dist.broadcast(expected_grad, src=1)
+        assert torch.equal(target_grad, expected_grad), (
+            r_str(f"[Rank {rank}] Gradient mismatch after sharing! \n") +
+            f"Expected:\n{expected_param}\nGot:\n{target_param}"
+        )
+        print(g_str(f"[Rank {rank}] ✓ Verified shared gradient matches rank 1.\n"), end="")
+        dist.barrier() #3
+        print(f"[Rank {rank}] Verifying updated parameter '{target_param_name}'...\n", end="")
+        target_param = model.get_parameter(target_param_name).data
+        expected_param = torch.empty_like(target_param)
+        dist.broadcast(expected_param, src=0)
+        assert torch.equal(target_param, expected_param), (
+            r_str(f"[Rank {rank}] Parameter mismatch after sharing! \n") +
+            f"Expected:\n{expected_param}\nGot:\n{target_param}"
+        )
+        print(g_str(f"[Rank {rank}] ✓ Verified updated parameter '{target_param_name}' matches rank 0.\n"), end="")
 
     dist.barrier()
     if rank == 0:

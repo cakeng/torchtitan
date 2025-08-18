@@ -91,11 +91,6 @@ class _MbpSchedule(ABC):
 
         # Return losses if there is a container passed in
         if contains_last_stage and losses is not None:
-            if len(self._internal_loss) != 1:
-                raise RuntimeError(
-                    f"Expecting 1 loss but got {len(self._internal_loss)}"
-                )
-
             # Clean external container first
             losses.clear()
             # Copy internal losses to external container
@@ -263,6 +258,12 @@ class ScheduleMbp(MbpScheduleSingle):
             self._initialize_stage(args, kwargs)
 
         works = {}
+        # Wait for the current microbatch to be scheduled
+        if mbp_ctrl is not None:
+            mbp_ctrl.wait_for_value(self._microbatch_idx)
+            mbp_ctrl.sem_wait()
+            print(g_str(f"Rank {self._global_rank} ") + 
+                  b_str(f"Executing ") + f"F/B pass on microbatch {self._microbatch_idx}\n", end="")
 
         # Forward pass
         with record_function(f"Forward {self._microbatch_idx}"):
@@ -281,6 +282,7 @@ class ScheduleMbp(MbpScheduleSingle):
                          + b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
 
+            # Schedule the next microbatch
             if mbp_ctrl is not None:
                 mbp_ctrl.add(1)
 
@@ -311,6 +313,10 @@ class ScheduleMbp(MbpScheduleSingle):
             logging.info(g_str(f"Rank {self._global_rank}: ")+ r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="bwd_send"))
 
+        if mbp_ctrl is not None:
+            # Release the semaphore
+            mbp_ctrl.sem_post()
+
         # Wait immediately for single microbatch
         for work in works.values():
             work.wait()
@@ -320,11 +326,6 @@ class ScheduleMbp(MbpScheduleSingle):
             # Add shared gradients back to model here
             # self._stage.scale_grads(1)
             self._stage.run_fsdp_post_backward()
-        else:
-            print(g_str(f"Rank {self._global_rank}: ") + b_str(f"Doing gradient reduction for non-last microbatch"))
-            # Do gradient reduction for non-last microbatch
-            pass
-        
 
         # Return losses if there is a container passed in
         self._update_losses(self._stage, losses)
