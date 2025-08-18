@@ -47,7 +47,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 16
+    model_args.num_hidden_layers = 6
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     # set device before init_device mesh, otherwise ep will have duplicate device mapping
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    mesh = dist.init_device_mesh("cuda", (2, 2, 1), mesh_dim_names=("pp", "ep", "fsdp"))
+    mesh = dist.init_device_mesh("cuda", (2, 2, 2), mesh_dim_names=("pp", "ep", "fsdp"))
 
     start_time = datetime.now()
 
