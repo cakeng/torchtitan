@@ -5,10 +5,10 @@ import sys
 from datetime import datetime
 import random
 
-mbp_size = 2
+mbp_size = 4
 pp_size = 2
 ep_size = 2
-fsdp_size = 1
+fsdp_size = 2
 
 num_gpus = pp_size * ep_size * fsdp_size
 
@@ -54,7 +54,7 @@ for i in range(mbp_size):
     )
     
     # Start output streaming threads only for first 2 instances
-    if i < 15:
+    if i < 12:
         stdout_thread = threading.Thread(target=stream_output, args=(process, i, "stdout"))
         stderr_thread = threading.Thread(target=stream_output, args=(process, i, "stderr"))
         

@@ -96,7 +96,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 2
+    model_args.num_hidden_layers = 6
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -111,7 +111,7 @@ def run_full_model(
         )
     
     # Setup MBP groups
-    max_concurrent_process_groups = 1
+    max_concurrent_process_groups = 6
     mbp_ctrl_name = f"mbp_ctrl_gpu_{rank}"
     if mbp_rank == 0:
         mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
@@ -251,17 +251,10 @@ def run_full_model(
 
     torch.cuda.empty_cache()
     print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
-    
-    mbp_ctrl.barrier()
-    dist.barrier()
-
-    
-    print_memory_usage(rank, mbp_ctrl, "After stage and schedule creation")
 
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     
     mbp_ctrl.barrier()
-    dist.barrier()
 
     # Run forward and backward
     steps = 2
