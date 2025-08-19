@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 import random
 
-mbp_size = 8
+mbp_size = 4
 pp_size = 2
 ep_size = 2
 fsdp_size = 1

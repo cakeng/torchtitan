@@ -11,6 +11,7 @@
 # and is intended to be used for debugging and development
 
 import os
+from pdb import run
 import sys
 from re import T
 
@@ -112,7 +113,7 @@ def run_full_model(
         )
     
     # Setup MBP groups
-    max_concurrent_process_groups = 8
+    max_concurrent_process_groups = 4
     mbp_ctrl_name = f"mbp_ctrl_gpu_{rank}"
     if mbp_rank == 0:
         mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
@@ -317,9 +318,36 @@ if __name__ == "__main__":
     mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size), 
                                  mesh_dim_names=("pp", "ep", "fsdp"))
     
-    time_start = datetime.now()
-    run_full_model(mesh, mbp_rank, mbp_size)
-    time_end = datetime.now()
-    print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
-
+    # Setup profiler
+    run_id = os.getenv("RUN_ID", "0")
+    log_dir = f"./tensorboard_traces/run_{run_id}"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Profile the execution
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=0,
+            warmup=0,
+            active=1,
+            repeat=1
+        ),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True
+    ) as prof:
+        time_start = datetime.now()
+        run_full_model(mesh, mbp_rank, mbp_size)
+        prof.step()
+        time_end = datetime.now()
+        print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
+        
+        # Export the trace
+        trace_path = f"{log_dir}/trace_{mbp_rank}_{dist.get_rank()}.json"
+        print(f"Rank {dist.get_rank()} Exporting trace to {trace_path}")
+        prof.export_chrome_trace(trace_path)
+    
     dist.destroy_process_group()
