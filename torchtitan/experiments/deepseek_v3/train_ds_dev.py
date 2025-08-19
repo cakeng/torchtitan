@@ -47,7 +47,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 6
+    model_args.num_hidden_layers = 16
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -75,20 +75,20 @@ def run_full_model(
     # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
     # Reason: the MoE is "sparsely activated" compared to the dense model, thus
     # it will be ineconomical re-gather the weights.
-    for layer in model.model.layers.values():
-        # Apply FSDP to experts
-        if hasattr(layer.mlp, "experts"):
-            for expert in layer.mlp.experts.values():
-                fully_shard(expert, mesh=fsdp_mesh, reshard_after_forward=False)
-        # Apply HSDP to other parts such as attention, layernorm, because they
-        # are doing DDP on EP dimension
-        fully_shard(layer, mesh=hsdp_mesh, reshard_after_forward=False)
+    # for layer in model.model.layers.values():
+    #     # Apply FSDP to experts
+    #     if hasattr(layer.mlp, "experts"):
+    #         for expert in layer.mlp.experts.values():
+    #             fully_shard(expert, mesh=fsdp_mesh, reshard_after_forward=False)
+    #     # Apply HSDP to other parts such as attention, layernorm, because they
+    #     # are doing DDP on EP dimension
+    #     fully_shard(layer, mesh=hsdp_mesh, reshard_after_forward=False)
 
-    # Apply HSDP on root model (lm_head, embeddings, etc)
-    fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
+    # # Apply HSDP on root model (lm_head, embeddings, etc)
+    # fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
 
     # Synthetic setting
-    microbatches = 4
+    microbatches = 8
 
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     # set device before init_device mesh, otherwise ep will have duplicate device mapping
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    mesh = dist.init_device_mesh("cuda", (2, 2, 2), mesh_dim_names=("pp", "ep", "fsdp"))
+    mesh = dist.init_device_mesh("cuda", (2, 2, 1), mesh_dim_names=("pp", "ep", "fsdp"))
 
     start_time = datetime.now()
 
