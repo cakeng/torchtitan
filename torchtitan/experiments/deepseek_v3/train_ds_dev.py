@@ -97,7 +97,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 6
+    model_args.num_hidden_layers = 16
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -112,7 +112,7 @@ def run_full_model(
         )
     
     # Setup MBP groups
-    max_concurrent_process_groups = 6
+    max_concurrent_process_groups = 8
     mbp_ctrl_name = f"mbp_ctrl_gpu_{rank}"
     if mbp_rank == 0:
         mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
@@ -156,24 +156,24 @@ def run_full_model(
     # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
     # Reason: the MoE is "sparsely activated" compared to the dense model, thus
     # it will be ineconomical re-gather the weights.
-    for layer in model.model.layers.values():
-        # Apply FSDP to experts
-        if hasattr(layer.mlp, "experts"):
-            for expert in layer.mlp.experts.values():
-                fully_shard(expert, 
-                    mesh=fsdp_mesh, 
-                    reshard_after_forward=False)
-        # Apply HSDP to other parts such as attention, layernorm, because they
-        # are doing DDP on EP dimension
-        fully_shard(layer, 
-                    mesh=hsdp_mesh, 
-                    reshard_after_forward=False)
+    # for layer in model.model.layers.values():
+    #     # Apply FSDP to experts
+    #     if hasattr(layer.mlp, "experts"):
+    #         for expert in layer.mlp.experts.values():
+    #             fully_shard(expert, 
+    #                 mesh=fsdp_mesh, 
+    #                 reshard_after_forward=False)
+    #     # Apply HSDP to other parts such as attention, layernorm, because they
+    #     # are doing DDP on EP dimension
+    #     fully_shard(layer, 
+    #                 mesh=hsdp_mesh, 
+    #                 reshard_after_forward=False)
 
-    # Apply HSDP on root model (lm_head, embeddings, etc)
-    fully_shard(model, 
-                mesh=hsdp_mesh, 
-                reshard_after_forward=False)
-    print_memory_usage(rank, mbp_ctrl, "After applying FSDP")
+    # # Apply HSDP on root model (lm_head, embeddings, etc)
+    # fully_shard(model, 
+    #             mesh=hsdp_mesh, 
+    #             reshard_after_forward=False)
+    # print_memory_usage(rank, mbp_ctrl, "After applying FSDP")
     
     # Use Symmetric Memory for MoE token shuffle.
     # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
@@ -187,8 +187,8 @@ def run_full_model(
     bs = 4
     seqlen = 128
     if mbp_rank == 0:
-        x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
-        label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
+        x = torch.randint(model_args.vocab_size, (microbatches, bs, seqlen), device=device)
+        label = torch.rand(microbatches, bs, seqlen, model_args.vocab_size, device=device)
         x = copy_and_share_tensor_ipc(x, is_creator=True, group_size=mbp_size, 
                                       shm_name=f"mbp_share_input_{rank}")
         label = copy_and_share_tensor_ipc(label, is_creator=True, group_size=mbp_size, 
@@ -209,7 +209,9 @@ def run_full_model(
     print_memory_usage(rank, mbp_ctrl, "After sharing model parameters")
 
     if rank == 0:
-        print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, {max_concurrent_process_groups=}, {bs=}, {seqlen=}\n", end="")
+        print(g_str(f"Rank {rank} ") + f"Runtime settings: {microbatches=}, " +
+              f"{max_concurrent_process_groups=}, {bs=}, {seqlen=}, "
+              f"{model_args.num_hidden_layers=}\n", end="")
     
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy 
@@ -228,9 +230,9 @@ def run_full_model(
     print(g_str(f"Rank {rank}: ") + "Starting initialization run...\n", end="")
 
     if pp_rank == 0:
-        pp_schedule.step(x, init_stage_only=(mbp_rank != 0))
+        pp_schedule.step(x[mbp_rank], init_stage_only=(mbp_rank != 0))
     elif pp_rank == pp_size - 1:
-        y_dict = pp_schedule.step(target=label, init_stage_only=(mbp_rank != 0))
+        y_dict = pp_schedule.step(target=label[mbp_rank], init_stage_only=(mbp_rank != 0))
     else:
         pp_schedule.step(init_stage_only=(mbp_rank != 0))
         
@@ -268,9 +270,9 @@ def run_full_model(
             y = None
             losses = []
             if pp_rank == 0:
-                pp_schedule.step(x, mbp_ctrl=mbp_ctrl)
+                pp_schedule.step(x[mbp_rank], mbp_ctrl=mbp_ctrl)
             elif pp_rank == pp_size - 1:
-                y = pp_schedule.step(target=label, losses=losses,
+                y = pp_schedule.step(target=label[mbp_rank], losses=losses,
                                           mbp_ctrl=mbp_ctrl)
                 loss = torch.mean(torch.stack(losses))
             else:
