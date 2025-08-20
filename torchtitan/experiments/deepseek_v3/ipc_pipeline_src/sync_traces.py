@@ -204,7 +204,7 @@ def synchronize_traces_at_barriers(traces: Dict, barrier_groups: List) -> Dict:
     return synchronized_traces
 
 def merge_synchronized_traces(synchronized_traces: Dict, output_file: str):
-    """Merge synchronized traces with aggressive process separation."""
+    """Merge synchronized traces with Perfetto-compatible process separation."""
     merged_trace = {
         'traceEvents': [],
         'metadata': {
@@ -216,14 +216,12 @@ def merge_synchronized_traces(synchronized_traces: Dict, output_file: str):
     
     def get_ranks(rank_str):
         try:
-            # rank_str is now like "1_0", "2_0", etc.
             if '_' in rank_str:
                 parts = rank_str.split('_')
-                mbp_rank = int(parts[0])  # First part is MBP rank
-                dist_rank = int(parts[1])  # Second part is dist rank
+                mbp_rank = int(parts[0])
+                dist_rank = int(parts[1])
                 return mbp_rank, dist_rank
             else:
-                # Fallback for simple rank numbers
                 mbp_rank = int(rank_str)
                 dist_rank = 0
                 return mbp_rank, dist_rank
@@ -238,42 +236,60 @@ def merge_synchronized_traces(synchronized_traces: Dict, output_file: str):
     sorted_ranks = sorted(synchronized_traces.keys(), key=sort_key)
     print(f"Sorted ranks by (MBP, dist) order: {sorted_ranks}")
     
-    # Assign process IDs with large gaps for clear separation
+    # Assign process IDs with smaller, Perfetto-compatible ranges
     for rank in sorted_ranks:
         trace_data = synchronized_traces[rank]
         mbp_rank, dist_rank = get_ranks(rank)
-        cpu_pid = 1000 + mbp_rank * 100 + dist_rank
-        gpu_pid = 10000 + mbp_rank * 100 + dist_rank
+        
+        # Use smaller PID ranges: CPU starts at 1, GPU starts at 100
+        cpu_pid = 100 + mbp_rank * 10 + dist_rank
+        gpu_pid = 500 + mbp_rank * 10 + dist_rank
+        
         print(f"  MBP{mbp_rank}-D{dist_rank}: CPU PID {cpu_pid}, GPU PID {gpu_pid}")
         
         if 'traceEvents' not in trace_data:
             continue
         
         for event in trace_data['traceEvents']:
-            new_event = event.copy()
-            
-            # Separate CPU and GPU events completely
+            # Modify the original event directly (like the older version)
             if event.get('cat') == 'gpu_user_annotation' or event.get('cat') == 'gpu_op':
-                # GPU events: completely separate process space
-                new_event['pid'] = gpu_pid
-                new_event['name'] = f"[MBP{mbp_rank}-D{dist_rank}-GPU] {event.get('name', 'Event')}"
+                event['pid'] = gpu_pid
+                event['name'] = f"[{mbp_rank}-{dist_rank}-GPU] {event.get('name', 'Event')}"
             else:
-                # CPU events: main process space
-                new_event['pid'] = cpu_pid
-                new_event['name'] = f"[MBP{mbp_rank}-D{dist_rank}-CPU] {event.get('name', 'Event')}"
+                event['pid'] = cpu_pid
+                event['name'] = f"[{mbp_rank}-{dist_rank}-CPU] {event.get('name', 'Event')}"
             
-            # Add metadata
-            if 'args' not in new_event:
-                new_event['args'] = {}
-            new_event['args']['MBP_Rank'] = mbp_rank
-            new_event['args']['Distributed_Rank'] = dist_rank
-            new_event['args']['Process_Type'] = 'GPU' if 'gpu' in event.get('cat', '').lower() else 'CPU'
-            
-            merged_trace['traceEvents'].append(new_event)
+
+            merged_trace['traceEvents'].append(event)
     
     with open(output_file, 'w') as f:
         json.dump(merged_trace, f, indent=2)
-        
+    
+def merge_synchronized_traces_old(synchronized_traces: Dict, output_file: str):
+    """Merge synchronized traces into a single file."""
+    merged_trace = {
+        'traceEvents': [],
+        'metadata': {
+            'merged_from': list(synchronized_traces.keys()),
+            'synchronization': 'barrier-based',
+            'timestamp': time.time()
+        }
+    }
+    
+    # Add rank information to event names for clarity
+    for rank, trace_data in synchronized_traces.items():
+        for event in trace_data['traceEvents']:
+            # Add rank prefix to event names for identification
+            if 'name' in event:
+                event['name'] = f"[Rank {rank}] {event['name']}"
+            else:
+                event['name'] = f"[Rank {rank}] Event"
+            
+            merged_trace['traceEvents'].append(event)
+    
+    # Save merged trace
+    with open(output_file, 'w') as f:
+        json.dump(merged_trace, f, indent=2)
 
 def merge_simple(traces: Dict, output_file: str):
     """Simple merge without synchronization (fallback)."""
