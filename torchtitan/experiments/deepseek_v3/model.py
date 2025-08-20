@@ -738,9 +738,20 @@ class MoE(nn.Module):
         # # This part processes the tokens routed to the local experts.
         # # TODO: can we use group GEMM here?
         for i, expert in enumerate(self.experts.values()):
-            processed_tokens[gatherd_idxs == i] = expert(
-                gathered_tokens[gatherd_idxs == i]
-            )
+            # Find indices for this expert using where (more efficient than boolean indexing)
+            expert_mask = (gatherd_idxs == i)
+            if expert_mask.any():
+                # Get the actual indices where the mask is True
+                expert_indices = torch.where(expert_mask)[0]
+                
+                # Use index_select for efficient, contiguous memory access
+                expert_tokens = gathered_tokens.index_select(0, expert_indices)
+                
+                # Process through the expert
+                expert_output = expert(expert_tokens)
+                
+                # Use index_copy_ for efficient assignment back to the result tensor
+                processed_tokens.index_copy_(0, expert_indices, expert_output)
 
         # Now shuffle the tokens back to their original owner, i.e. EP to DP shuffle.
         # The input/output splits are just a reverse of the previous shuffle.

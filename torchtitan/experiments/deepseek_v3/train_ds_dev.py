@@ -33,11 +33,11 @@ from ipc_pipeline_src.ipc_share import (get_shared_data, destroy_shared_data,
                                         share_model_parameters_ipc,
                                         share_model_gradients_ipc,
                                         create_and_share_tensor_ipc,
-                                        copy_and_share_tensor_ipc)
+                                        copy_and_share_tensor_ipc,
+                                        SharedData)
 from ipc_pipeline_src.mbp_schedule import ScheduleMbp
 from ipc_pipeline_src.mbp_stage import MbpStage
-from ipc_pipeline_src.ipc_gradient import SharedGradientManager
-import torch_ipc_extension 
+from ipc_pipeline_src.sync_traces import merge_chrome_traces_with_barriers
 
 from datetime import datetime
 
@@ -78,6 +78,7 @@ def run_full_model(
     mesh: DeviceMesh,
     mbp_rank: int = 0,
     mbp_size: int = 1,
+    mbp_ctrl: SharedData = None,
 ):
     time_start = datetime.now()
     pp_mesh = mesh["pp"]
@@ -111,18 +112,6 @@ def run_full_model(
             f"Ranks: {mbp_rank=}, {rank=}, {ep_rank=}, {pp_rank=}, {fsdp_rank=}, "
             f"{model_args.num_stages=}, {model_args.stage_idx=}\n"
         )
-    
-    # Setup MBP groups
-    max_concurrent_process_groups = 4
-    mbp_ctrl_name = f"mbp_ctrl_gpu_{rank}"
-    if mbp_rank == 0:
-        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
-                                   group_size=mbp_size, initial_value=0, 
-                                   semaphore_count=max_concurrent_process_groups)
-    else:
-        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
-                                   group_size=mbp_size, initial_value=0, 
-                                   semaphore_count=max_concurrent_process_groups)
 
     fsdp_mesh = mesh["fsdp"]
     fsdp_rank = fsdp_mesh.get_local_rank()
@@ -256,10 +245,12 @@ def run_full_model(
     torch.cuda.empty_cache()
     print_memory_usage(rank, mbp_ctrl, "After sharing model and gradients")
 
-    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     time_setup = datetime.now()
     print(b_str(f"Rank {rank} ") + f"Setup time: {time_setup - time_start}\n", end="")
-    mbp_ctrl.barrier()
+    with torch.profiler.record_function("BARRIER:EXEC_START"):
+        mbp_ctrl.barrier()
+        dist.barrier()
+    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
 
     # Run forward and backward
     steps = 2
@@ -297,14 +288,12 @@ def run_full_model(
             if rank == 0:
                 print(g_str(f"Rank {rank} ") + 
                       f"/////// Finished iteration {_} ///////\n", end="")
-
+    with torch.profiler.record_function("BARRIER:EXEC_END"):
+        mbp_ctrl.barrier()
+        dist.barrier()
     print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
     time_end = datetime.now()
     print(b_str(f"Rank {rank} ") + f"Execution time: {time_end - time_setup}\n", end="")
-    
-    if mbp_rank == 0:
-        destroy_shared_data(mbp_ctrl)
-
 
 if __name__ == "__main__":
     pp_size = int(sys.argv[1])
@@ -317,6 +306,18 @@ if __name__ == "__main__":
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size), 
                                  mesh_dim_names=("pp", "ep", "fsdp"))
+    
+    # Setup MBP groups
+    max_concurrent_process_groups = 4
+    mbp_ctrl_name = f"mbp_ctrl_gpu_{dist.get_rank()}"
+    if mbp_rank == 0:
+        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
+                                   group_size=mbp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
+    else:
+        mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
+                                   group_size=mbp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
     
     # Setup profiler
     run_id = os.getenv("RUN_ID", "0")
@@ -340,7 +341,7 @@ if __name__ == "__main__":
         with_stack=True
     ) as prof:
         time_start = datetime.now()
-        run_full_model(mesh, mbp_rank, mbp_size)
+        run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl)
         prof.step()
         time_end = datetime.now()
         print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
@@ -349,5 +350,18 @@ if __name__ == "__main__":
         trace_path = f"{log_dir}/trace_{mbp_rank}_{dist.get_rank()}.json"
         print(f"Rank {dist.get_rank()} Exporting trace to {trace_path}")
         prof.export_chrome_trace(trace_path)
+        
+    dist.barrier()
+    mbp_ctrl.barrier()
     
+    if mbp_rank == 0 and dist.get_rank() == 0:
+        merge_chrome_traces_with_barriers(
+            trace_dir=log_dir,
+            output_file=f"{log_dir}/merged_trace.json",
+            barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
+            trace_names=[f"trace_{mbp_rank}_0.json" for mbp_rank in range(mbp_size)]
+        )
+        
     dist.destroy_process_group()
+    if mbp_rank == 0:
+        destroy_shared_data(mbp_ctrl)
