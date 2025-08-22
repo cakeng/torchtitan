@@ -727,31 +727,74 @@ class MoE(nn.Module):
             gatherd_idxs = gatherd_idxs.repeat_interleave(tokens_per_expert_group)
 
         
-        # Prepare buffer for tokens processed by experts
-        if self.shuffle_method == "symm_mem":
-            # Take necessary space from `token_gather_buf` symm mem because we are
-            # going to send them out after expert processing
-            processed_tokens = self.get_gather_buf()[: gathered_tokens.shape[0]]
-        else:  # "torch_all_to_all"
-            processed_tokens = torch.empty_like(gathered_tokens)
+        # # Prepare buffer for tokens processed by experts
+        # if self.shuffle_method == "symm_mem":
+        #     # Take necessary space from `token_gather_buf` symm mem because we are
+        #     # going to send them out after expert processing
+        #     processed_tokens = self.get_gather_buf()[: gathered_tokens.shape[0]]
+        # else:  # "torch_all_to_all"
+        #     processed_tokens = torch.empty_like(gathered_tokens)
 
         # # This part processes the tokens routed to the local experts.
         # # TODO: can we use group GEMM here?
+        # for i, expert in enumerate(self.experts.values()):
+        #     processed_tokens[gatherd_idxs == i] = expert(
+        #         gathered_tokens[gatherd_idxs == i]
+        #     )
+
+        # --- OPTIMIZED EXPERT PROCESSING ---
+        # This section is modified to remove per-expert synchronization.
+
+        # Sort tokens by the expert they are intended for. This makes the tokens
+        # for each expert contiguous in memory.
+        # `sorted_expert_idxs` will be e.g., [0,0,0, 1,1, 2,2,2,2,...]
+        # `permutation_indices` stores the original positions to unsort later.
+        sorted_expert_idxs, permutation_indices = torch.sort(gatherd_idxs)
+        
+        # Apply the permutation to group the tokens by expert.
+        permuted_gathered_tokens = gathered_tokens[permutation_indices]
+        
+        # Create an inverse permutation to scatter the results back.
+        _, unpermutation_indices = torch.sort(permutation_indices)
+
+        # SINGLE SYNC POINT: Get the token counts for each expert.
+        # We use bincount and then transfer the result to the CPU. This is the
+        # one synchronization we accept to avoid the expensive per-expert syncs.
+        tokens_per_local_expert = torch.bincount(
+            sorted_expert_idxs, minlength=len(self.experts)
+        ).tolist()
+
+        # Calculate the offsets for slicing into the permuted tensor.
+        # e.g., [10, 20, 5] -> [0, 10, 30, 35]
+        offsets = [0] + torch.cumsum(
+            torch.tensor(tokens_per_local_expert), dim=0
+        ).tolist()
+
+        # Prepare the output buffer.
+        if self.shuffle_method == "symm_mem":
+            processed_tokens_permuted = self.get_gather_buf()[: gathered_tokens.shape[0]]
+        else:
+            processed_tokens_permuted = torch.empty_like(permuted_gathered_tokens)
+
+        # Process experts in a loop using efficient, static slices.
+        # NO SYNCHRONIZATION HAPPENS INSIDE THIS LOOP.
         for i, expert in enumerate(self.experts.values()):
-            # Find indices for this expert using where (more efficient than boolean indexing)
-            expert_mask = (gatherd_idxs == i)
-            if expert_mask.any():
-                # Get the actual indices where the mask is True
-                expert_indices = torch.where(expert_mask)[0]
-                
-                # Use index_select for efficient, contiguous memory access
-                expert_tokens = gathered_tokens.index_select(0, expert_indices)
-                
-                # Process through the expert
-                expert_output = expert(expert_tokens)
-                
-                # Use index_copy_ for efficient assignment back to the result tensor
-                processed_tokens.index_copy_(0, expert_indices, expert_output)
+            start, end = offsets[i], offsets[i+1]
+            if start == end: # No tokens for this expert
+                continue
+            
+            # Slice the permuted tensor to get the batch for this expert.
+            expert_input = permuted_gathered_tokens[start:end]
+            
+            # Process the tokens.
+            expert_output = expert(expert_input)
+            
+            # Place the results in the corresponding slice of the output buffer.
+            processed_tokens_permuted[start:end] = expert_output
+
+        # Un-sort the processed tokens to their original order before the EP->DP shuffle.
+        processed_tokens = processed_tokens_permuted[unpermutation_indices]
+
 
         # Now shuffle the tokens back to their original owner, i.e. EP to DP shuffle.
         # The input/output splits are just a reverse of the previous shuffle.

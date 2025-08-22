@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 import random
 
-mbp_size = 8
+mbp_size = 2
 pp_size = 2
 ep_size = 2
 fsdp_size = 1
@@ -15,7 +15,7 @@ num_gpus = pp_size * ep_size * fsdp_size
 run_id = datetime.now().strftime("%Y%m%d%H%M%S")
 #export run_id to env
 os.environ["RUN_ID"] = run_id
-os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "16"
 os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
 
