@@ -233,33 +233,25 @@ def merge_synchronized_traces(synchronized_traces: Dict, output_file: str):
         mbp_rank, dist_rank = get_ranks(rank_str)
         return (mbp_rank, dist_rank)
     
-    sorted_ranks = sorted(synchronized_traces.keys(), key=sort_key)
+    sorted_ranks = sorted(synchronized_traces.keys(), key=sort_key, reverse=True)
     print(f"Sorted ranks by (MBP, dist) order: {sorted_ranks}")
     
     # Assign process IDs with smaller, Perfetto-compatible ranges
     for rank in sorted_ranks:
         trace_data = synchronized_traces[rank]
         mbp_rank, dist_rank = get_ranks(rank)
-        
+
         # Use smaller PID ranges: CPU starts at 1, GPU starts at 100
-        cpu_pid = 100 + mbp_rank * 10 + dist_rank
-        gpu_pid = 500 + mbp_rank * 10 + dist_rank
-        
-        print(f"  MBP{mbp_rank}-D{dist_rank}: CPU PID {cpu_pid}, GPU PID {gpu_pid}")
+        pid = 10000 + (99 - mbp_rank) * 100 + (99 - dist_rank)
+                
+        print(f"MBP{mbp_rank}-D{dist_rank}: PID {pid}")
         
         if 'traceEvents' not in trace_data:
             continue
         
         for event in trace_data['traceEvents']:
-            # Modify the original event directly (like the older version)
-            if event.get('cat') == 'gpu_user_annotation' or event.get('cat') == 'gpu_op':
-                event['pid'] = gpu_pid
-                event['name'] = f"[{mbp_rank}-{dist_rank}-GPU] {event.get('name', 'Event')}"
-            else:
-                event['pid'] = cpu_pid
-                event['name'] = f"[{mbp_rank}-{dist_rank}-CPU] {event.get('name', 'Event')}"
-            
-
+            # event['pid'] = pid
+            event['name'] = f"[Rank {mbp_rank}-{dist_rank}] {event['name']}"
             merged_trace['traceEvents'].append(event)
     
     with open(output_file, 'w') as f:

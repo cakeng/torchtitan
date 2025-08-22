@@ -161,6 +161,7 @@ def _sorted_batch_p2p(
 
     # Call batch_isend_irecv per peer, in sorted order of the peers (to avoid hangs)
     for peer, ops in sorted(ops_by_peer.items()):
+        print(f"Rank {dist.get_rank()}: Sending to {peer}: {ops}")
         work_by_peer[peer] = _batch_p2p(ops, desc=desc)
 
     return work_by_peer
