@@ -80,6 +80,7 @@ def run_full_model(
     mbp_rank: int = 0,
     mbp_size: int = 1,
     mbp_ctrl: SharedData = None,
+    mbp_ctrl_global: SharedData = None,
 ):
     time_start = datetime.now()
     pp_mesh = mesh["pp"]
@@ -100,7 +101,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 6
+    model_args.num_hidden_layers = 8
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -124,10 +125,6 @@ def run_full_model(
           b_str("\n\tfsdp_mesh: ") + f"{fsdp_mesh} - " + y_str("fsdp rank: ") + f"{fsdp_rank}" + 
           b_str("\n\thsdp_mesh: ") + f"{hsdp_mesh} \n", end="")
     
-    mbp_ctrl.barrier()
-    print(g_str(f"Rank {rank} ") + "Synced with all ranks in the MBP group\n", end="")
-    
-      
     # Instantiate model
     print_memory_usage(rank, mbp_ctrl, "Before model instantiation")
     with device, mesh:
@@ -248,13 +245,14 @@ def run_full_model(
 
     time_setup = datetime.now()
     print(b_str(f"Rank {rank} ") + f"Setup time: {time_setup - time_start}\n", end="")
-    with torch.profiler.record_function("BARRIER:EXEC_START"):
-        mbp_ctrl.barrier()
-        dist.barrier()
-    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
+    if mbp_ctrl_global is not None:
+        with torch.profiler.record_function("BARRIER:EXEC_START"):
+            mbp_ctrl_global.barrier()
 
+    print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
+    
     # Run forward and backward
-    steps = 3
+    steps = 4
     for _ in range(steps):
         # Only the first process in each SMB group captures the weight gradients
         mbp_ctrl_in = mbp_ctrl
@@ -290,9 +288,11 @@ def run_full_model(
             if rank == 0:
                 print(g_str(f"Rank {rank} ") + 
                       f"/////// Finished iteration {_} ///////\n", end="")
-    with torch.profiler.record_function("BARRIER:EXEC_END"):
-        mbp_ctrl.barrier()
-        dist.barrier()
+
+    if mbp_ctrl_global is not None:
+        with torch.profiler.record_function("BARRIER:EXEC_END"):
+            mbp_ctrl_global.barrier()
+
     print(b_str(f"Rank {rank} ") + f"All processes finished training loop\n", end="")
     time_end = datetime.now()
     print(b_str(f"Rank {rank} ") + f"Execution time: {time_end - time_setup}\n", end="")
@@ -320,11 +320,23 @@ if __name__ == "__main__":
         mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
                                    group_size=mbp_size, initial_value=0, 
                                    semaphore_count=max_concurrent_process_groups)
+
+    # Setup global MBP groups (For debugging & tracing purposes, would not work in multi-node setup)
+    mbp_ctrl_name = f"mbp_ctrl_global"
+    if mbp_rank == 0 and dist.get_rank() == 0:
+        mbp_ctrl_global = get_shared_data(mbp_ctrl_name, is_creator=True, 
+                                   group_size=mbp_size*pp_size*ep_size*fsdp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
+    else:
+        mbp_ctrl_global = get_shared_data(mbp_ctrl_name, is_creator=False, 
+                                   group_size=mbp_size*pp_size*ep_size*fsdp_size, initial_value=0, 
+                                   semaphore_count=max_concurrent_process_groups)
     
     # Setup profiler
     run_id = os.getenv("RUN_ID", "0")
     log_dir = f"./tensorboard_traces/run_{run_id}"
     os.makedirs(log_dir, exist_ok=True)
+    mbp_ctrl_global.barrier()
     
     # Profile the execution
     with torch.profiler.profile(
@@ -343,7 +355,7 @@ if __name__ == "__main__":
         with_stack=True
     ) as prof:
         time_start = datetime.now()
-        run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl)
+        run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl, mbp_ctrl_global)
         prof.step()
         time_end = datetime.now()
         print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
@@ -359,15 +371,15 @@ if __name__ == "__main__":
     # print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
     
     torch.cuda.empty_cache()
-    dist.barrier()
-    mbp_ctrl.barrier()
+    mbp_ctrl_global.barrier()
     if mbp_rank == 0 and dist.get_rank() == 0:
         merge_chrome_traces_with_barriers(
             trace_dir=log_dir,
             output_file=f"{log_dir}/merged_trace.json",
             barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
             trace_names=[f"trace_{mbp_rank}_0.json" for mbp_rank in range(mbp_size)] + \
-                        [f"trace_{mbp_rank}_2.json" for mbp_rank in range(mbp_size)]
+                        [f"trace_{mbp_rank}_2.json" for mbp_rank in range(mbp_size)],
+            whole_trace=False,
         )
         # compress the merged trace
         with zipfile.ZipFile(f"{log_dir}/{run_id}_merged_trace.zip", "w",

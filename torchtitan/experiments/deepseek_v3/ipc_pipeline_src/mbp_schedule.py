@@ -274,20 +274,21 @@ class ScheduleMbp(MbpScheduleSingle):
                   b_str(f"Executing ") + f"F/B pass on microbatch {self._microbatch_idx}\n", end="")
 
         # Forward pass
-        with record_function(f"Forward {self._microbatch_idx}"):
+        with record_function(f"[Rank {self._microbatch_idx}-{self._global_rank}] Forward"):
             ops = self._stage.get_fwd_recv_ops()      
             work_sync = _sorted_batch_p2p(ops, desc="fwd_recv")
             for work in work_sync.values():
                 work.wait()
-            logging.info(g_str(f"Rank {self._global_rank}: ") 
-                         + b_str(f"Forwarding {self._microbatch_idx}") 
-                         + f", receiving {ops}")
+            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+                         b_str(f"Forwarding {self._microbatch_idx}") + f", receiving {ops}")
 
-            output = self._stage.forward_one_chunk(args, kwargs)
- 
+            with torch.profiler.record_function(
+                f"[Rank {self._microbatch_idx}-{self._global_rank}] Forward pass"):
+                output = self._stage.forward_one_chunk(args, kwargs)
+
             ops = self._stage.get_fwd_send_ops()
-            logging.info(g_str(f"Rank {self._global_rank}: ") 
-                         + b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
+            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+                         b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
 
             # Schedule the next microbatch
@@ -302,19 +303,23 @@ class ScheduleMbp(MbpScheduleSingle):
             return   
 
         # Backward pass
-        with record_function(f"Backward {self._microbatch_idx}"):
+        with record_function(f"[Rank {self._microbatch_idx}-{self._global_rank}] Backward"):
             ops = self._stage.get_bwd_recv_ops()
             work_sync = _sorted_batch_p2p(ops, desc="bwd_recv")
             for work in work_sync.values():
                 work.wait()
-            logging.info(g_str(f"Rank {self._global_rank}: ")+ r_str(f"Backwarding {self._microbatch_idx}") + f", receiving {ops}")
+            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+                         r_str(f"Backwarding {self._microbatch_idx}") + f", receiving {ops}")
 
             # For single microbatch, loss is directly available
             loss = self._maybe_get_loss(self._stage)
-            self._stage.backward_one_chunk(loss=loss)
+            with torch.profiler.record_function(
+                f"[Rank {self._microbatch_idx}-{self._global_rank}] Backward pass"):
+                self._stage.backward_one_chunk(loss=loss)
 
             ops = self._stage.get_bwd_send_ops()
-            logging.info(g_str(f"Rank {self._global_rank}: ")+ r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
+            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+                         r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="bwd_send"))
 
         # Release the semaphore
