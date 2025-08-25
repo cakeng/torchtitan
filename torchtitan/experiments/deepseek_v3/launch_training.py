@@ -5,17 +5,17 @@ import sys
 from datetime import datetime
 import random
 
-mbp_size = 4
+mbp_size = 10
 pp_size = 2
-ep_size = 2
+ep_size = 4
 fsdp_size = 1
-
+run_profiler = "False"
 num_gpus = pp_size * ep_size * fsdp_size
 
 run_id = datetime.now().strftime("%Y%m%d%H%M%S")
 #export run_id to env
 os.environ["RUN_ID"] = run_id
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_gpus))
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "16"
 os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
 
@@ -32,7 +32,7 @@ def stream_output(process, rank, stream_type):
 # Launch four different training jobs asynchronously
 processes = []
 for i in range(mbp_size):
-    port = 29500 + random.randint(0, 1000)
+    port = 29500 + random.randint(0, 10000)
     cmd = [
         "torchrun",
         f"--nproc_per_node={num_gpus}",
@@ -42,7 +42,8 @@ for i in range(mbp_size):
         str(ep_size),
         str(fsdp_size),
         str(mbp_size),
-        str(i)
+        str(i),
+        run_profiler
     ]
     cmd_str = " ".join(cmd)
     

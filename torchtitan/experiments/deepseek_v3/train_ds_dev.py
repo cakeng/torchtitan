@@ -252,8 +252,8 @@ def run_full_model(
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     
     # Run forward and backward
-    steps = 4
-    for _ in range(steps):
+    steps = 12
+    for step_idx in range(steps):
         # Only the first process in each SMB group captures the weight gradients
         mbp_ctrl_in = mbp_ctrl
         if pp_size > 1:
@@ -262,13 +262,13 @@ def run_full_model(
             y = None
             losses = []
             if pp_rank == 0:
-                pp_schedule.step(x[mbp_rank], mbp_ctrl=mbp_ctrl_in)
+                pp_schedule.step(x[mbp_rank], mbp_ctrl=mbp_ctrl_in, step_idx=step_idx)
             elif pp_rank == pp_size - 1:
                 y = pp_schedule.step(target=label[mbp_rank], losses=losses,
-                                     mbp_ctrl=mbp_ctrl_in)
+                                     mbp_ctrl=mbp_ctrl_in, step_idx=step_idx)
                 loss = torch.mean(torch.stack(losses))
             else:
-                pp_schedule.step(mbp_ctrl=mbp_ctrl_in)
+                pp_schedule.step(mbp_ctrl=mbp_ctrl_in, step_idx=step_idx)
 
             print(g_str(f"Rank {rank} ") + r_str(f"Finished ") + 
                   f"F/B pass on microbatch {mbp_rank}\n", end="")  
@@ -280,14 +280,20 @@ def run_full_model(
                       f"label: {label.shape}\n", end="")
 
         # Wait for all MBP members to finish gradient accumulation before running optimizer
+        torch.cuda.synchronize()
         mbp_ctrl.barrier()
+        if mbp_rank == mbp_size - 1:
+            print(g_str(f"Rank {rank}: ") + b_str(f"Adding shared gradients back to model"))
+            # Add shared gradients back to model here
+            # stage.scale_grads(1)
+            # stage.run_fsdp_post_backward()
 
         if mbp_rank == 0:
             # Reset microbatch counter
             mbp_ctrl.set(0)
             if rank == 0:
                 print(g_str(f"Rank {rank} ") + 
-                      f"/////// Finished iteration {_} ///////\n", end="")
+                      f"/////// Finished iteration {step_idx} ///////\n", end="")
 
     if mbp_ctrl_global is not None:
         with torch.profiler.record_function("BARRIER:EXEC_END"):
@@ -303,6 +309,7 @@ if __name__ == "__main__":
     fsdp_size = int(sys.argv[3])
     mbp_size = int(sys.argv[4])
     mbp_rank = int(sys.argv[5])
+    run_profiler = sys.argv[6] == "True"
     
     # set device before init_device mesh, otherwise ep will have duplicate device mapping
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -310,7 +317,7 @@ if __name__ == "__main__":
                                  mesh_dim_names=("pp", "ep", "fsdp"))
     
     # Setup MBP groups
-    max_concurrent_process_groups = 16
+    max_concurrent_process_groups = 3 * pp_size
     mbp_ctrl_name = f"mbp_ctrl_gpu_{dist.get_rank()}"
     if mbp_rank == 0:
         mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=True, 
@@ -320,73 +327,82 @@ if __name__ == "__main__":
         mbp_ctrl = get_shared_data(mbp_ctrl_name, is_creator=False, 
                                    group_size=mbp_size, initial_value=0, 
                                    semaphore_count=max_concurrent_process_groups)
+    mbp_ctrl.barrier()
+    if mbp_rank == 0:
+        print(g_str(f"Rank {dist.get_rank()} ") + "mbp_ctrl ready.\n", end="")
 
-    # Setup global MBP groups (For debugging & tracing purposes, would not work in multi-node setup)
-    mbp_ctrl_name = f"mbp_ctrl_global"
-    if mbp_rank == 0 and dist.get_rank() == 0:
-        mbp_ctrl_global = get_shared_data(mbp_ctrl_name, is_creator=True, 
-                                   group_size=mbp_size*pp_size*ep_size*fsdp_size, initial_value=0, 
-                                   semaphore_count=max_concurrent_process_groups)
+    if run_profiler:
+        # Setup global MBP groups (For debugging & tracing purposes, would not work in multi-node setup)
+        mbp_ctrl_name = f"mbp_ctrl_global"
+        if mbp_rank == 0 and dist.get_rank() == 0:
+            mbp_ctrl_global = get_shared_data(mbp_ctrl_name, is_creator=True, 
+                                    group_size=mbp_size*pp_size*ep_size*fsdp_size, initial_value=0, 
+                                    semaphore_count=max_concurrent_process_groups)
+        else:
+            mbp_ctrl_global = get_shared_data(mbp_ctrl_name, is_creator=False, 
+                                    group_size=mbp_size*pp_size*ep_size*fsdp_size, initial_value=0, 
+                                    semaphore_count=max_concurrent_process_groups)
+        
+        # Setup profiler
+        run_id = os.getenv("RUN_ID", "0")
+        log_dir = f"./tensorboard_traces/run_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}"
+        os.makedirs(log_dir, exist_ok=True)
+        mbp_ctrl_global.barrier()
+        if mbp_rank == 0 and dist.get_rank() == 0:
+            print(g_str(f"Rank {dist.get_rank()} ") + 
+                "mbp_ctrl_global ready. All processes initialized.\n", end="")
+        
+        # Profile the execution
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=0,
+                warmup=0,
+                active=1,
+                repeat=1
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        ) as prof:
+            time_start = datetime.now()
+            run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl, mbp_ctrl_global)
+            prof.step()
+            time_end = datetime.now()
+            print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
+            
+            # Export the trace
+            trace_path = f"{log_dir}/trace_{mbp_rank}_{dist.get_rank()}.json"
+            print(f"Rank {dist.get_rank()} Exporting trace to {trace_path}")
+            prof.export_chrome_trace(trace_path)
+   
+        torch.cuda.empty_cache()
+        mbp_ctrl_global.barrier()
+        if mbp_rank == 0 and dist.get_rank() == 0:
+            merge_chrome_traces_with_barriers(
+                trace_dir=log_dir,
+                output_file=f"{log_dir}/merged_trace.json",
+                barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
+                trace_names=[f"trace_{mbp_rank}_0.json" for mbp_rank in range(mbp_size)] + \
+                            [f"trace_{mbp_rank}_{ep_size*fsdp_size}.json" for mbp_rank in range(mbp_size)],
+                whole_trace=False,
+            )
+            # compress the merged trace
+            zip_name = f"{log_dir}/{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_merged_trace.zip" 
+            with zipfile.ZipFile(zip_name, "w",
+                                compression=zipfile.ZIP_DEFLATED, 
+                                compresslevel=9) as zipf:
+                print(f"Rank {dist.get_rank()} Compressing trace to {zip_name}")
+                zipf.write(f"{log_dir}/merged_trace.json", f"{run_id}_merged_trace.json")
+            print(f"Rank {dist.get_rank()} Compressed trace to {zip_name}")
     else:
-        mbp_ctrl_global = get_shared_data(mbp_ctrl_name, is_creator=False, 
-                                   group_size=mbp_size*pp_size*ep_size*fsdp_size, initial_value=0, 
-                                   semaphore_count=max_concurrent_process_groups)
-    
-    # Setup profiler
-    run_id = os.getenv("RUN_ID", "0")
-    log_dir = f"./tensorboard_traces/run_{run_id}"
-    os.makedirs(log_dir, exist_ok=True)
-    mbp_ctrl_global.barrier()
-    
-    # Profile the execution
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(
-            wait=0,
-            warmup=0,
-            active=1,
-            repeat=1
-        ),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
         time_start = datetime.now()
-        run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl, mbp_ctrl_global)
-        prof.step()
+        run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl)
         time_end = datetime.now()
         print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
-        
-        # Export the trace
-        trace_path = f"{log_dir}/trace_{mbp_rank}_{dist.get_rank()}.json"
-        print(f"Rank {dist.get_rank()} Exporting trace to {trace_path}")
-        prof.export_chrome_trace(trace_path)
-
-    # time_start = datetime.now()
-    # run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl)
-    # time_end = datetime.now()
-    # print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
-    
-    torch.cuda.empty_cache()
-    mbp_ctrl_global.barrier()
-    if mbp_rank == 0 and dist.get_rank() == 0:
-        merge_chrome_traces_with_barriers(
-            trace_dir=log_dir,
-            output_file=f"{log_dir}/merged_trace.json",
-            barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
-            trace_names=[f"trace_{mbp_rank}_0.json" for mbp_rank in range(mbp_size)] + \
-                        [f"trace_{mbp_rank}_2.json" for mbp_rank in range(mbp_size)],
-            whole_trace=False,
-        )
-        # compress the merged trace
-        with zipfile.ZipFile(f"{log_dir}/{run_id}_merged_trace.zip", "w",
-                             compression=zipfile.ZIP_DEFLATED, 
-                             compresslevel=9) as zipf:
-            print(f"Rank {dist.get_rank()} Compressing trace to {log_dir}/{run_id}_merged_trace.zip")
-            zipf.write(f"{log_dir}/merged_trace.json", f"{run_id}_merged_trace.json")
         
     dist.destroy_process_group()
     if mbp_rank == 0:

@@ -218,7 +218,7 @@ def sync_and_merge_traces(traces: Dict, barrier_deltas: Dict, rank_final_times: 
                 event['name'] = f"[Rank {mbp_rank}-{dist_rank}] Event"
             if 'ts' in event:
                 event['ts'] = event['ts'] - barrier_deltas[rank]
-            if whole_trace:
+            if not whole_trace:
                 if event['ts'] >= 0 and event['ts'] <= rank_final_times[rank]:
                     merged_trace['traceEvents'].append(event)
             else:

@@ -107,6 +107,7 @@ class _MbpSchedule(ABC):
         losses: Optional[list] = None,
         mbp_ctrl=None,
         init_stage_only=False,
+        step_idx=0,
     ):
         """
         Run one iteration of the pipeline schedule with single microbatch.
@@ -214,6 +215,7 @@ class MbpScheduleSingle(_MbpSchedule):
     def step(self, *args, target=None, losses: Optional[list] = None,
             mbp_ctrl=None,
             init_stage_only=False,
+            step_idx=0,
             **kwargs):
         """
         Run one iteration with single microbatch input.
@@ -223,7 +225,7 @@ class MbpScheduleSingle(_MbpSchedule):
         self._stage.clear_runtime_states()
         # Run single microbatch
         self._step_microbatches(args, kwargs, target, losses,
-                                mbp_ctrl, init_stage_only)
+                                mbp_ctrl, init_stage_only, step_idx)
 
         # Return outputs directly (no merging needed)
         if self._stage.is_last:
@@ -246,6 +248,7 @@ class ScheduleMbp(MbpScheduleSingle):
         losses: Optional[list] = None,
         mbp_ctrl=None,
         init_stage_only=False,
+        step_idx=0,
     ):
         """
         Run single microbatch - simplified version of GPipe schedule.
@@ -274,7 +277,7 @@ class ScheduleMbp(MbpScheduleSingle):
                   b_str(f"Executing ") + f"F/B pass on microbatch {self._microbatch_idx}\n", end="")
 
         # Forward pass
-        with record_function(f"[Rank {self._microbatch_idx}-{self._global_rank}] Forward"):
+        with record_function(f"[Rank {self._microbatch_idx}-{self._global_rank}] Forward {step_idx}"):
             ops = self._stage.get_fwd_recv_ops()      
             work_sync = _sorted_batch_p2p(ops, desc="fwd_recv")
             for work in work_sync.values():
@@ -282,8 +285,7 @@ class ScheduleMbp(MbpScheduleSingle):
             logging.info(g_str(f"Rank {self._global_rank}: ") + 
                          b_str(f"Forwarding {self._microbatch_idx}") + f", receiving {ops}")
 
-            with torch.profiler.record_function(
-                f"[Rank {self._microbatch_idx}-{self._global_rank}] Forward pass"):
+            with torch.profiler.record_function(f"Forward {step_idx}"):
                 output = self._stage.forward_one_chunk(args, kwargs)
 
             ops = self._stage.get_fwd_send_ops()
@@ -329,12 +331,6 @@ class ScheduleMbp(MbpScheduleSingle):
         # Wait immediately for single microbatch
         for work in works.values():
             work.wait()
-        
-        if self._microbatch_idx == self._microbatch_size - 1:
-            print(g_str(f"Rank {self._global_rank}: ") + b_str(f"Adding shared gradients back to model"))
-            # Add shared gradients back to model here
-            # self._stage.scale_grads(1)
-            # self._stage.run_fsdp_post_backward()
 
         # Return losses if there is a container passed in
         self._update_losses(self._stage, losses)
