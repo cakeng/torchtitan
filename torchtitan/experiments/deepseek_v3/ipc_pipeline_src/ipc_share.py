@@ -105,18 +105,6 @@ class SharedData:
         """Post to (increment) the semaphore."""
         pass
 
-def acquire(tensor: torch.Tensor) -> None:
-    """Acquire the lock for a given IPC tensor."""
-    pass
-
-def release(tensor: torch.Tensor) -> None:
-    """Release the lock for a given IPC tensor with device synchronization."""
-    pass
-
-def release_async(tensor: torch.Tensor) -> None:
-    """Release the lock for a given IPC tensor without device synchronization."""
-    pass
-
 def destroy_shared_data(shared_data: torch_ipc_extension.SharedData) -> None:
     """Destroy and unlink shared memory for a SharedData object."""
     pass
@@ -125,12 +113,16 @@ def destroy_shared_data(shared_data: torch_ipc_extension.SharedData) -> None:
 # This ensures the type hints are available while maintaining the real functionality
 __all__ = [
     'SharedData',
-    'acquire', 'release', 'release_async',
     'destroy_shared_data',
     'get_shared_data',
     'share_model_parameters_ipc',
     'create_and_share_tensor_ipc',
-    'copy_and_share_tensor_ipc'
+    'copy_and_share_tensor_ipc',
+    'register_gradient_hooks',
+    'unregister_gradient_hooks',
+    'acquire_gradient_lock',
+    'release_gradient_lock',
+    'with_gradient_lock',
 ]
 
 def g_str(s):
@@ -243,7 +235,45 @@ def _set_param_or_buffer(model, name, new_tensor):
     if old_tensor is not None:
         del old_tensor
     torch.cuda.empty_cache()
-        
+    
+def _create_gradient_hooks(name, param):
+    """Create hooks with parameter name information."""
+    def gradient_compute_hook(grad):
+        """Hook executed DURING gradient computation - acquire lock."""
+        # print(f"ACQUIRING lock for parameter '{name}': "
+        #       f"grad is not None: {param.grad is not None} " +
+        #       f"is_ipc_tensor: {torch_ipc_extension.is_ipc_tensor(param.grad) if param.grad is not None else 'None'}")
+        if param.grad is not None and torch_ipc_extension.is_ipc_tensor(param.grad):
+            torch_ipc_extension.acquire(param.grad)
+            # print(f"ACQUIRED lock for parameter '{name}'")
+        return grad
+    
+    def gradient_accumulate_hook(grad):
+        """Hook executed AFTER gradient accumulation - release lock."""
+        # print(f"RELEASING lock for parameter '{name}': " +
+        #       f"grad is not None: {param.grad is not None} " +
+        #       f"is_ipc_tensor: {torch_ipc_extension.is_ipc_tensor(param.grad) if param.grad is not None else 'None'}")
+        if param.grad is not None and torch_ipc_extension.is_ipc_tensor(param.grad):
+            torch_ipc_extension.release(param.grad)
+            # print(f"RELEASED lock for parameter '{name}'")
+        return grad
+    
+    return gradient_compute_hook, gradient_accumulate_hook
+
+def register_gradient_hooks(model: nn.Module):
+    """Register hooks directly on parameter tensors for precise gradient locking."""
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # Create hooks with parameter name information
+            compute_hook, accumulate_hook = _create_gradient_hooks(name, param)
+            
+            # Hook during gradient computation (acquire lock)
+            param.register_hook(compute_hook)
+            # Hook after gradient accumulation (release lock)
+            param.register_post_accumulate_grad_hook(accumulate_hook)
+    
+    print(f"Registered gradient hooks on {sum(1 for p in model.parameters() if p.requires_grad)} parameters")
+
 def _set_grad_in_param_or_buffer(model, name, new_tensor):
     """Recursively finds and replaces a parameter or buffer in a model."""
     module_path, _, attr_name = name.rpartition('.')
@@ -292,6 +322,12 @@ def share_model_gradients_ipc(
     """
     Shares model gradients from a source rank using C++-level IPC,
     independent of torch.distributed.
+    
+    Args:
+        model: The model whose gradients to share
+        is_creator: Whether this rank is the creator of the shared memory
+        group_size: Number of processes in the sharing group
+        shm_name: Name for the shared memory segment
     """
     shm = get_shared_data(shm_name, is_creator, group_size, 
                           data_buffer_size=128*1024*1024)
@@ -379,6 +415,8 @@ def share_model_gradients_ipc(
             _set_grad_in_param_or_buffer(model, name, shared_grad)
             
     # Barrier 2: Wait for all ranks to finish setting parameters
+    register_gradient_hooks(model)
+    
     gc.collect()
     torch.cuda.empty_cache()
     shm.barrier()
@@ -1457,6 +1495,8 @@ class _SimpleModel(nn.Module):
     def forward(self, x):
         return self.layer2(self.relu(self.layer1(x))) + self.my_buffer
 
+
+
 def main():
     """Main execution function with robust unit tests."""
     if not torch.cuda.is_available():
@@ -1757,6 +1797,7 @@ def main():
         output = model(**inputs, labels=inputs["input_ids"])
         loss = output.loss
         # loss.backward() will accumulate new gradients to the shared gradients
+        print(f"[Rank {rank}] Running loss.backward()...")
         loss.backward()
         dist.barrier() #2
         target_grad = model.get_parameter(target_param_name).grad

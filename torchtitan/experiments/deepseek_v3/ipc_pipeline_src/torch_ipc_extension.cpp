@@ -28,6 +28,8 @@
 #include <c10/cuda/CUDAStream.h>    // For c10::cuda::getCurrentCUDAStream
 #endif
 
+#define IPC_MAGIC_NUMBER 0x4A30E31F
+
 // #define _PRINT_DEBUG 1
 
 // The data structure to be placed in shared memory
@@ -258,6 +260,35 @@ struct IpcAllocationContext
     std::unique_ptr<SharedLock> lock; // Use a unique_ptr for ownership
 };
 
+class IpcContextRegistry {
+    public:
+        static void register_context(const void* ctx) {
+            registered_contexts.insert(ctx);
+        }
+        
+        static bool is_registered(const void* ctx) {
+            return registered_contexts.find(ctx) != registered_contexts.end();
+        }
+        
+        static void unregister_context(const void* ctx) {
+            registered_contexts.erase(ctx);
+        }
+
+    private:
+        static std::set<const void*> registered_contexts;
+};
+std::set<const void*> IpcContextRegistry::registered_contexts;
+
+bool is_ipc_tensor(const torch::Tensor& tensor) {
+    auto* ctx = tensor.storage().data_ptr().get_context();
+    if (!ctx) return false;
+    
+    if (IpcContextRegistry::is_registered(ctx)) {
+        return true;
+    }
+    return false;
+}
+
 // --- Custom Allocator for IPC-enabled memory ---
 class IpcAllocator final : public c10::Allocator
 {
@@ -274,6 +305,7 @@ public:
 #endif
 
         auto* ctx = new IpcAllocationContext();
+        IpcContextRegistry::register_context(ctx);
         ctx->base_ptr = base_ptr;
 
 #ifdef USE_HIP
@@ -340,6 +372,7 @@ private:
         {
             SharedLock::destroy(ctx->lock->get_name());
         }
+        IpcContextRegistry::unregister_context(ctx);
         delete ctx;
     }
 };
@@ -571,6 +604,7 @@ torch::Tensor open_ipc_and_get_tensor(
 #endif
 
     auto* ctx = new IpcAllocationContext();
+    IpcContextRegistry::register_context(ctx);
     ctx->base_ptr = base_ptr;
     ctx->handle = handle;
     std::string lock_name = generate_lock_name_from_handle(handle);
@@ -1064,6 +1098,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "Release the lock for a given IPC tensor, Pytorch-level GPU "
           "synchronization is required to avoid race conditions on kernel "
           "launched in the critical section.");
+    m.def("is_ipc_tensor", &is_ipc_tensor, 
+          "Check if a tensor is an IPC tensor.");
 
     py::class_<SharedData>(m, "SharedData")
         .def(py::init<const std::string&, bool, unsigned int, int64_t, 

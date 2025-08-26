@@ -15,7 +15,7 @@ num_gpus = pp_size * ep_size * fsdp_size
 run_id = datetime.now().strftime("%Y%m%d%H%M%S")
 #export run_id to env
 os.environ["RUN_ID"] = run_id
-os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i + 4) for i in range(num_gpus))
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_gpus))
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "16"
 os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
 
