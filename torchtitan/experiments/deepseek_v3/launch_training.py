@@ -1,15 +1,25 @@
 import os
+from pdb import run
 import subprocess
 import threading
 import sys
 from datetime import datetime
 import random
 
-mbp_size = 10
+run_type = sys.argv[1]
+mbp_size = 6
 pp_size = 2
 ep_size = 2
 fsdp_size = 1
-run_profiler = "False"
+num_hidden_layers = 8
+num_steps = 4
+run_profiler = "True"
+
+if run_type == "1f1b":
+    train_script = "train_ds_dev_1f1b.py"
+else:
+    train_script = "train_ds_dev.py"
+
 num_gpus = pp_size * ep_size * fsdp_size
 
 run_id = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -31,18 +41,21 @@ def stream_output(process, rank, stream_type):
 
 # Launch four different training jobs asynchronously
 processes = []
-for i in range(mbp_size):
+num_process_groups = 1 if run_type == "1f1b" else mbp_size
+for i in range(num_process_groups):
     port = 29500 + random.randint(0, 10000)
     cmd = [
         "torchrun",
         f"--nproc_per_node={num_gpus}",
         f"--master_port={port}",
-        "train_ds_dev.py",
+        train_script,
         str(pp_size),
         str(ep_size),
         str(fsdp_size),
         str(mbp_size),
         str(i),
+        str(num_hidden_layers),
+        str(num_steps),
         run_profiler
     ]
     cmd_str = " ".join(cmd)
@@ -58,7 +71,7 @@ for i in range(mbp_size):
     )
     
     # Start output streaming threads only for first 2 instances
-    if i < 12:
+    if i < num_process_groups:
         stdout_thread = threading.Thread(target=stream_output, args=(process, i, "stdout"))
         stderr_thread = threading.Thread(target=stream_output, args=(process, i, "stderr"))
         
@@ -75,7 +88,7 @@ for i in range(mbp_size):
     print(f"Launched MBP rank {i} with PID {process.pid}, cmd: {cmd_str}")
 
 # Wait for all processes to complete
-print(f"\nWaiting for all {len(processes)} processes to complete...")
+print(f"\nWaiting for all {num_process_groups} processes to complete...")
 for i, (process, stdout_thread, stderr_thread) in enumerate(processes):
     return_code = process.wait()
     print(f"\n=== MBP Rank {i} (PID {process.pid}) completed with return code {return_code} ===")

@@ -3,6 +3,7 @@ import glob
 import os
 from typing import Dict, List, Tuple
 import time
+from tqdm import tqdm
 
 def debug_trace_events(traces: Dict):
     """Debug function to see what events are actually in the traces."""
@@ -211,7 +212,11 @@ def sync_and_merge_traces(traces: Dict, barrier_deltas: Dict, rank_final_times: 
         mbp_rank, dist_rank = get_ranks(rank)
         if 'traceEvents' not in trace_data:
             continue
-        for event in trace_data['traceEvents']:
+        total_events = len(trace_data['traceEvents'])
+        for event in tqdm(trace_data['traceEvents'], 
+                         total=total_events, 
+                         desc=f"Processing trace events of rank {mbp_rank}-{dist_rank}",
+                         unit="events"):
             if 'name' in event:
                 event['name'] = f"[Rank {mbp_rank}-{dist_rank}] {event['name']}"
             else:
