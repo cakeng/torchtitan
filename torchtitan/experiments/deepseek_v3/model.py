@@ -1156,13 +1156,14 @@ class DecoderLayer(nn.Module):
         self.self_attn = Attention(config=config, layer_idx=layer_idx)
 
         self.mlp = (
-            MoE(config)
-            if (
-                config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0
-            )
-            else MLP(config)
+            # MoE(config)
+            # if (
+            #     config.n_routed_experts is not None
+            #     and layer_idx >= config.first_k_dense_replace
+            #     and layer_idx % config.moe_layer_freq == 0
+            # )
+            # else MLP(config)
+            MLP(config)
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(

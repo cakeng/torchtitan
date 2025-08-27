@@ -6,13 +6,13 @@ import sys
 from datetime import datetime
 import random
 
-run_type = sys.argv[1]
-mbp_size = 6
+run_type = sys.argv[1] if len(sys.argv) > 1 else ""
+mbp_size = 8
 pp_size = 2
 ep_size = 2
 fsdp_size = 1
 num_hidden_layers = 8
-num_steps = 4
+num_steps = 6
 run_profiler = "True"
 
 if run_type == "1f1b":

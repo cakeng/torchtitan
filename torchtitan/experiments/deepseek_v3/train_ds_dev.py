@@ -81,6 +81,8 @@ def run_full_model(
     mbp_size: int = 1,
     mbp_ctrl: SharedData = None,
     mbp_ctrl_global: SharedData = None,
+    num_hidden_layers: int = 8,
+    num_steps: int = 12,
 ):
     time_start = datetime.now()
     pp_mesh = mesh["pp"]
@@ -101,7 +103,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 8
+    model_args.num_hidden_layers = num_hidden_layers
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -252,7 +254,7 @@ def run_full_model(
     print(b_str(f"Rank {rank} ") + f"Starting training loop with {microbatches=}, {bs=}, {seqlen=}\n", end="")
     
     # Run forward and backward
-    steps = 12
+    steps = num_steps
     for step_idx in range(steps):
         # Only the first process in each SMB group captures the weight gradients
         mbp_ctrl_in = mbp_ctrl
@@ -309,7 +311,9 @@ if __name__ == "__main__":
     fsdp_size = int(sys.argv[3])
     mbp_size = int(sys.argv[4])
     mbp_rank = int(sys.argv[5])
-    run_profiler = sys.argv[6] == "True"
+    num_hidden_layers = int(sys.argv[6])
+    num_steps = int(sys.argv[7])
+    run_profiler = sys.argv[8] == "True"
     
     # set device before init_device mesh, otherwise ep will have duplicate device mapping
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -345,7 +349,7 @@ if __name__ == "__main__":
         
         # Setup profiler
         run_id = os.getenv("RUN_ID", "0")
-        log_dir = f"./tensorboard_traces/run_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}"
+        log_dir = f"./tensorboard_traces/run_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}"
         os.makedirs(log_dir, exist_ok=True)
         mbp_ctrl_global.barrier()
         if mbp_rank == 0 and dist.get_rank() == 0:
@@ -369,7 +373,8 @@ if __name__ == "__main__":
             with_stack=True
         ) as prof:
             time_start = datetime.now()
-            run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl, mbp_ctrl_global)
+            run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl, mbp_ctrl_global, 
+                           num_hidden_layers=num_hidden_layers, num_steps=num_steps)
             prof.step()
             time_end = datetime.now()
             print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
@@ -391,7 +396,7 @@ if __name__ == "__main__":
                 whole_trace=False,
             )
             # compress the merged trace
-            zip_name = f"{log_dir}/{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_merged_trace.zip" 
+            zip_name = f"{log_dir}/{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}_merged_trace.zip" 
             with zipfile.ZipFile(zip_name, "w",
                                 compression=zipfile.ZIP_DEFLATED, 
                                 compresslevel=9) as zipf:
@@ -400,7 +405,8 @@ if __name__ == "__main__":
             print(f"Rank {dist.get_rank()} Compressed trace to {zip_name}")
     else:
         time_start = datetime.now()
-        run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl)
+        run_full_model(mesh, mbp_rank, mbp_size, mbp_ctrl, 
+                       num_hidden_layers=num_hidden_layers, num_steps=num_steps)
         time_end = datetime.now()
         print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
         

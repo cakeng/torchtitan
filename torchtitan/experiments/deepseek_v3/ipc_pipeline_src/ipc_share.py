@@ -415,7 +415,9 @@ def share_model_gradients_ipc(
             _set_grad_in_param_or_buffer(model, name, shared_grad)
             
     # Barrier 2: Wait for all ranks to finish setting parameters
-    register_gradient_hooks(model)
+    # This creates a lot of synchronization overhead.
+    # Larger granularity locks should be used instead.
+    # register_gradient_hooks(model)
     
     gc.collect()
     torch.cuda.empty_cache()
