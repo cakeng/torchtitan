@@ -159,26 +159,22 @@ class ContextScheduler:
             self.next_exec_id = self.waiting_exec_ids.popleft()
             if self.debug:
                 t_id = threading.current_thread().ident
-                print(r_str(f"[T{t_id}]") + " Switching to next exec " + 
+                print(r_str(f"[T{t_id}]") + " Scheduling next exec " + 
                       y_str(f"{self.next_exec_id}") + ", current waiting execs: " + 
                       y_str(f"{self.waiting_exec_ids}"))
         else:
             if self.debug:
                 t_id = threading.current_thread().ident
-                print(r_str(f"[T{t_id}]") + " No execs waiting, switching to active exec " + 
+                print(r_str(f"[T{t_id}]") + " No execs waiting, scheduling active exec " + 
                       y_str(f"{self.active_exec_id}"))
             self.next_exec_id = self.active_exec_id
-        if self.debug:
-            t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id}]") + " Scheduling next exec " + 
-                  y_str(f"{self.next_exec_id}"))
 
     def _release_context(self):
         # Release the context lock and signal the next exec to resume.
         if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id}]") + " Yielding context of exec " + 
-                  y_str(f"{self.active_exec_id}") + " next exec " + 
+            print(b_str(f"[T{t_id}]") + " Yielding context of exec to " + 
+                  y_str(f"{self.active_exec_id}") + " exec " + 
                   y_str(f"{self.next_exec_id}"))
             assert t_id == self.execs[self.active_exec_id]["exec"].ident, \
                 f"Expected {t_id} to be the active exec during release, got {self.execs[self.active_exec_id]['exec'].ident}"
