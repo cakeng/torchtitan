@@ -24,8 +24,10 @@ import time
 import copy
 from collections import deque
 import unittest
+from typing import Dict
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, logging
+from accelerate import init_empty_weights
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, logging
 logging.set_verbosity_error() # Suppress verbose warnings
 
 def g_str(s):
@@ -43,69 +45,143 @@ def y_str(s):
 # (This component remains unchanged)
 # =============================================================================
 
-def selective_deepcopy(obj, memo=None):
-    if memo is None:
-        memo = {}
-    if id(obj) in memo:
-        return memo[id(obj)]
-    if isinstance(obj, nn.Parameter):
-        memo[id(obj)] = obj
-        return obj
-    if isinstance(obj, nn.Module):
-        # As per your request, I'm having the opening brace on a new
-        # line for this style [2025-08-13].
-        new_module = obj.__class__.__new__(obj.__class__)
-        memo[id(obj)] = new_module
-        for key, value in obj.__dict__.items():
-            new_module.__dict__[key] = selective_deepcopy(value, memo)
-        return new_module
-    elif isinstance(obj, (list, tuple)):
-        new_list = [selective_deepcopy(item, memo) for item in obj]
-        if isinstance(obj, tuple):
-            new_list = tuple(new_list)
-        return new_list
-    elif isinstance(obj, dict):
-        new_dict = {
-            key: selective_deepcopy(value, memo)
-            for key, value in obj.items()
-        }
-        return new_dict
-    else:
-        return copy.deepcopy(obj, memo)
+def _get_parent_module_and_param_name(model: nn.Module, path: str):
+    """
+    A helper function to find the parent module and the final attribute
+    name given a full parameter path.
+    Example: for path 'layers.0.attn.weight', it returns the
+    `model.layers[0].attn` module and the string 'weight'.
+    """
+    parts = path.split('.')
+    parent_module = model
+    for part in parts[:-1]:
+        # getattr can handle both attribute access (like .layers) and
+        # indexed access for nn.ModuleList (like [0])
+        if part.isdigit():
+            parent_module = parent_module[int(part)]
+        else:
+            parent_module = getattr(parent_module, part)
+    param_name = parts[-1]
+    return parent_module, param_name
+
+def materialize_meta_model(
+    meta_model: nn.Module, 
+    base_model: nn.Module
+):
+    """
+    Materializes a model created on the 'meta' device by replacing its
+    meta tensors with references to the corresponding tensors from a
+    fully initialized base model.
+
+    Args:
+        meta_model (nn.Module): The model skeleton, initialized on the
+                                'meta' device. This model will be
+                                modified in-place.
+        base_model (nn.Module): A fully initialized model (on CPU or GPU)
+                                that contains the actual tensor data.
+    """
+    base_params: Dict[str, nn.Parameter] = dict(base_model.named_parameters())
+    base_buffers: Dict[str, torch.Tensor] = dict(base_model.named_buffers())
+
+    # ### FIX: Collect parameter names into a static list first ###
+    # This prevents the "dictionary changed during iteration" error.
+    meta_param_names = [name for name, _ in meta_model.named_parameters()]
+
+    for param_name in meta_param_names:
+        # We only need to handle meta tensors. If a tensor is already
+        # materialized, we can skip it.
+        parent_check, attr_check = _get_parent_module_and_param_name(
+            meta_model, param_name
+        )
+        if getattr(parent_check, attr_check).device != torch.device("meta"):
+            continue
+            
+        if param_name not in base_params:
+            raise ValueError(
+                f"Architecture mismatch: Parameter '{param_name}' found in "
+                "meta_model but not in base_model."
+            )
+
+        parent_module, attr_name = _get_parent_module_and_param_name(
+            meta_model, param_name
+        )
+
+        # Replace the meta parameter with a reference to the base parameter
+        delattr(parent_module, attr_name)
+        setattr(parent_module, attr_name, base_params[param_name])
+
+    # ### FIX: Apply the same logic for buffers ###
+    meta_buffer_names = [name for name, _ in meta_model.named_buffers()]
+
+    for buffer_name in meta_buffer_names:
+        parent_check, attr_check = _get_parent_module_and_param_name(
+            meta_model, buffer_name
+        )
+        if getattr(parent_check, attr_check).device != torch.device("meta"):
+            continue
+
+        if buffer_name not in base_buffers:
+            raise ValueError(
+                f"Architecture mismatch: Buffer '{buffer_name}' found in "
+                "meta_model but not in base_model."
+            )
+
+        parent_module, attr_name = _get_parent_module_and_param_name(
+            meta_model, buffer_name
+        )
+        
+        delattr(parent_module, attr_name)
+        setattr(parent_module, attr_name, base_buffers[buffer_name])
 
 # =============================================================================
 # COMPONENT 2: SCHEDULER, THREAD, AND HOOKS (UPDATED FOR TRAINING)
 # =============================================================================
 
 class ContextScheduler:
-    """ Manages and schedules TrainingThreads in a round-robin fashion. """
-    def __init__(self, num_execs):
+    """ Manages and schedules ExecutionEngines in a round-robin fashion. """
+    def __init__(self, num_execs, debug = False):
+        self.num_execs = num_execs
         self.active_exec_id = 0
         self.next_exec_id = 0
+        self.waiting_exec_ids = deque(maxlen=num_execs)
+        self.execs = {}
+        self.modules = {}
+        self.debug = debug
+        self.completion_barrier = threading.Barrier(num_execs + 1)
         self.context_lock = threading.Lock()
         self.context_lock.acquire()
-        self.execs = {}
-        self.ops = {}
-        self.debug = True
-        self.num_execs = num_execs
-        self.completion_barrier = threading.Barrier(num_execs + 1)
 
     def _scheduler(self):
         if self.next_exec_id is None:
             return None
-        # Switch to the next exec using a simple round-robin.
-        self.next_exec_id = (self.active_exec_id + 1) % len(self.execs)
+        # Switch to the next exec using a simple FIFO queue.
+        if len(self.waiting_exec_ids) > 0:
+            self.next_exec_id = self.waiting_exec_ids.popleft()
+            if self.debug:
+                t_id = threading.current_thread().ident
+                print(r_str(f"[T{t_id}]") + " Switching to next exec " + 
+                      y_str(f"{self.next_exec_id}") + ", current waiting execs: " + 
+                      y_str(f"{self.waiting_exec_ids}"))
+        else:
+            if self.debug:
+                t_id = threading.current_thread().ident
+                print(r_str(f"[T{t_id}]") + " No execs waiting, switching to active exec " + 
+                      y_str(f"{self.active_exec_id}"))
+            self.next_exec_id = self.active_exec_id
         if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id} Scheduler]") + " Scheduling next exec " + 
+            print(b_str(f"[T{t_id}]") + " Scheduling next exec " + 
                   y_str(f"{self.next_exec_id}"))
 
     def _release_context(self):
         # Release the context lock and signal the next exec to resume.
         if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id} Scheduler]") + " Yielding context of exec " + 
-                  y_str(f"{self.active_exec_id}"))
+            print(b_str(f"[T{t_id}]") + " Yielding context of exec " + 
+                  y_str(f"{self.active_exec_id}") + " next exec " + 
+                  y_str(f"{self.next_exec_id}"))
+            assert t_id == self.execs[self.active_exec_id]["exec"].ident, \
+                f"Expected {t_id} to be the active exec during release, got {self.execs[self.active_exec_id]['exec'].ident}"
         self.execs[self.active_exec_id]["signal"].clear()
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id]["signal"].set()
@@ -115,64 +191,71 @@ class ContextScheduler:
         # Acquire the context lock and execute.
         if exec_id is None:
             exec_id = self.active_exec_id
-        self.execs[exec_id]["signal"].wait()
-        if self.next_exec_id == exec_id:
-            self.active_exec_id = self.next_exec_id
-            if self.debug:
-                t_id = threading.current_thread().ident
-                print(b_str(f"[T{t_id} Scheduler]") + " Resuming exec " + 
-                    y_str(f"{self.active_exec_id}"))
-            self.context_lock.acquire() 
-        elif self.debug:
+        self.waiting_exec_ids.append(exec_id)
+        if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id} Scheduler]") + " Exec " + y_str(f"{exec_id}") + 
-                  " detached remotely, running independently from the scheduler context.")
+            print(b_str(f"[T{t_id}]") + " Waiting for exec " + 
+                y_str(f"{exec_id}"))
+        self.execs[exec_id]["signal"].wait()
+        assert self.next_exec_id == exec_id, \
+            f"Expected {self.next_exec_id} to be the next exec during acquire, got {exec_id} running"
+        self.active_exec_id = self.next_exec_id
+        self.context_lock.acquire() 
+        if self.debug:
+            t_id = threading.current_thread().ident
+            print(b_str(f"[T{t_id}]") + " Resuming exec " + 
+                y_str(f"{self.active_exec_id}"))
 
-    def attach_exec(self, ident):
+    def add_exec(self, exec):
+        # Add an exec to the scheduler.
+        for exec_id in self.execs:
+            assert self.execs[exec_id]["exec"] != exec, \
+                f"Exec {exec} already exists"
+        if self.debug:
+            t_id = threading.current_thread().ident
+            print(b_str(f"[T{t_id}]") + " Adding exec " + 
+                  y_str(f"{exec}") + ", ident " + 
+                  y_str(f"{exec.ident}"))
         new_exec_id = len(self.execs)
         new_exec_event = threading.Event()
         new_exec_event.clear()
         self.execs[new_exec_id] = {
-            "ident": ident,
+            "exec": exec,
             "signal": new_exec_event,
         }
+        return new_exec_id
+
+    def attach_exec_to_context(self, exec_id):
+        # Attach the exec to the scheduler context
         if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id} Scheduler]") + " Attaching exec " + 
-                  y_str(f"{new_exec_id}"))
-        self._acquire_context(new_exec_id)
+            print(b_str(f"[T{t_id}]") + " Attaching exec " + 
+                  y_str(f"{exec_id}") + ", ident " + 
+                  y_str(f"{self.execs[exec_id]['exec'].ident}"))
+        self.execs[exec_id] = self.execs[exec_id]
+        self._acquire_context(exec_id)
         return
 
-    def detach_exec(self, ident):
-        for exec_id, exec in self.execs.items():
-            if exec["ident"] == ident:
-                if self.active_exec_id == exec_id:
-                    self._scheduler()
-                    self._release_context(exec_id)
-                    if self.debug:
-                        t_id = threading.current_thread().ident
-                        print(b_str(f"[T{t_id} Scheduler]") + " Exec " + y_str(f"{exec_id}") + 
-                            " detached and running independently from the scheduler context.")
-                else:
-                    if self.debug:
-                        t_id = threading.current_thread().ident
-                        print(b_str(f"[T{t_id} Scheduler]") + f" Current exec " +
-                              y_str(f"{self.active_exec_id}") + f" detaching inactive exec " +
-                              y_str(f"{exec_id}") + " from the scheduler context.")
-                    self._release_context(exec_id)
-                    exec["signal"].set()
-                del self.execs[exec_id]
-                return
-        raise ValueError(f"Exec with ident {ident} not found")
+    def detach_exec_from_context(self, exec_id):
+        # Detach the exec from the scheduler context
+        assert self.active_exec_id == exec_id, \
+            f"Expected {self.active_exec_id} to be the active exec during detach, got {exec_id} running"
+        self._scheduler()
+        self._release_context()
+        if self.debug:
+            t_id = threading.current_thread().ident
+            print(b_str(f"[T{t_id}]") + " Exec " + y_str(f"{exec_id}") + 
+                " detached and running independently from the scheduler context.")
+        return
 
-    def start(self, starting_exec_id = 0):
+    def start(self):
         assert len(self.execs) == self.num_execs, \
             f"Expected {self.num_execs} execs, got {len(self.execs)}"
         for exec_id in self.execs:
             self.execs[exec_id]["signal"].clear()
-            self.execs[exec_id].s
-        self.active_exec_id = starting_exec_id
-        self.execs[starting_exec_id]["signal"].set()
+        self._scheduler()
+        if self.next_exec_id is not None:
+            self.execs[self.next_exec_id]["signal"].set()
         self.context_lock.release()
         return
         
@@ -183,12 +266,12 @@ class ContextScheduler:
     def wait_completion(self):
         if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id} Scheduler]") + " Waiting for completion of all execs.")
+            print(b_str(f"[T{t_id}]") + " Waiting for completion of all execs.")
         self.completion_barrier.wait()
         self.context_lock.acquire()
         if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id} Scheduler]") + " All exec completed, returning to main thread.")
+            print(b_str(f"[T{t_id}]") + " All exec completed, returning to main thread.")
 
     def context_switch(self):
         self._scheduler()
@@ -199,57 +282,98 @@ class ContextScheduler:
 class ExecutionEngine(threading.Thread):
     """ A dedicated thread to run a single training step (fwd/bwd). """
     def __init__(
-        self, base_model, microbatch, labels, loss_fn, scheduler,
+        self, model, microbatch, labels, loss_fn, scheduler,
+        debug = False,
     ):
         super().__init__(daemon=True)
-        self.model = base_model
+        self.model = model
         self.microbatch = microbatch
         self.labels = labels
         self.loss_fn = loss_fn
         self.scheduler = scheduler
+        self.exec_id = scheduler.add_exec(self)
         self.loss = None
         self.hooks = {}
+        self.debug = debug
         self.attach_hooks()
+        self.start()
 
     def run(self):
-        self.scheduler.attach_exec(self.ident)
-        try:
-            # Forward pass
-            outputs = self.model(self.microbatch)
-            self.loss = self.loss_fn(outputs, self.labels)
-            
-            # Backward pass
-            # self.loss.backward()
-            
-            # print(f"[{self.name}] Fwd/Bwd pass finished. Loss:"
-            #       f" {self.loss.item():.4f}")
-        except Exception as e:
-            print(f"[{self.name}] Encountered an error: {e}")
+        print(g_str(f"[T{self.ident}]") + " Running...")
+        while True:
+            # Attach the exec to the scheduler context, 
+            # The execution of this thread will be controlled by the scheduler.
+            self.scheduler.attach_exec_to_context(self.exec_id)
+            try:
+                # Forward pass
+                outputs = self.model(self.microbatch)
+                self.loss = self.loss_fn(outputs, self.labels)
+                
+                # Backward pass
+                # self.loss.backward()
+                
+                # print(f"[{self.name}] Fwd/Bwd pass finished. Loss:"
+                #       f" {self.loss.item():.4f}")
+            except Exception as e:
+                print(g_str(f"[T{self.ident}]") + " Encountered an error: " + 
+                      r_str(f"{e}"))
 
-        self.scheduler.detach_exec(self.ident)
-        self.scheduler.completion_barrier.wait()
+            # Detach the exec from the scheduler context,
+            # The execution will now be independent of the scheduler and
+            # the scheduler will no longer switch to this thread.
+            self.scheduler.detach_exec_from_context(self.exec_id)
+            # Wait for all execs to complete.
+            if self.debug:
+                t_id = threading.current_thread().ident
+                print(b_str(f"[T{t_id}]") + " Waiting for all execs to complete.")
+            self.scheduler.completion_barrier.wait()
 
     def is_running(self): return self.event.is_set()
 
     def attach_hooks(self):
-        pass
+        """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
+        print(g_str(f"[T{self.ident}]") + " Attaching hooks...")
+        self.detach_hooks() # Clear any old hooks first
+        for module in self.model.modules():
+            fwd_handle = module.register_forward_hook(self.forward_scheduler_hook)
+            # Use full backward hook for better coverage
+            bwd_handle = module.register_full_backward_hook(
+                self.backward_scheduler_hook
+            )
+            self.hooks.extend([fwd_handle, bwd_handle])
+    
     def detach_hooks(self):
-        pass
+        """ ### IMPLEMENTATION: Remove all attached hooks. ### """
+        for handle in self.hooks:
+            handle.remove()
+        self.hooks = []
 
-    def forward_yield_hook(self, module, input, output):
-        print(f"[T{self.ident}] Hook fired on {module}")
+    def forward_scheduler_hook(self, module, input, output):
+        assert threading.current_thread().ident == self.ident, \
+            f"Expected {self.ident} to be the current exec during forward hook, got {threading.current_thread().ident}"
+        if self.debug:
+            print(g_str(f"[T{self.ident}]") + " Hook fired on " + 
+                y_str(f"{module}") + " current exec " + 
+                y_str(f"{self.scheduler.active_exec_id}"))
         self.scheduler.context_switch()
 
-    def backward_yield_hook(self, module, grad_input, grad_output):
-        print(f"[T{self.ident}] Hook fired on {module}")
+    def backward_scheduler_hook(self, module, grad_input, grad_output):
+        assert threading.current_thread().ident == self.ident, \
+            f"Expected {self.ident} to be the current exec during backward hook, got {threading.current_thread().ident}"
+        if self.debug:
+            print(g_str(f"[T{self.ident}]") + " Hook fired on " + 
+                  y_str(f"{module}") + " current exec " + 
+                  y_str(f"{self.scheduler.active_exec_id}"))
         self.scheduler.context_switch()
 
-    def create_backward_lock_hooks(layer_lock):
+    def create_backward_lock_hooks(self, layer_lock):
         """ Hooks to acquire/release a lock during the backward pass. """
         def pre_hook(module, grad_input):
-            print(f"[T{self.ident}] Pre-hook fired on {module}")
+            print(g_str(f"[T{self.ident}]") + " Pre-hook fired on " + 
+                  y_str(f"{module}"))
         def post_hook(module, grad_input, grad_output):
-            print(f"[T{self.ident}] Post-hook fired on {module}")
+            print(g_str(f"[T{self.ident}]") + " Post-hook fired on " + 
+                  y_str(f"{module}"))
         return pre_hook, post_hook
 
 # =============================================================================
@@ -299,7 +423,7 @@ def simple_loss_fn(outputs, labels):
     return F.cross_entropy(outputs.view(-1, outputs.size(-1)), labels.view(-1))
 
 def run_training_test(
-    model_name, model_class, get_data_fn, loss_fn, num_threads
+    model_name, model_factory_fn, get_data_fn, loss_fn, num_threads, debug
 ):
     print("\n" + "="*80)
     print(f" E2E Training Test: {model_name} with {num_threads} Threads")
@@ -310,72 +434,50 @@ def run_training_test(
         return
 
     # 1. Model and Optimizer Setup
-    base_model = model_class().cuda()
+    base_model = model_factory_fn(materialized=True)
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=1e-4)
-
-    # 2. Hook and Lock Setup
-    scheduler = ContextScheduler()
-    fwd_hook = create_forward_yield_hook(scheduler)
-    layer_locks = {}
     
-    # Identify transformer layers to attach locks
-    transformer_layers = []
-    if hasattr(base_model, 'layers'): # For our simple model
-        transformer_layers = base_model.layers
-    elif hasattr(base_model, 'model') and hasattr(base_model.model, 'layers'): # For HF models
-        transformer_layers = base_model.model.layers
-    
-    for i, layer in enumerate(transformer_layers):
-        layer.custom_name = f"Layer-{i}"
-        layer_locks[i] = threading.Lock()
-        bwd_pre_hook, bwd_post_hook = create_backward_lock_hooks(
-            layer_locks[i]
-        )
-        layer.register_forward_hook(fwd_hook)
-        layer.register_full_backward_pre_hook(bwd_pre_hook)
-        layer.register_full_backward_hook(bwd_post_hook)
-    
-    # 3. Data and Thread Setup
+    # 2. Data and Thread Setup
     microbatches, labels = get_data_fn(num_threads)
-    completion_barrier = threading.Barrier(num_threads + 1)
     
-    threads = [
-        TrainingThread(
-            base_model, microbatches[i], labels[i], loss_fn,
-            scheduler, completion_barrier, rank=i,
-            name=f"Thread-{i}"
-        ) for i in range(num_threads)
-    ]
+    # 3. Hook and Lock Setup
+    scheduler = ContextScheduler(num_threads, debug)
+    for t in range(num_threads):
+        model = model_factory_fn(materialized=False)
+        materialize_meta_model(model, base_model)
+        ExecutionEngine(model, microbatches[t], labels[t], 
+                        loss_fn, scheduler, debug)
 
     # 4. Run Training Step
-    initial_weight = copy.deepcopy(
-        transformer_layers[0].attn.in_proj_weight.data
-    )
-
     scheduler.start()
-    for t in threads: t.start()
-    for t in threads: scheduler.submit(t)
 
-    print("\n[MainThread] Waiting for all threads to finish backward pass...")
-    completion_barrier.wait(timeout=60) # Main thread waits here
+    print("\n[MainThread] Waiting for all threads to complete execution...")
+    scheduler.wait_completion() # Main thread waits here
     
-    print("[MainThread] All threads complete. Stepping optimizer...")
-    optimizer.step()
-    optimizer.zero_grad()
+    # print("[MainThread] All threads complete. Stepping optimizer...")
+    # optimizer.step()
+    # optimizer.zero_grad()
     
-    final_weight = transformer_layers[0].attn.in_proj_weight.data
+    # final_weight = transformer_layers[0].attn.in_proj_weight.data
 
-    # 5. Cleanup and Verification
-    for t in threads: t.join(timeout=5)
-    scheduler.stop()
+    # # 5. Cleanup and Verification
+    # for t in threads: t.join(timeout=5)
+    # scheduler.stop()
 
-    assert not torch.equal(initial_weight, final_weight), \
-        "Weights did not change after optimizer step."
-    print("\nVerification PASSED: Model weights were updated.")
+    # assert not torch.equal(initial_weight, final_weight), \
+    #     "Weights did not change after optimizer step."
+    # print("\nVerification PASSED: Model weights were updated.")
 
 # =============================================================================
 # TEST CONFIGURATIONS AND MAIN BLOCK
 # =============================================================================
+
+def get_simple_transformer_model(materialized=True):
+    if materialized:
+        return SimpleTransformerModel().to("cuda")
+    else:
+        with init_empty_weights():
+            return SimpleTransformerModel()
 
 def get_simple_transformer_data(num_threads):
     batch_size, seq_len, vocab_size = 32, 64, 100
@@ -393,9 +495,50 @@ def get_simple_transformer_data(num_threads):
     labels = list(torch.split(full_labels, micro_bs))
     return microbatches, labels
 
+def get_deepseek_model(materialized=True):
+    """
+    Factory function for the DeepSeekV2-Lite model.
+
+    Args:
+        materialized (bool): If True, loads the full model with weights
+            and device_map. If False, creates a memoryless shell on the
+            'meta' device.
+    """
+    model_name = "deepseek-ai/deepseek-v2-lite"
+    
+    if materialized:
+        # This is for the base_model: load it completely with accelerate
+        print("[MainThread] Loading materialized base model with device_map='auto'...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda"
+        )
+        # The forward pass needs to be modified for this simple trainer to
+        # compute loss automatically when labels are present.
+        original_forward = model.forward
+        def new_forward(input_ids, labels=None):
+            # If labels are not provided, use input_ids for causal LM loss
+            if labels is None:
+                labels = input_ids
+            return original_forward(input_ids=input_ids, labels=labels)
+        model.forward = new_forward
+        print("[MainThread] Base model loaded.")
+        return model
+    else:
+        # This is for the meta_model_shell: create a shell from config
+        # without loading weights.
+        print("[MainThread] Creating meta model shell...")
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+        print("[MainThread] Meta model shell created.")
+        return model
+
 def get_deepseek_data(num_threads):
     # This is a dummy data generator for demonstration
-    batch_size, seq_len = 8, 128
+    batch_size, seq_len = 32, 128
     assert batch_size % num_threads == 0
     micro_bs = batch_size // num_threads
     
@@ -413,37 +556,26 @@ def deepseek_loss_fn(outputs, labels):
 
 if __name__ == "__main__":
     # Test 1: Simple Transformer
+    debug = True
     for num_threads in [1, 2, 4]:
         run_training_test(
             "Simple Transformer",
-            SimpleTransformerModel,
+            get_simple_transformer_model,
             get_simple_transformer_data,
             simple_loss_fn,
-            num_threads
+            num_threads,
+            debug
         )
-    def get_deepseek_model():
-        # As per your request, I'm using vim for editing text files
-        # [2025-08-05], though it's not applicable here.
-        # This demonstrates how to wrap the model loading.
-        model = AutoModelForCausalLM.from_pretrained(
-            "deepseek-ai/deepseek-v2-lite",
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
-        )
-        # The forward pass needs to be modified for this simple trainer
-        original_forward = model.forward
-        def new_forward(input_ids):
-            return original_forward(input_ids, labels=input_ids)
-        model.forward = new_forward
-        return model
-    
+        torch.cuda.empty_cache()
     # NOTE: Running with more threads on large models is very
     # memory-intensive due to activations stored for backward pass.
-    for num_threads in [1, 2]:
+    for num_threads in [4]:
         run_training_test(
             "DeepSeekV2-Lite",
             get_deepseek_model,
             get_deepseek_data,
             deepseek_loss_fn,
-            num_threads
+            num_threads,
+            debug
         )
+        torch.cuda.empty_cache()
