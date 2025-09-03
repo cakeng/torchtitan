@@ -148,21 +148,31 @@ class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
     def __init__(self, num_execs, debug = False):
         self.num_execs = num_execs
-        self.active_exec_id = 0
-        self.next_exec_id = 0
-        self.waiting_exec_ids = deque(maxlen=num_execs)
+        self.active_exec_id = -1
+        self.next_exec_id = -1
+        self.waiting_exec_ids = []
         self.execs = {}
         self.debug = debug
         self.completion_barrier = threading.Barrier(num_execs + 1)
         self.context_lock = threading.Lock()
         self.context_lock.acquire()
 
-    def _scheduler(self):
+    def _scheduler(self, force_switch = False):
         if self.next_exec_id is None:
             return None
         # Switch to the next exec using a simple FIFO queue.
         if len(self.waiting_exec_ids) > 0:
-            self.next_exec_id = self.waiting_exec_ids.popleft()
+            self.next_exec_id = self.active_exec_id
+            for exec_id in self.waiting_exec_ids:
+                if self.execs[exec_id].event.query():
+                    self.next_exec_id = exec_id
+                    break
+            if self.next_exec_id == self.active_exec_id and force_switch:
+                self.next_exec_id = self.waiting_exec_ids[0]   
+                
+            if self.next_exec_id != self.active_exec_id:
+                self.waiting_exec_ids.remove(self.next_exec_id)
+            
             if self.debug:
                 t_id = threading.current_thread().ident
                 print(r_str(f"[T{t_id}]") + " Scheduling next exec " + 
@@ -199,7 +209,7 @@ class ContextScheduler:
         self.waiting_exec_ids.append(exec_id)
         if self.debug:
             t_id = threading.current_thread().ident
-            print(b_str(f"[T{t_id}]") + " Waiting for exec " + 
+            print(b_str(f"[T{t_id}]") + " Waiting for context switch to exec " + 
                 y_str(f"{exec_id}"))
         self.execs[exec_id].signal.wait()
         assert self.next_exec_id == exec_id, \
@@ -211,7 +221,7 @@ class ContextScheduler:
         if self.debug:
             t_id = threading.current_thread().ident
             print(b_str(f"[T{t_id}]") + " Resuming exec " + 
-                y_str(f"{self.active_exec_id}") + " on stream " +
+                y_str(f"{self.active_exec_id}") + " context on stream " +
                 y_str(f"{self.execs[self.active_exec_id].stream}"))
 
     def add_exec(self, exec):
@@ -229,6 +239,7 @@ class ContextScheduler:
         new_exec_signal.clear()
         new_exec_stream = torch.cuda.Stream()
         new_exec_event = torch.cuda.Event()
+        new_exec_event.record(new_exec_stream)
         self.execs[new_exec_id] = ExecContext(exec, 
                                               new_exec_signal, 
                                               new_exec_stream, 
@@ -239,8 +250,9 @@ class ContextScheduler:
         # Schedule the next exec, release context of the current exec,
         # and enter the waiting queue until next context is acquired.
         self._scheduler()
-        self._release_context()
-        self._acquire_context()
+        if self.next_exec_id != self.active_exec_id:
+            self._release_context()
+            self._acquire_context()
         return
 
     def attach_exec_to_context(self, exec_id):
@@ -260,7 +272,7 @@ class ContextScheduler:
         assert self.active_exec_id == exec_id, \
             f"Expected {self.active_exec_id} to be the active exec during detach, " + \
             f"got {exec_id} running"
-        self._scheduler()
+        self._scheduler(force_switch=True)
         self._release_context()
         if self.debug:
             t_id = threading.current_thread().ident
@@ -273,7 +285,8 @@ class ContextScheduler:
             f"Expected {self.num_execs} execs, got {len(self.execs)}"
         for exec_id in self.execs:
             self.execs[exec_id].signal.clear()
-        self._scheduler()
+        self.active_exec_id = -1
+        self._scheduler(force_switch=True)
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id].signal.set()
         self.context_lock.release()
@@ -380,7 +393,7 @@ class ModelProfiler():
         
     def flag_context_switch(self):
         # Simple equal-time based context switch
-        num_context_switch_points = len(self.module_queue) / 100 if len(self.module_queue) > 500 else 5
+        num_context_switch_points = len(self.module_queue) / 300 if len(self.module_queue) > 1500 else 5
         context_switch_time = self.total_time / num_context_switch_points
         current_time = 0    
         for module_name in self.module_queue:
@@ -414,7 +427,6 @@ class ModelProfiler():
         return outputs, self.model_changed
 
     def attach_hooks(self):
-        """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
         print(g_str(f"[Profiler]") + " Attaching hooks...")
         self.detach_hooks() # Clear any old hooks first
         for module in self.model.modules():
@@ -438,8 +450,6 @@ class ModelProfiler():
             self.modules[module.module_name] = module_info
     
     def detach_hooks(self):
-        """ ### IMPLEMENTATION: Remove all attached hooks. ### """
-        # Clear all events
         for module_info in self.modules.values():
             if module_info.fwd_pre_hook is not None:
                 module_info.fwd_pre_hook.remove()
