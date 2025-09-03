@@ -16,14 +16,16 @@
 #
 # All code formatted within 80 columns as requested [2025-05-21]
 
+from tkinter import Y
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import threading
 import time
+import copy
 from dataclasses import dataclass
 from collections import deque
-from typing import Dict
+from typing import Dict, Callable
 
 from accelerate import init_empty_weights
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, logging
@@ -139,8 +141,8 @@ def materialize_meta_model(
 class ExecContext:
     exec: threading.Thread
     signal: threading.Event
-    cuda_stream: torch.cuda.Stream
-    cuda_event: torch.cuda.Event
+    stream: torch.cuda.Stream
+    event: torch.cuda.Event
 
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
@@ -184,8 +186,8 @@ class ContextScheduler:
                 f"Expected {t_id} to be the active exec during release, " + \
                 f"got {self.execs[self.active_exec_id].exec.ident}"
         self.execs[self.active_exec_id].signal.clear()
-        self.execs[self.active_exec_id].cuda_event.record(
-            self.execs[self.active_exec_id].cuda_stream)
+        self.execs[self.active_exec_id].event.record(
+            self.execs[self.active_exec_id].stream)
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id].signal.set()
         self.context_lock.release()
@@ -204,13 +206,13 @@ class ContextScheduler:
             f"Expected {self.next_exec_id} to be the next exec during acquire, " + \
             f"got {exec_id} running"
         self.active_exec_id = self.next_exec_id
-        torch.cuda.set_stream(self.execs[self.active_exec_id].cuda_stream)
+        torch.cuda.set_stream(self.execs[self.active_exec_id].stream)
         self.context_lock.acquire() 
         if self.debug:
             t_id = threading.current_thread().ident
             print(b_str(f"[T{t_id}]") + " Resuming exec " + 
                 y_str(f"{self.active_exec_id}") + " on stream " +
-                y_str(f"{self.execs[self.active_exec_id].cuda_stream}"))
+                y_str(f"{self.execs[self.active_exec_id].stream}"))
 
     def add_exec(self, exec):
         # Add an exec to the scheduler.
@@ -223,10 +225,14 @@ class ContextScheduler:
                   y_str(f"{exec}") + ", ident " + 
                   y_str(f"{exec.ident}"))
         new_exec_id = len(self.execs)
-        new_exec_event = threading.Event()
-        new_exec_event.clear()
-        self.execs[new_exec_id] = ExecContext(exec, new_exec_event, 
-                                   torch.cuda.Stream(), torch.cuda.Event())
+        new_exec_signal = threading.Event()
+        new_exec_signal.clear()
+        new_exec_stream = torch.cuda.Stream()
+        new_exec_event = torch.cuda.Event()
+        self.execs[new_exec_id] = ExecContext(exec, 
+                                              new_exec_signal, 
+                                              new_exec_stream, 
+                                              new_exec_event)
         return new_exec_id
     
     def context_switch(self):
@@ -286,12 +292,246 @@ class ContextScheduler:
         if self.debug:
             t_id = threading.current_thread().ident
             print(b_str(f"[T{t_id}]") + " All exec completed, returning to main thread.")
+            
+@dataclass
+class ModuleInfo():
+    avg_time_taken: float
+    num_profiles: int
+    input_shape: torch.Size
+    output_shape: torch.Size
+    fire_context_switch: bool
+    time_since_last_context_switch: float
+    
+    new_module_queue_start: int
+    module_queue_start: int
+    module_queue_end: int
+    profiler_event: torch.cuda.Event
+    
+    fwd_pre_hook: Callable
+    fwd_hook: Callable
+    bwd_hook: Callable
+    
+def print_module_info(module_name, module_info, module_queue = []):
+    out_str = (g_str(f"\t[{module_name}]") + " Module info:\n" + 
+               y_str(f"\t\tavg time taken:") + f"{module_info.avg_time_taken}\n" +
+               y_str(f"\t\tnum profiles: ") + f"{module_info.num_profiles}\n" +
+               y_str(f"\t\tinput shape: ") + f"{module_info.input_shape}\n" +
+               y_str(f"\t\toutput shape: ") + f"{module_info.output_shape}\n" +
+               y_str(f"\t\tfire context switch: ") + f"{module_info.fire_context_switch}\n" +
+               y_str(f"\t\ttime since last context switch: ") + f"{module_info.time_since_last_context_switch}\n"
+               )
+    print(out_str, end="")
+    
+class ModelProfiler():
+    def __init__(
+        self, model, microbatch, labels, loss_fn, do_profile=True, debug = False
+    ):
+        super().__init__()
+        self.model = model
+        self.microbatch = microbatch
+        self.labels = labels
+        self.loss_fn = loss_fn
+        self.loss = None
+        self.total_time = 0
+        self.modules = {}
+        self.module_queue = []
+        self.debug = debug
         
+        self.tag_module_name(self.model)
+        if do_profile:
+            self.profile_model()
+            self.delete_non_leaf_modules()
+            self.flag_context_switch()
+            self.print_profiler_info()
+    
+    def tag_module_name(self, module, module_name=None):
+        if module_name is None:
+            module.module_name = module.__class__.__name__
+        else:
+            module.module_name = module_name    
+        
+        for child_name, child_module in module.named_children():
+            self.tag_module_name(child_module, 
+                                 module.module_name + "_" + child_name)
+            
+    def delete_non_leaf_modules(self):
+        if self.debug:
+            print(g_str(f"[Profiler]") + " Deleting non-leaf modules...")
+        new_modules = {}
+        new_module_queue = []
+        total_time = 0
+        for module_name in self.module_queue:
+            module_info = self.modules[module_name]
+            if module_info.module_queue_end - module_info.module_queue_start == 1:
+                if self.debug:
+                    print(g_str(f"[Profiler]") + " Keeping leaf module " + 
+                          b_str(f"{module_name}") + ".")
+                module_info.module_queue_start = len(new_module_queue)
+                module_info.module_queue_end = len(new_module_queue) + 1
+                new_modules[module_name] = module_info
+                new_module_queue.append(module_name)
+                total_time += module_info.avg_time_taken
+            elif self.debug:
+                print(g_str(f"[Profiler]") + " Deleting non-leaf module " + 
+                      r_str(f"{module_name}") + ".")
+        self.modules = new_modules
+        self.module_queue = new_module_queue
+        self.total_time = total_time
+        
+    def flag_context_switch(self):
+        # Simple equal-time based context switch
+        num_context_switch_points = len(self.module_queue) / 100 if len(self.module_queue) > 500 else 5
+        context_switch_time = self.total_time / num_context_switch_points
+        current_time = 0    
+        for module_name in self.module_queue:
+            module_info = self.modules[module_name]
+            module_info.time_since_last_context_switch = current_time
+            if current_time + module_info.avg_time_taken > context_switch_time:
+                if self.debug:
+                    print(g_str(f"[Profiler]") + " Flagging context switch at " + 
+                          y_str(f"{module_name}") + ".")
+                module_info.fire_context_switch = True
+                current_time = 0
+            current_time += module_info.avg_time_taken
+            
+    def print_profiler_info(self):
+        print(g_str(f"[Profiler]") + " Profiler info:")
+        print(y_str(f"\tModel: ") + f"{self.model}")
+        print(y_str(f"\tTotal time: ") + f"{self.total_time}")
+        print(y_str(f"\tProfiled Modules: "))
+        for module_name in self.modules:
+            if self.modules[module_name].fire_context_switch:
+                print_module_info(module_name, self.modules[module_name], self.module_queue)
+        print(y_str(f"\tProfiled Module queue: ") + f"{self.module_queue}")
+
+    def profile_model(self):
+        self.new_module_queue = []
+        self.model_changed = False
+        self.attach_hooks()
+        outputs = self.model(self.microbatch)
+        self.detach_hooks()
+        self.module_queue = self.new_module_queue
+        return outputs, self.model_changed
+
+    def attach_hooks(self):
+        """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
+        print(g_str(f"[Profiler]") + " Attaching hooks...")
+        self.detach_hooks() # Clear any old hooks first
+        for module in self.model.modules():
+            module_info = ModuleInfo(
+                avg_time_taken=-1,
+                time_since_last_context_switch=-1,
+                input_shape=torch.Size([]),
+                output_shape=torch.Size([]),
+                fire_context_switch=False,
+                new_module_queue_start=-1,
+                module_queue_start=-1,
+                module_queue_end=-1,
+                num_profiles=0,
+                profiler_event=torch.cuda.Event(enable_timing=True),
+                fwd_pre_hook=None,
+                fwd_hook=None,
+                bwd_hook=None
+            )
+            module_info.fwd_pre_hook = module.register_forward_pre_hook(self.forward_pre_profiler_hook)
+            module_info.fwd_hook = module.register_forward_hook(self.forward_profiler_hook)
+            self.modules[module.module_name] = module_info
+    
+    def detach_hooks(self):
+        """ ### IMPLEMENTATION: Remove all attached hooks. ### """
+        # Clear all events
+        for module_info in self.modules.values():
+            if module_info.fwd_pre_hook is not None:
+                module_info.fwd_pre_hook.remove()
+            if module_info.fwd_hook is not None:
+                module_info.fwd_hook.remove()
+            if module_info.bwd_hook is not None:
+                module_info.bwd_hook.remove()
+        
+    def forward_pre_profiler_hook(self, module, input):
+        if isinstance(input, tuple):
+            if len(input) > 0:
+                input_shape = input[0].shape if hasattr(input[0], 'shape') else torch.Size([])
+            else:
+                input_shape = torch.Size([])
+        else:
+            input_shape = input.shape if hasattr(input, 'shape') else torch.Size([])
+            
+        if self.debug:
+            print(g_str(f"[Profiler]") + " Forward pre profiler hook fired on " + 
+                  y_str(f"{module.module_name}") + f", input {input_shape}")
+        module_key = module.module_name
+        self.modules[module_key].new_module_queue_start = len(self.new_module_queue)
+        self.new_module_queue.append(module_key)
+        self.modules[module_key].profiler_event.record()
+
+    def forward_profiler_hook(self, module, input, output):
+        if isinstance(input, tuple):
+            if len(input) > 0:
+                input_shape = input[0].shape if hasattr(input[0], 'shape') else torch.Size([])
+            else:
+                input_shape = torch.Size([])
+        else:
+            input_shape = input.shape if hasattr(input, 'shape') else torch.Size([])
+        if isinstance(output, tuple):
+            if len(output) > 0:
+                output_shape = output[0].shape if hasattr(output[0], 'shape') else torch.Size([])
+            else:
+                output_shape = torch.Size([])
+        else:
+            output_shape = output.shape if hasattr(output, 'shape') else torch.Size([])
+        if self.debug:
+            print(g_str(f"[Profiler]") + " Forward profiler hook fired on " + 
+                  y_str(f"{module.module_name}") + f", input {input_shape}" + 
+                  f", output {output_shape}")
+
+        module_key = module.module_name
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        torch.cuda.synchronize()
+        time_taken = self.modules[module_key].profiler_event.elapsed_time(end_event)
+        self.total_time += time_taken
+        self.modules[module_key].input_shape = input_shape
+        self.modules[module_key].output_shape = output_shape
+        
+        # If this is not the first profile, check if the module execution changed
+        if self.modules[module_key].module_queue_start > -1:
+            # If this is not the first profile and the model did not change yet, check if the module queue is the same
+            old_start = self.modules[module_key].module_queue_start
+            if old_start != self.modules[module_key].new_module_queue_start:
+                self.model_changed = True
+            old_end = self.modules[module_key].module_queue_end
+            if old_end != len(self.new_module_queue):
+                self.model_changed = True
+            old_module_queue = self.module_queue[old_start:old_end]
+            new_module_queue = self.new_module_queue[self.modules[module_key].new_module_queue_start:]
+            if new_module_queue != old_module_queue:
+                self.model_changed = True
+            if self.model_changed and self.debug:
+                print(g_str(f"[Profiler]") + " Model execution change detected on " + 
+                        y_str(f"{module.module_name}"))
+                
+        if self.model_changed or self.modules[module_key].module_queue_start == -1:
+            # If the module queue is different (execution changed), update the module queue start and end
+            self.modules[module_key].avg_time_taken = time_taken
+            self.modules[module_key].module_queue_start = self.modules[module_key].new_module_queue_start
+            self.modules[module_key].module_queue_end = len(self.new_module_queue)
+        else:
+            # If the module queue is the same (execution did not change), update the average time taken
+            self.modules[module_key].avg_time_taken = \
+                (self.modules[module_key].avg_time_taken * self.modules[module_key].num_profiles + 
+                    time_taken) / (self.modules[module_key].num_profiles + 1)
+        self.modules[module_key].num_profiles += 1
+        if self.debug:
+            print_module_info(module_key, self.modules[module_key], 
+                              self.new_module_queue)
+                
 class ExecutionEngine(threading.Thread):
+    
     """ A dedicated thread to run a single training step (fwd/bwd). """
     def __init__(
         self, model, microbatch, labels, loss_fn, scheduler,
-        debug = False,
+        profiler, debug = False,
     ):
         super().__init__(daemon=True)
         self.model = model
@@ -301,15 +541,26 @@ class ExecutionEngine(threading.Thread):
         self.scheduler = scheduler
         self.exec_id = scheduler.add_exec(self)
         self.loss = None
-        self.hooks = {}
-        self.op_stack = []
-        self.profile = False
+        self.profiler = profiler
         self.debug = debug
+        
+        self.tag_module_name(self.model)
         self.attach_hooks()
         self.start()
+        
+    def is_running(self): return self.event.is_set()
+    
+    def tag_module_name(self, module, module_name=None):
+        # Set the exec_name for the current module
+        if module_name is None:
+            module.module_name = module.__class__.__name__
+        else:
+            module.module_name = module_name    
+        
+        for child_name, child_module in module.named_children():
+            self.tag_module_name(child_module, module.module_name + "_" + child_name)
 
     def run(self):
-        self.profile = False
         print(g_str(f"[T{self.ident}]") + " Running...")
         while True:
             # Attach the exec to the scheduler context, 
@@ -338,60 +589,34 @@ class ExecutionEngine(threading.Thread):
                 t_id = threading.current_thread().ident
                 print(b_str(f"[T{t_id}]") + " Waiting for all execs to complete.")
             self.scheduler.completion_barrier.wait()
-    
-    def profile_model(self):
-        self.profile = True
-        outputs = self.model(self.microbatch)
-        self.profile = False
-        return outputs
-
-    def is_running(self): return self.event.is_set()
 
     def attach_hooks(self):
         """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
         print(g_str(f"[T{self.ident}]") + " Attaching hooks...")
         self.detach_hooks() # Clear any old hooks first
         for module in self.model.modules():
-            fwd_pre_handle = module.register_forward_pre_hook(self.forward_pre_scheduler_hook)
-            fwd_handle = module.register_forward_hook(self.forward_scheduler_hook)
-            # Use full backward hook for better coverage
-            bwd_handle = module.register_full_backward_hook(
-                self.backward_scheduler_hook
-            )
-            self.hooks[module] = [fwd_pre_handle, fwd_handle, bwd_handle]
+            module_name = module.module_name
+            if module_name in self.profiler.modules:
+                module_info = self.profiler.modules[module_name]
+                if module_info.fire_context_switch:
+                    module_info.fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
+                    module_info.bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
     
     def detach_hooks(self):
         """ ### IMPLEMENTATION: Remove all attached hooks. ### """
-        for module in self.hooks:
-            for handle in self.hooks[module]:
-                handle.remove()
-        self.hooks = {}
+        # Clear all events
+        self.profiler.detach_hooks()
         
-    def forward_pre_scheduler_hook(self, module, input):
-        assert threading.current_thread().ident == self.ident, \
-            f"Expected {self.ident} to be the current exec during forward pre hook, " + \
-            f"got {threading.current_thread().ident}"
-        if self.debug:
-            print(g_str(f"[T{self.ident}]") + " Forward pre hook fired on " + 
-                y_str(f"{module}") + " current exec " + 
-                y_str(f"{self.scheduler.active_exec_id}"))
-            
-        if not self.profile:
-            pass
-        else:
-            self.op_stack.append(("forward_pre", module, input))
-
     def forward_scheduler_hook(self, module, input, output):
         assert threading.current_thread().ident == self.ident, \
             f"Expected {self.ident} to be the current exec during forward hook, " + \
             f"got {threading.current_thread().ident}"
         if self.debug:
             print(g_str(f"[T{self.ident}]") + " Forward hook fired on " + 
-                y_str(f"{module}") + " current exec " + 
+                y_str(f"{module.module_name}") + " current exec " + 
                 y_str(f"{self.scheduler.active_exec_id}"))
             
-        if not self.profile:
-            self.scheduler.context_switch()
+        self.scheduler.context_switch()
 
     def backward_scheduler_hook(self, module, grad_input, grad_output):
         assert threading.current_thread().ident == self.ident, \
@@ -399,19 +624,19 @@ class ExecutionEngine(threading.Thread):
             f"got {threading.current_thread().ident}"
         if self.debug:
             print(g_str(f"[T{self.ident}]") + " Backward hook fired on " + 
-                  y_str(f"{module}") + " current exec " + 
+                  y_str(f"{module.module_name}") + " current exec " + 
                   y_str(f"{self.scheduler.active_exec_id}"))
-        if not self.profile:
-            self.scheduler.context_switch()
+
+        self.scheduler.context_switch()
 
     def create_backward_lock_hooks(self, layer_lock):
         """ Hooks to acquire/release a lock during the backward pass. """
         def pre_hook(module, grad_input):
             print(g_str(f"[T{self.ident}]") + " Pre-hook fired on " + 
-                  y_str(f"{module}"))
+                  y_str(f"{module.module_name}"))
         def post_hook(module, grad_input, grad_output):
             print(g_str(f"[T{self.ident}]") + " Post-hook fired on " + 
-                  y_str(f"{module}"))
+                  y_str(f"{module.module_name}"))
         return pre_hook, post_hook
 
 # =============================================================================
@@ -478,13 +703,16 @@ def run_training_test(
     # 2. Data and Thread Setup
     microbatches, labels = get_data_fn(num_threads)
     
+    # 3. Profiler Setup
+    profiler = ModelProfiler(base_model, microbatches[0], labels[0], loss_fn)
+
     # 3. Hook and Lock Setup
     scheduler = ContextScheduler(num_threads, debug)
     for t in range(num_threads):
         model = model_factory_fn(materialized=False)
         materialize_meta_model(model, base_model)
         ExecutionEngine(model, microbatches[t], labels[t], 
-                        loss_fn, scheduler, debug)
+                        loss_fn, scheduler, profiler, debug=debug)
 
     # 4. Run Training Step
     scheduler.start()
