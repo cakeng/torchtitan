@@ -38,9 +38,14 @@ def stream_output(process, rank, stream_type):
     for line in iter(process.stdout.readline if stream_type == "stdout" else process.stderr.readline, ''):
         if line:
             # Prefix each line with rank info for clarity
-            prefix = f"[MBP {rank}] "
-            if stream_type == "stderr":
-                prefix = f"[MBP {rank}-ERR] "
+            prefix = f""
+            if run_type == "mbp":
+                prefix = f"[MBP {rank}] "
+                if stream_type == "stderr":
+                    prefix = f"[MBP {rank}-ERR] "
+            else:
+                if stream_type == "stderr":
+                    prefix = f"[ERR] "
             print(f"{prefix}{line.rstrip()}", flush=True)
 
 # Launch four different training jobs asynchronously

@@ -237,6 +237,7 @@ class ContextScheduler:
         # Append to the front of the list to maintain order
         self.waiting_exec_ids.insert(0, exec_id)
         if self.active_exec_id is None and self.next_exec_id is None:
+            self.next_exec_id = exec_id
             if self.debug:
                 t_id = threading.current_thread().ident
                 print(b_str(f"[T{t_id}]") + " No active execs, acquiring context lock for exec " + 
@@ -319,7 +320,7 @@ class ContextScheduler:
         return
     
     def enter_backward_region(self, exec_id):
-        self.execs[exec_id].backward_signal.wait()
+        # self.execs[exec_id].backward_signal.wait()
         self.backward_semaphore.acquire()
         if exec_id + 1 < self.num_execs:
             self.execs[exec_id + 1].backward_signal.set()
@@ -331,7 +332,7 @@ class ContextScheduler:
     
     def exit_backward_region(self, exec_id):
         self.backward_semaphore.release()
-        self.execs[exec_id].backward_signal.clear()
+        # self.execs[exec_id].backward_signal.clear()
         if self.debug:
             t_id = threading.current_thread().ident
             print(b_str(f"[T{t_id}]") + " Exiting backward region for exec " + 
@@ -343,10 +344,11 @@ class ContextScheduler:
             f"Expected {self.num_execs} execs, got {len(self.execs)}"
         for exec_id in self.execs:
             self.execs[exec_id].signal.clear()
-        self.execs[0].backward_signal.set()
+        # self.execs[0].backward_signal.set()
         self.active_exec_id = None
         self.stop_scheduling = False
-        self._scheduler(force_switch=True)
+        if self.next_exec_id is None:
+            self._scheduler(force_switch=True)
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id].signal.set()
         self.completion_signal.clear()
@@ -663,7 +665,7 @@ class ExecutionEngine(threading.Thread):
 
             # Forward pass
             self.model.train()
-            outputs = self.model(self.x, label=self.label)
+            outputs = self.model(self.x, labels=self.label)
             self.loss = self.loss_fn(outputs, self.label)
             
             # Detach the exec from the scheduler context,
@@ -672,8 +674,8 @@ class ExecutionEngine(threading.Thread):
             self.scheduler.detach_exec_from_context(self.exec_id)
             
             print(g_str(f"[T{self.ident}]") + " Fwd pass finished. Loss:"
-                    f" {self.loss},  current exec " + 
-                    y_str(f"{self.scheduler.active_exec_id}"))
+                    f" {self.loss}, exec " + 
+                    y_str(f"{self.exec_id}"))
             
             self.scheduler.enter_backward_region(self.exec_id)
             self.scheduler.attach_exec_to_context(self.exec_id)
@@ -685,7 +687,7 @@ class ExecutionEngine(threading.Thread):
             self.scheduler.exit_backward_region(self.exec_id)
             
             print(g_str(f"[T{self.ident}]") + " Bwd pass finished, current exec " + 
-                    y_str(f"{self.scheduler.active_exec_id}"))
+                    y_str(f"{self.exec_id}"))
 
             # Wait for all execs to complete.
             if self.debug:
@@ -802,7 +804,7 @@ class SimpleTransformerModel(nn.Module):
         ])
         self.out = nn.Linear(d_model, vocab_size)
     
-    def forward(self, x, label=None):
+    def forward(self, x, labels=None):
         x = self.embedding(x)
         for layer in self.layers:
             x = layer(x)
