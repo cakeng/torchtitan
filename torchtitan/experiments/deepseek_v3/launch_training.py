@@ -7,7 +7,7 @@ from datetime import datetime
 import random
 
 run_type = sys.argv[1] if len(sys.argv) > 1 else ""
-mbp_size = 6
+mbp_size = 2
 pp_size = 2
 ep_size = 2
 fsdp_size = 1
@@ -17,8 +17,12 @@ run_profiler = "True"
 
 if run_type == "1f1b":
     train_script = "train_ds_dev_1f1b.py"
-else:
+elif run_type == "sched":
+    train_script = "train_ds_dev_sched.py"
+elif run_type == "mbp":
     train_script = "train_ds_dev.py"
+else:
+    raise ValueError(f"Invalid run type: {run_type}")
 
 num_gpus = pp_size * ep_size * fsdp_size
 
@@ -41,7 +45,7 @@ def stream_output(process, rank, stream_type):
 
 # Launch four different training jobs asynchronously
 processes = []
-num_process_groups = 1 if run_type == "1f1b" else mbp_size
+num_process_groups = mbp_size if run_type == "mbp" else 1
 for i in range(num_process_groups):
     port = 29500 + random.randint(0, 10000)
     cmd = [

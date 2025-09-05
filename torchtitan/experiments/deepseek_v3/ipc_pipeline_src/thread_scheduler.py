@@ -77,7 +77,12 @@ def _get_parent_module_and_param_name(model: nn.Module, path: str):
         # getattr can handle both attribute access (like .layers) and
         # indexed access for nn.ModuleList (like [0])
         if part.isdigit():
-            parent_module = parent_module[int(part)]
+            # Try integer indexing first (for ModuleList), then string key (for ModuleDict)
+            try:
+                parent_module = parent_module[int(part)]
+            except (KeyError, TypeError):
+                # If integer indexing fails, try string key (for ModuleDict)
+                parent_module = parent_module[part]
         else:
             parent_module = getattr(parent_module, part)
     param_name = parts[-1]
@@ -184,7 +189,6 @@ class ContextScheduler:
         if self.stop_scheduling:
             self.next_exec_id = None
             return
-        # Switch to the next exec using a simple FIFO queue.
         if len(self.waiting_exec_ids) > 0:
             self.next_exec_id = self.active_exec_id
             for exec_id in self.waiting_exec_ids:
@@ -230,7 +234,8 @@ class ContextScheduler:
 
     def _acquire_context(self, exec_id):
         # Acquire the context lock and execute.
-        self.waiting_exec_ids.append(exec_id)
+        # Append to the front of the list to maintain order
+        self.waiting_exec_ids.insert(0, exec_id)
         if self.active_exec_id is None and self.next_exec_id is None:
             if self.debug:
                 t_id = threading.current_thread().ident
@@ -395,12 +400,12 @@ def print_module_info(module_name, module_info, module_queue = []):
     
 class ModelProfiler():
     def __init__(
-        self, model, microbatch, labels, loss_fn, do_profile=True, debug = False
+        self, model, microbatch, label, loss_fn, do_profile=True, debug = False
     ):
         super().__init__()
         self.model = model
         self.microbatch = microbatch
-        self.labels = labels
+        self.label = label
         self.loss_fn = loss_fn
         self.loss = None
         self.total_time = 0
@@ -597,17 +602,26 @@ class ModelProfiler():
             print_module_info(module_key, self.modules[module_key], 
                               self.new_module_queue)
                 
+
+class ForcedContextSwitchModuleWrapper(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        
+    def forward(self, *args, **kwargs):
+        self.module.forward(*args, **kwargs)
+
 class ExecutionEngine(threading.Thread):
     
     """ A dedicated thread to run a single training step (fwd/bwd). """
     def __init__(
-        self, model, microbatch, labels, loss_fn, scheduler,
-        profiler, debug = False,
+        self, model, x, label, loss_fn, scheduler,
+        profiler = None, start_exec = True, debug = False,
     ):
         super().__init__(daemon=True)
         self.model = model
-        self.microbatch = microbatch
-        self.labels = labels
+        self.x = x
+        self.label = label
         self.loss_fn = loss_fn
         self.scheduler = scheduler
         self.exec_id = scheduler.add_exec(self)
@@ -616,13 +630,20 @@ class ExecutionEngine(threading.Thread):
         self.backward_tid = -1
         self.hooks = {}
         self.debug = debug
+        self.stop_exec = False
         
+        if start_exec:
+            self.start_exec()
+
+    def start_exec(self):
         self.tag_module_name(self.model)
         self.attach_hooks()
         self.start()
         
-    def is_running(self): return self.event.is_set()
-    
+    def stop_exec(self):
+        self.detach_hooks()
+        self.stop_exec = True
+        
     def tag_module_name(self, module, module_name=None):
         # Set the exec_name for the current module
         if module_name is None:
@@ -635,15 +656,15 @@ class ExecutionEngine(threading.Thread):
 
     def run(self):
         print(g_str(f"[T{self.ident}]") + " Running...")
-        while True:
+        while not self.stop_exec:
             # Attach the exec to the scheduler context, 
             # The execution of this thread will be controlled by the scheduler.
             self.scheduler.attach_exec_to_context(self.exec_id)
 
             # Forward pass
             self.model.train()
-            outputs = self.model(self.microbatch, labels=self.labels)
-            self.loss = self.loss_fn(outputs, self.labels)
+            outputs = self.model(self.x, label=self.label)
+            self.loss = self.loss_fn(outputs, self.label)
             
             # Detach the exec from the scheduler context,
             # The execution will now be independent of the scheduler and
@@ -682,7 +703,15 @@ class ExecutionEngine(threading.Thread):
         self.detach_hooks() # Clear any old hooks first
         for module in self.model.modules():
             module_name = module.module_name
-            if module_name in self.profiler.modules:
+            if isinstance(module, ForcedContextSwitchModuleWrapper):
+                fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
+                bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
+                self.hooks[module_name] = (
+                    fwd_hook,
+                    bwd_hook
+                )
+                continue
+            elif self.profiler is not None and module_name in self.profiler.modules:
                 module_info = self.profiler.modules[module_name]
                 if module_info.fire_context_switch:
                     fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
@@ -773,15 +802,15 @@ class SimpleTransformerModel(nn.Module):
         ])
         self.out = nn.Linear(d_model, vocab_size)
     
-    def forward(self, x, labels=None):
+    def forward(self, x, label=None):
         x = self.embedding(x)
         for layer in self.layers:
             x = layer(x)
         return self.out(x)
 
-def simple_loss_fn(outputs, labels):
+def simple_loss_fn(outputs, label):
     # Reshape for CrossEntropyLoss
-    return F.cross_entropy(outputs.view(-1, outputs.size(-1)), labels.view(-1))
+    return F.cross_entropy(outputs.view(-1, outputs.size(-1)), label.view(-1))
 
 def run_training_test(
     model_name, model_factory_fn, get_data_fn, loss_fn, num_threads, debug
@@ -799,18 +828,18 @@ def run_training_test(
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=1e-4)
     
     # 2. Data and Thread Setup
-    microbatches, labels = get_data_fn(num_threads)
+    microbatches, label = get_data_fn(num_threads)
     
     # 3. Profiler Setup
-    profiler = ModelProfiler(base_model, microbatches[0], labels[0], loss_fn)
+    profiler = ModelProfiler(base_model, microbatches[0], label[0], loss_fn)
 
     # 3. Hook and Lock Setup
     scheduler = ContextScheduler(num_threads, debug)
     for t in range(num_threads):
         model = model_factory_fn(materialized=False)
         materialize_meta_model(model, base_model)
-        ExecutionEngine(model, microbatches[t], labels[t], 
-                        loss_fn, scheduler, profiler, debug=debug)
+        ExecutionEngine(model, microbatches[t], label[t], 
+                        loss_fn, scheduler, profiler=profiler, debug=debug)
 
     # 4. Run Training Step
     scheduler.start()
@@ -849,13 +878,13 @@ def get_simple_transformer_data(num_threads):
     full_batch = torch.randint(
         0, vocab_size, (batch_size, seq_len), device='cuda'
     )
-    full_labels = torch.randint(
+    full_label = torch.randint(
         0, vocab_size, (batch_size, seq_len), device='cuda'
     )
     
     microbatches = list(torch.split(full_batch, micro_bs))
-    labels = list(torch.split(full_labels, micro_bs))
-    return microbatches, labels
+    label = list(torch.split(full_label, micro_bs))
+    return microbatches, label
 
 def get_deepseek_model(materialized=True):
     """
@@ -891,7 +920,7 @@ def get_deepseek_model(materialized=True):
 
 def get_deepseek_data(num_threads):
     # This is a dummy data generator for demonstration
-    batch_size, seq_len = 32, 128
+    batch_size, seq_len = 16, 64
     assert batch_size % num_threads == 0
     micro_bs = batch_size // num_threads
     
@@ -900,11 +929,13 @@ def get_deepseek_data(num_threads):
     )
     
     microbatches = list(torch.split(full_batch, micro_bs))
-    # For causal LM, labels are the same as inputs
+    microbatch_shapes = [microbatch.shape for microbatch in microbatches]
+    print(y_str(f"[Main Thread]") + " Microbatches: " + f"{microbatch_shapes}")
+    # For causal LM, label are the same as inputs
     return microbatches, microbatches
 
-def deepseek_loss_fn(outputs, labels):
-    # The model itself returns a loss object if labels are provided
+def deepseek_loss_fn(outputs, label):
+    # The model itself returns a loss object if label are provided
     return outputs.loss
 
 if __name__ == "__main__":
