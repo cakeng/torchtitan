@@ -51,9 +51,9 @@ def y_str(s):
 class TorchTitanExecutionEngine(ExecutionEngine):
     def __init__(self, model, x, label, loss_fn, microbatch_size, microbatch_index,
                  pp_rank, pp_size, device, pp_mesh, context_scheduler, 
-                 profiler=None, debug=True):
+                 profiler=None, is_dist=False, debug=True):
         super().__init__(model, x, label, loss_fn, context_scheduler, 
-                         profiler=profiler, start_exec=False, debug=debug)
+                         profiler=profiler, start_exec=False, is_dist=is_dist, debug=debug)
         
         self.microbatch_size = microbatch_size
         self.microbatch_index = microbatch_index
@@ -72,29 +72,29 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         )
         # Create pipeline schedule
         self.losses = []
+        global_rank = dist.get_rank()
         self.pp_schedule = ScheduleTsched(self.stage, 
                                           self.microbatch_index,
                                           self.microbatch_size, 
-                                          loss_fn=self.loss_fn)
-        
-        self.start_exec()
+                                          loss_fn=self.loss_fn,
+                                          global_rank=global_rank)
+        print(g_str(f"[T{self.ident}]") + " ExecutionEngine initialized, "
+              f"exec id " + y_str(f"{self.exec_id}") + ", microbatch id " + 
+              y_str(f"{self.microbatch_index}") + ", global rank " + 
+              y_str(f"{global_rank}"))
+        self.start_exec(model=self.stage.submod)
         
     def run(self):
-        if self.pp_size > 1:
-            # Create pipeline stage
-            self.scheduler.attach_exec_to_context(self.exec_id)
+        # Create pipeline stage
+        self.scheduler.attach_exec_to_context(self.exec_id)
 
-            if self.pp_rank == 0:
-                y = self.pp_schedule.step(self.x)
-            elif self.pp_rank == self.pp_size - 1:
-                y = self.pp_schedule.step(target=self.label, losses=self.losses)
-                loss = torch.mean(torch.stack(self.losses))
-            else:
-                self.pp_schedule.step()
+        if self.pp_rank == 0:
+            y = self.pp_schedule.step(self.x)
+        elif self.pp_rank == self.pp_size - 1:
+            y = self.pp_schedule.step(target=self.label, losses=self.losses)
+            loss = torch.mean(torch.stack(self.losses))
         else:
-            y = self.model(self.x)
-            loss = self.loss_fn(y, self.label)
-            loss.backward()
+            self.pp_schedule.step()
 
         if self.pp_rank == self.pp_size - 1:
             print(f"logits: {y.shape}")
@@ -109,6 +109,13 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         self.scheduler.detach_exec_from_context(self.exec_id)
 
         print("Backward done")
+
+        if self.debug:
+            print(b_str(f"[T{self.ident}]") + " Waiting for all execs to complete.")
+        self.scheduler.completion_barrier.wait() # Wait for all execs to complete
+        self.scheduler.completion_signal.wait() # Wait for the main thread to resume
+        if self.debug:
+            print(b_str(f"[T{self.ident}]") + " All execs completed! Waiting for next iteration...")
 
 # Run full model
 def run_full_model(
@@ -189,7 +196,7 @@ def run_full_model(
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy
     
-    context_scheduler = ContextScheduler(mbp_size, debug=True)
+    context_scheduler = ContextScheduler(mbp_size, debug=True, is_dist=True)
     profiler = None
     # profiler = ModelProfiler(base_model, x[0], label[0], loss_fn)
     for t in range(microbatches):
@@ -199,7 +206,7 @@ def run_full_model(
         materialize_meta_model(model, base_model)
         TorchTitanExecutionEngine(model, x[t], label[t], loss_fn,
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
-                        context_scheduler, profiler=profiler, debug=True)
+                        context_scheduler, profiler=profiler, is_dist=True, debug=True)
 
     
     with torch.profiler.record_function("BARRIER:EXEC_START"):

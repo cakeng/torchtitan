@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from enum import Enum
 from typing import Any, Callable, NamedTuple, Optional, TYPE_CHECKING, Union
-
+import threading
 import torch
 import torch.distributed as dist
 from torch._dynamo import OptimizedModule
@@ -260,21 +260,22 @@ class ScheduleTsched(TschedScheduleSingle):
             self._initialize_stage(args, kwargs)
 
         works = {}
+        ident = threading.current_thread().ident
         # Wait for the current microbatch to be scheduled
         # Forward pass
-        with record_function(f"[Rank {self._microbatch_idx}-{self._global_rank}] Forward {step_idx}"):
+        with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward {step_idx}"):
             ops = self._stage.get_fwd_recv_ops()      
             work_sync = _sorted_batch_p2p(ops, desc="fwd_recv")
             for work in work_sync.values():
                 work.wait()
-            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+            logging.info(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
                          b_str(f"Forwarding {self._microbatch_idx}") + f", receiving {ops}")
 
             with torch.profiler.record_function(f"Forward {step_idx}"):
                 output = self._stage.forward_one_chunk(args, kwargs)
 
             ops = self._stage.get_fwd_send_ops()
-            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+            logging.info(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
 
@@ -286,22 +287,22 @@ class ScheduleTsched(TschedScheduleSingle):
             return   
 
         # Backward pass
-        with record_function(f"[Rank {self._microbatch_idx}-{self._global_rank}] Backward"):
+        with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
             ops = self._stage.get_bwd_recv_ops()
             work_sync = _sorted_batch_p2p(ops, desc="bwd_recv")
             for work in work_sync.values():
                 work.wait()
-            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+            logging.info(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          r_str(f"Backwarding {self._microbatch_idx}") + f", receiving {ops}")
 
             # For single microbatch, loss is directly available
             loss = self._maybe_get_loss(self._stage)
             with torch.profiler.record_function(
-                f"[Rank {self._microbatch_idx}-{self._global_rank}] Backward pass"):
+                f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward pass"):
                 self._stage.backward_one_chunk(loss=loss)
 
             ops = self._stage.get_bwd_send_ops()
-            logging.info(g_str(f"Rank {self._global_rank}: ") + 
+            logging.info(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="bwd_send"))
             
