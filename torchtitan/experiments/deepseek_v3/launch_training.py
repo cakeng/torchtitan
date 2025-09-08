@@ -52,7 +52,7 @@ def stream_output(process, rank, stream_type):
 processes = []
 num_process_groups = mbp_size if run_type == "mbp" else 1
 for i in range(num_process_groups):
-    port = 29500 + random.randint(0, 10000)
+    port = 29500 + random.randint(0, 30000)
     cmd = [
         "torchrun",
         f"--nproc_per_node={num_gpus}",

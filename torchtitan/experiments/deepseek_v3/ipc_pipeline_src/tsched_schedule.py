@@ -10,6 +10,7 @@ from typing import Any, Callable, NamedTuple, Optional, TYPE_CHECKING, Union
 import threading
 import torch
 import torch.distributed as dist
+from ipc_pipeline_src.thread_scheduler import ContextScheduler
 from torch._dynamo import OptimizedModule
 from torch.distributed.fsdp import FSDPModule, UnshardHandle
 from torch.nn.modules.loss import _Loss
@@ -63,10 +64,9 @@ class _TschedSchedule(ABC):
         # Holds the losses for each microbatch.
         self._internal_loss: torch.Tensor = None
 
-    def _maybe_compute_loss(self, stage, output, target_mb):
+    def _maybe_compute_loss(self, stage, output, target):
         if stage.is_last and self._has_backward:
-            # For single microbatch, target_mbs is just the target
-            loss = self._compute_loss(output, target_mb)
+            loss = self._compute_loss(output, target)
             self._internal_loss = loss
 
     def _maybe_get_loss(self, stage):
@@ -105,6 +105,7 @@ class _TschedSchedule(ABC):
         kwargs: Optional[dict[str, Any]] = None,
         target: Optional[torch.Tensor] = None,
         losses: Optional[list] = None,
+        scheduler: Optional[ContextScheduler] = None,
         step_idx=0,
     ):
         """
@@ -113,7 +114,8 @@ class _TschedSchedule(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def step(self, *args, target=None, losses: Optional[list] = None, **kwargs):
+    def step(self, *args, target=None, losses: Optional[list] = None, 
+             scheduler: Optional[ContextScheduler] = None, **kwargs):
         """
         Run one iteration of the pipeline schedule with *whole-batch* input.
         No chunking needed for single microbatch.
@@ -211,8 +213,7 @@ class TschedScheduleSingle(_TschedSchedule):
         self._stage_initialized = True
 
     def step(self, *args, target=None, losses: Optional[list] = None,
-            mbp_ctrl=None,
-            init_stage_only=False,
+            scheduler: Optional[ContextScheduler] = None,
             step_idx=0,
             **kwargs):
         """
@@ -222,7 +223,7 @@ class TschedScheduleSingle(_TschedSchedule):
         # Clean per iteration
         self._stage.clear_runtime_states()
         # Run single microbatch
-        self._step_microbatches(args, kwargs, target, losses, step_idx)
+        self._step_microbatches(args, kwargs, target, losses, scheduler, step_idx)
 
         # Return outputs directly (no merging needed)
         if self._stage.is_last:
@@ -236,13 +237,29 @@ class ScheduleTsched(TschedScheduleSingle):
     The GPipe schedule for single microbatch.
     Processes one microbatch with immediate communication completion.
     """
+    
+    def initialize_stage(
+        self,
+        *args,
+        target: Optional[torch.Tensor] = None,
+        losses: Optional[list] = None,
+        scheduler: Optional[ContextScheduler] = None,
+        step_idx=0,
+        **kwargs,
+    ):
+        """
+        Initialize the stage.
+        """
+        if not self._stage_initialized:
+            self._initialize_stage(args, kwargs)
 
     def _step_microbatches(
         self,
         args: Optional[tuple[Any, ...]] = None,
         kwargs: Optional[dict[str, Any]] = None,
-        target_mb: Optional[torch.Tensor] = None,
+        target: Optional[torch.Tensor] = None,
         losses: Optional[list] = None,
+        scheduler: Optional[ContextScheduler] = None,
         step_idx=0,
     ):
         """
@@ -253,8 +270,8 @@ class ScheduleTsched(TschedScheduleSingle):
             args = ()
         if kwargs is None:
             kwargs = {}
-        if target_mb is None:
-            target_mb = None
+        if target is None:
+            target = None
             
         if not self._stage_initialized:
             self._initialize_stage(args, kwargs)
@@ -263,24 +280,35 @@ class ScheduleTsched(TschedScheduleSingle):
         ident = threading.current_thread().ident
         # Wait for the current microbatch to be scheduled
         # Forward pass
-        with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward {step_idx}"):
-            ops = self._stage.get_fwd_recv_ops()      
-            work_sync = _sorted_batch_p2p(ops, desc="fwd_recv")
-            for work in work_sync.values():
-                work.wait()
-            logging.info(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
-                         b_str(f"Forwarding {self._microbatch_idx}") + f", receiving {ops}")
+        
+        
+ 
+        ops = self._stage.get_fwd_recv_ops()     
+        if scheduler is not None:
+            scheduler.attach_exec_to_context(self._microbatch_idx) 
+        work_sync = _sorted_batch_p2p(ops, desc="fwd_recv") # This will crash in concurrent mode
+        
+        for work in work_sync.values():
+            work.wait()
+        print(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
+                        b_str(f"Forwarding {self._microbatch_idx}") + f", receiving {ops}")
+        
+        
+        
+        with torch.profiler.record_function(f"Forward {step_idx}"):
+            output = self._stage.forward_one_chunk(args, kwargs)
+            
+        if scheduler is not None:
+            scheduler.detach_exec_from_context(self._microbatch_idx)
+            
 
-            with torch.profiler.record_function(f"Forward {step_idx}"):
-                output = self._stage.forward_one_chunk(args, kwargs)
-
-            ops = self._stage.get_fwd_send_ops()
-            logging.info(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                         b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
-            works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
+        ops = self._stage.get_fwd_send_ops()
+        print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                        b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
+        works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
 
         # Compute loss if this is the last stage
-        self._maybe_compute_loss(self._stage, output, target_mb)
+        self._maybe_compute_loss(self._stage, output, target)
 
         # No loss function, no need to run backward
         if not self._has_backward:
@@ -292,7 +320,7 @@ class ScheduleTsched(TschedScheduleSingle):
             work_sync = _sorted_batch_p2p(ops, desc="bwd_recv")
             for work in work_sync.values():
                 work.wait()
-            logging.info(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+            print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          r_str(f"Backwarding {self._microbatch_idx}") + f", receiving {ops}")
 
             # For single microbatch, loss is directly available
@@ -305,6 +333,8 @@ class ScheduleTsched(TschedScheduleSingle):
             logging.info(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="bwd_send"))
+            
+        
             
         # Wait immediately for single microbatch
         for work in works.values():

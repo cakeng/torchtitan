@@ -78,6 +78,14 @@ class TorchTitanExecutionEngine(ExecutionEngine):
                                           self.microbatch_size, 
                                           loss_fn=self.loss_fn,
                                           global_rank=global_rank)
+        if self.pp_rank == 0:
+            y = self.pp_schedule.initialize_stage(self.x, scheduler=self.scheduler)
+        elif self.pp_rank == self.pp_size - 1:
+            y = self.pp_schedule.initialize_stage(target=self.label, losses=self.losses, 
+                                                  scheduler=self.scheduler)
+        else:
+            self.pp_schedule.initialize_stage(scheduler=self.scheduler)
+
         print(g_str(f"[T{self.ident}]") + " ExecutionEngine initialized, "
               f"exec id " + y_str(f"{self.exec_id}") + ", microbatch id " + 
               y_str(f"{self.microbatch_index}") + ", global rank " + 
@@ -86,15 +94,14 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         
     def run(self):
         # Create pipeline stage
-        self.scheduler.attach_exec_to_context(self.exec_id)
-
         if self.pp_rank == 0:
-            y = self.pp_schedule.step(self.x)
+            y = self.pp_schedule.step(self.x, scheduler=self.scheduler)
         elif self.pp_rank == self.pp_size - 1:
-            y = self.pp_schedule.step(target=self.label, losses=self.losses)
+            y = self.pp_schedule.step(target=self.label, losses=self.losses, 
+                                      scheduler=self.scheduler)
             loss = torch.mean(torch.stack(self.losses))
         else:
-            self.pp_schedule.step()
+            self.pp_schedule.step(scheduler=self.scheduler)
 
         if self.pp_rank == self.pp_size - 1:
             print(f"logits: {y.shape}")
@@ -106,7 +113,6 @@ class TorchTitanExecutionEngine(ExecutionEngine):
 
         self.model.zero_grad()
         
-        self.scheduler.detach_exec_from_context(self.exec_id)
 
         print("Backward done")
 
