@@ -180,9 +180,11 @@ class ContextScheduler:
         self.execs = {}
         self.debug = debug
         self.is_dist = is_dist
-        self.completion_barrier = threading.Barrier(num_execs + 1)
-        self.completion_signal = threading.Event()
-        self.completion_signal.clear()
+        self.completion_barrier = threading.Barrier(num_execs)
+        self.completion_signal_m2c = threading.Event()
+        self.completion_signal_m2c.clear()
+        self.completion_signal_c2m = threading.Event()
+        self.completion_signal_c2m.clear()
         self.context_lock = threading.Lock()
         self.context_lock.acquire()
         self.backward_semaphore = threading.Semaphore(1)
@@ -211,7 +213,6 @@ class ContextScheduler:
                 self.next_exec_id = self.waiting_exec_ids[0]   
             
             if self.debug:
-                t_id = threading.current_thread().ident
                 print(self.format_print("Scheduling next exec " + 
                       y_str(f"{self.next_exec_id}") + ", current waiting execs: " + 
                       y_str(f"{self.waiting_exec_ids}"), r_str))
@@ -221,7 +222,6 @@ class ContextScheduler:
                 self.next_exec_id = None # No active exec
             else:
                 if self.debug:
-                    t_id = threading.current_thread().ident
                     print(self.format_print(" No execs waiting, scheduling active exec " + 
                         y_str(f"{self.active_exec_id}"), r_str))
                 self.next_exec_id = self.active_exec_id
@@ -232,7 +232,6 @@ class ContextScheduler:
             f"Expected {self.active_exec_id} to be the active exec during release, " + \
             f"got {exec_id} running"
         if self.debug:
-            t_id = threading.current_thread().ident
             print(self.format_print("Yielding context of exec " + 
                   y_str(f"{self.active_exec_id}") + ", next scheduled exec " + 
                   y_str(f"{self.next_exec_id}") + "\n", b_str), end="")
@@ -268,8 +267,8 @@ class ContextScheduler:
     def add_exec(self, exec):
         # Add an exec to the scheduler.
         for exec_id in self.execs:
-            assert self.execs[exec_id].exec.ident != exec.ident, \
-                f"Exec {exec} already exists, ident {exec.ident}"
+            assert self.execs[exec_id].exec.tid != exec.tid, \
+                f"Exec {exec} already exists, thread ident {exec.tid}"
         new_exec_id = len(self.execs)
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
@@ -345,7 +344,8 @@ class ContextScheduler:
             self._scheduler(force_switch=True)
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id].signal.set()
-        self.completion_signal.clear()
+        self.completion_signal_c2m.clear()
+        self.completion_signal_m2c.clear()
         self.context_lock.release()
         return
         
@@ -357,9 +357,9 @@ class ContextScheduler:
     def wait_completion(self):
         if self.debug:
             print(y_str(f"[Main Thread]") + " Waiting for completion of all execs.")
-        self.completion_barrier.wait() # Wait for all execs to complete
+        self.completion_signal_c2m.wait() # Wait for all execs to complete
         self.context_lock.acquire() # Acquire the context lock
-        self.completion_signal.set() # Signal that the main thread has resumed
+        self.completion_signal_m2c.set() # Signal that the main thread has acquired the context lock
         if self.debug:
             print(y_str(f"[Main Thread]") + " All execs completed! Resuming main thread.")
             
@@ -616,15 +616,15 @@ class ExecutionEngine(threading.Thread):
         self, model, x, label, loss_fn, scheduler,
         profiler = None, start_exec = True, 
         context_switch_module_list = ["moe_forward1"],
-        is_dist = False, debug = False,
+        is_dist = False, debug = False, 
+        main_thread = False,
     ):
-        super().__init__(daemon=True)
+        super().__init__(daemon=not main_thread)
         self.model = model
         self.x = x
         self.label = label
         self.loss_fn = loss_fn
         self.scheduler = scheduler
-        self.exec_id = scheduler.add_exec(self)
         self.loss = None
         self.profiler = profiler
         self.backward_tid = -1
@@ -632,25 +632,33 @@ class ExecutionEngine(threading.Thread):
         self.debug = debug
         self.is_dist = is_dist
         self.stop_exec = False
+        self.main_thread = main_thread
+        if self.main_thread:
+            self.tid = threading.current_thread().ident
+        else:
+            self.tid = None
+        self.exec_id = scheduler.add_exec(self)
         self.context_switch_module_list = context_switch_module_list
         if start_exec:
-            self.start_exec()
-
-    def start_exec(self, model=None):
+            self.init_exec()
+            self.start()
+            
+    def init_exec(self, model=None):
         if model is not None:
             self.model = model
         self.tag_module_name(self.model)
         self.attach_hooks()
-        self.start()
         
     def stop_exec(self):
         self.detach_hooks()
         self.stop_exec = True
 
-    def format_print(self, message, color_fnc=b_str, ident=None):
-        if ident is None:
-            ident = self.ident
-        prefix = f"T{ident}"
+    def format_print(self, message, color_fnc=b_str, tid=None):
+        if self.tid is None:
+            self.tid = self.ident
+        if tid is None:
+            tid = self.tid
+        prefix = f"T{tid}"
         if self.is_dist:
             prefix += f" R{dist.get_rank()}"
         prefix += f" E{self.exec_id}"
@@ -670,42 +678,46 @@ class ExecutionEngine(threading.Thread):
     def run(self):
         print(self.format_print(" Running..."))
         while not self.stop_exec:
-            # Attach the exec to the scheduler context, 
-            # The execution of this thread will be controlled by the scheduler.
-            self.scheduler.attach_exec_to_context(self.exec_id)
+            self.step()
+            self.sync_step_completion()
+            
+    def sync_step_completion(self):
+        # Wait for all execs to complete.
+        if self.debug:
+            print(self.format_print("Waiting for all execs to complete."))
+        self.scheduler.completion_barrier.wait() # Wait for all execs to complete
+        self.scheduler.completion_signal_c2m.set() # Signal that the main thread can proceed to acquire the context lock
+        self.scheduler.completion_signal_m2c.wait() # Wait for the main thread to acquire the context lock
+        if self.debug:
+            print(self.format_print("All execs completed! Waiting for next iteration..."))
+            
+    def step(self):
+        # Attach the exec to the scheduler context, 
+        # The execution of this thread will be controlled by the scheduler.
+        self.scheduler.attach_exec_to_context(self.exec_id)
 
-            # Forward pass
-            self.model.train()
-            outputs = self.model(self.x, labels=self.label)
-            self.loss = self.loss_fn(outputs, self.label)
-            
-            # Detach the exec from the scheduler context,
-            # The execution will now be independent of the scheduler and
-            # the scheduler will no longer switch to this thread.
-            self.scheduler.detach_exec_from_context(self.exec_id)
-            
-            print(self.format_print(f"Fwd pass finished. Loss: {self.loss}"))
-            
-            self.scheduler.enter_backward_region(self.exec_id)
-            self.scheduler.attach_exec_to_context(self.exec_id)
-            
-            # Backward pass
-            self.loss.backward()
-            
-            self.scheduler.detach_exec_from_context(self.exec_id)
-            self.scheduler.exit_backward_region(self.exec_id)
-            
-            print(self.format_print("Bwd pass finished"))
-
-            # Wait for all execs to complete.
-            if self.debug:
-                t_id = threading.current_thread().ident
-                print(self.format_print("Waiting for all execs to complete."))
-            self.scheduler.completion_barrier.wait() # Wait for all execs to complete
-            self.scheduler.completion_signal.wait() # Wait for the main thread to resume
-            if self.debug:
-                t_id = threading.current_thread().ident
-                print(self.format_print("All execs completed! Waiting for next iteration..."))
+        # Forward pass
+        self.model.train()
+        outputs = self.model(self.x, labels=self.label)
+        self.loss = self.loss_fn(outputs, self.label)
+        
+        # Detach the exec from the scheduler context,
+        # The execution will now be independent of the scheduler and
+        # the scheduler will no longer switch to this thread.
+        self.scheduler.detach_exec_from_context(self.exec_id)
+        
+        print(self.format_print(f"Fwd pass finished. Loss: {self.loss}"))
+        
+        self.scheduler.enter_backward_region(self.exec_id)
+        self.scheduler.attach_exec_to_context(self.exec_id)
+        
+        # Backward pass
+        self.loss.backward()
+        
+        self.scheduler.detach_exec_from_context(self.exec_id)
+        self.scheduler.exit_backward_region(self.exec_id)
+        
+        print(self.format_print("Bwd pass finished"))
 
     def attach_hooks(self):
         """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
@@ -744,8 +756,10 @@ class ExecutionEngine(threading.Thread):
         self.hooks = {}
         
     def forward_scheduler_hook(self, module, input, output):
-        assert threading.current_thread().ident == self.ident, \
-            f"Expected {self.ident} to be the current exec during forward hook, " + \
+        if self.tid is None:
+            self.tid = self.ident
+        assert threading.current_thread().ident == self.tid, \
+            f"Expected {self.tid} to be the current exec during forward hook, " + \
             f"got {threading.current_thread().ident}"
         if self.debug:
             print(self.format_print(b_str(f"Forward hook") + " fired on " + 
@@ -756,7 +770,7 @@ class ExecutionEngine(threading.Thread):
         if self.backward_tid == -1:
             self.backward_tid = threading.current_thread().ident
         assert threading.current_thread().ident == self.backward_tid, \
-            f"Expected {self.ident} to be the current exec during backward hook, " + \
+            f"Expected {self.backward_tid} to be the current exec during backward hook, " + \
             f"got {threading.current_thread().ident}"
         if self.debug:
             print(self.format_print(r_str(f"Backward hook") + " fired on " + 

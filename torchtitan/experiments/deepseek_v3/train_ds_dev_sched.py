@@ -51,9 +51,10 @@ def y_str(s):
 class TorchTitanExecutionEngine(ExecutionEngine):
     def __init__(self, model, x, label, loss_fn, microbatch_size, microbatch_index,
                  pp_rank, pp_size, device, pp_mesh, context_scheduler, 
-                 profiler=None, is_dist=False, debug=True):
+                 profiler=None, is_dist=False, debug=True, main_thread=False):
         super().__init__(model, x, label, loss_fn, context_scheduler, 
-                         profiler=profiler, start_exec=False, is_dist=is_dist, debug=debug)
+                         profiler=profiler, start_exec=False, is_dist=is_dist, 
+                         debug=debug, main_thread=main_thread)
         
         self.microbatch_size = microbatch_size
         self.microbatch_index = microbatch_index
@@ -86,43 +87,35 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         else:
             self.pp_schedule.initialize_stage(scheduler=self.scheduler)
 
-        print(g_str(f"[T{self.ident}]") + " ExecutionEngine initialized, "
+        print(g_str(f"[T{self.tid}]") + " ExecutionEngine initialized, "
               f"exec id " + y_str(f"{self.exec_id}") + ", microbatch id " + 
               y_str(f"{self.microbatch_index}") + ", global rank " + 
               y_str(f"{global_rank}"))
-        self.start_exec(model=self.stage.submod)
         
-    def run(self):
-        while not self.stop_exec:
-            # Create pipeline stage
-            if self.pp_rank == 0:
-                y = self.pp_schedule.step(self.x, scheduler=self.scheduler)
-            elif self.pp_rank == self.pp_size - 1:
-                y = self.pp_schedule.step(target=self.label, losses=self.losses, 
-                                        scheduler=self.scheduler)
-                loss = torch.mean(torch.stack(self.losses))
-            else:
-                self.pp_schedule.step(scheduler=self.scheduler)
+        self.init_exec(model=self.stage.submod)
+        if not self.main_thread:
+            self.start()
 
-            if self.pp_rank == self.pp_size - 1:
-                print(f"logits: {y.shape}")
-                print(f"{loss=}")
+    def step(self):
+        if self.pp_rank == 0:
+            y = self.pp_schedule.step(self.x, scheduler=self.scheduler)
+        elif self.pp_rank == self.pp_size - 1:
+            y = self.pp_schedule.step(target=self.label, losses=self.losses, 
+                                    scheduler=self.scheduler)
+            loss = torch.mean(torch.stack(self.losses))
+        else:
+            self.pp_schedule.step(scheduler=self.scheduler)
 
-            if self.pp_rank == 0:
-                param = self.model.get_parameter("model.layers.0.self_attn.q_proj.weight")
-                print(f"{torch.linalg.norm(param.grad)=}")
+        if self.pp_rank == self.pp_size - 1:
+            print(f"logits: {y.shape}")
+            print(f"{loss=}")
 
-            self.model.zero_grad()
-            
+        if self.pp_rank == 0:
+            param = self.model.get_parameter("model.layers.0.self_attn.q_proj.weight")
+            print(f"{torch.linalg.norm(param.grad)=}")
 
-            print("Backward done")
-
-            if self.debug:
-                print(b_str(f"[T{self.ident}]") + " Waiting for all execs to complete.")
-            self.scheduler.completion_barrier.wait() # Wait for all execs to complete
-            self.scheduler.completion_signal.wait() # Wait for the main thread to resume
-            if self.debug:
-                print(b_str(f"[T{self.ident}]") + " All execs completed! Waiting for next iteration...")
+        self.model.zero_grad()
+        print("Backward done")
 
 # Run full model
 def run_full_model(
@@ -206,7 +199,7 @@ def run_full_model(
     context_scheduler = ContextScheduler(mbp_size, debug=True, is_dist=True)
     profiler = None
     # profiler = ModelProfiler(base_model, x[0], label[0], loss_fn)
-    for t in range(microbatches):
+    for t in range(microbatches - 1):
         with device, mesh, init_empty_weights():
             model = DeepseekForCausalLM(model_args)
         model.train()
@@ -214,8 +207,16 @@ def run_full_model(
         TorchTitanExecutionEngine(model, x[t], label[t], loss_fn,
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, profiler=profiler, is_dist=True, debug=True)
+        
+    with device, mesh, init_empty_weights():
+        model = DeepseekForCausalLM(model_args)
+    model.train()
+    materialize_meta_model(model, base_model)
+    main_engine = TorchTitanExecutionEngine(model, x[microbatches - 1], label[microbatches - 1], loss_fn,
+                    microbatches, microbatches - 1, pp_rank, pp_size, device, pp_mesh, 
+                    context_scheduler, profiler=profiler, is_dist=True, debug=True, 
+                    main_thread=True)
 
-    
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
 
@@ -225,6 +226,7 @@ def run_full_model(
     for step_idx in range(num_steps):
         print(y_str(f"[Rank {rank}]") + " Starting step " + f"{step_idx}")
         context_scheduler.start()
+        main_engine.step()
         context_scheduler.wait_completion()
         print(y_str(f"[Rank {rank}]") + " Step " + f"{step_idx} completed.")
         dist.barrier()
@@ -252,7 +254,7 @@ if __name__ == "__main__":
 
     # Setup profiler
     run_id = os.getenv("RUN_ID", "0")
-    log_dir = f"./tensorboard_traces/run_1f1b_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}"
+    log_dir = f"./tensorboard_traces/run_tsched_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}"
     os.makedirs(log_dir, exist_ok=True)
 
     # Profile the execution
@@ -293,7 +295,7 @@ if __name__ == "__main__":
                     whole_trace=False,
                 )
                 # compress the merged trace
-                zip_name = f"{log_dir}/{run_id}_1f1b_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}_merged_trace.zip" 
+                zip_name = f"{log_dir}/{run_id}_tsched_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}_merged_trace.zip" 
                 with zipfile.ZipFile(zip_name, "w",
                                     compression=zipfile.ZIP_DEFLATED, 
                                     compresslevel=9) as zipf:
