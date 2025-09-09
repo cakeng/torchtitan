@@ -282,37 +282,38 @@ class ScheduleTsched(TschedScheduleSingle):
         # Forward pass
         
         
- 
-        ops = self._stage.get_fwd_recv_ops()     
         if scheduler is not None:
             scheduler.attach_exec_to_context(self._microbatch_idx) 
-        work_sync = _sorted_batch_p2p(ops, desc="fwd_recv") # This will crash in concurrent mode
+
+        with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward"):
+            ops = self._stage.get_fwd_recv_ops()     
+            work_sync = _sorted_batch_p2p(ops, desc="fwd_recv") # This will crash in concurrent mode
+            
+            for work in work_sync.values():
+                work.wait()
+            print(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
+                  b_str(f"Forwarding {self._microbatch_idx}") + f", receiving {ops}")
         
-        for work in work_sync.values():
-            work.wait()
-        print(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
-                        b_str(f"Forwarding {self._microbatch_idx}") + f", receiving {ops}")
-        
-        
-        
-        with torch.profiler.record_function(f"Forward {step_idx}"):
-            output = self._stage.forward_one_chunk(args, kwargs)
+            with torch.profiler.record_function(f"Forward {step_idx}"):
+                output = self._stage.forward_one_chunk(args, kwargs)
+                
+            
+                
+            ops = self._stage.get_fwd_send_ops()
+            print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                            b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
+            works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
+
+            # Compute loss if this is the last stage
+            self._maybe_compute_loss(self._stage, output, target)
             
         if scheduler is not None:
-            scheduler.detach_exec_from_context(self._microbatch_idx)
-            
-
-        ops = self._stage.get_fwd_send_ops()
-        print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                        b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
-        works.update(_sorted_batch_p2p(ops, desc="fwd_send"))
-
-        # Compute loss if this is the last stage
-        self._maybe_compute_loss(self._stage, output, target)
+                scheduler.detach_exec_from_context(self._microbatch_idx)
 
         # No loss function, no need to run backward
-        if not self._has_backward:
-            return   
+        if scheduler is not None:
+            scheduler.enter_backward_region(self._microbatch_idx)
+            scheduler.attach_exec_to_context(self._microbatch_idx) 
 
         # Backward pass
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
@@ -328,17 +329,21 @@ class ScheduleTsched(TschedScheduleSingle):
             with torch.profiler.record_function(
                 f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward pass"):
                 self._stage.backward_one_chunk(loss=loss)
-
+                
+            
+                
             ops = self._stage.get_bwd_send_ops()
-            logging.info(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+            print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
             works.update(_sorted_batch_p2p(ops, desc="bwd_send"))
-            
-        
             
         # Wait immediately for single microbatch
         for work in works.values():
             work.wait()
+            
+        if scheduler is not None:
+            scheduler.detach_exec_from_context(self._microbatch_idx)
+            scheduler.exit_backward_region(self._microbatch_idx)
 
         # Return losses if there is a container passed in
         self._update_losses(self._stage, losses)

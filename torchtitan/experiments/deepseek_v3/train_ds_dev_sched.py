@@ -93,35 +93,36 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         self.start_exec(model=self.stage.submod)
         
     def run(self):
-        # Create pipeline stage
-        if self.pp_rank == 0:
-            y = self.pp_schedule.step(self.x, scheduler=self.scheduler)
-        elif self.pp_rank == self.pp_size - 1:
-            y = self.pp_schedule.step(target=self.label, losses=self.losses, 
-                                      scheduler=self.scheduler)
-            loss = torch.mean(torch.stack(self.losses))
-        else:
-            self.pp_schedule.step(scheduler=self.scheduler)
+        while not self.stop_exec:
+            # Create pipeline stage
+            if self.pp_rank == 0:
+                y = self.pp_schedule.step(self.x, scheduler=self.scheduler)
+            elif self.pp_rank == self.pp_size - 1:
+                y = self.pp_schedule.step(target=self.label, losses=self.losses, 
+                                        scheduler=self.scheduler)
+                loss = torch.mean(torch.stack(self.losses))
+            else:
+                self.pp_schedule.step(scheduler=self.scheduler)
 
-        if self.pp_rank == self.pp_size - 1:
-            print(f"logits: {y.shape}")
-            print(f"{loss=}")
+            if self.pp_rank == self.pp_size - 1:
+                print(f"logits: {y.shape}")
+                print(f"{loss=}")
 
-        if self.pp_rank == 0:
-            param = self.model.get_parameter("model.layers.0.self_attn.q_proj.weight")
-            print(f"{torch.linalg.norm(param.grad)=}")
+            if self.pp_rank == 0:
+                param = self.model.get_parameter("model.layers.0.self_attn.q_proj.weight")
+                print(f"{torch.linalg.norm(param.grad)=}")
 
-        self.model.zero_grad()
-        
+            self.model.zero_grad()
+            
 
-        print("Backward done")
+            print("Backward done")
 
-        if self.debug:
-            print(b_str(f"[T{self.ident}]") + " Waiting for all execs to complete.")
-        self.scheduler.completion_barrier.wait() # Wait for all execs to complete
-        self.scheduler.completion_signal.wait() # Wait for the main thread to resume
-        if self.debug:
-            print(b_str(f"[T{self.ident}]") + " All execs completed! Waiting for next iteration...")
+            if self.debug:
+                print(b_str(f"[T{self.ident}]") + " Waiting for all execs to complete.")
+            self.scheduler.completion_barrier.wait() # Wait for all execs to complete
+            self.scheduler.completion_signal.wait() # Wait for the main thread to resume
+            if self.debug:
+                print(b_str(f"[T{self.ident}]") + " All execs completed! Waiting for next iteration...")
 
 # Run full model
 def run_full_model(
@@ -218,12 +219,17 @@ def run_full_model(
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
 
-    print(f"[Rank {rank}] Running {num_steps} thread-parallel steps, "
+    print(y_str(f"[Rank {rank}]") + " Running " + f"{num_steps} thread-parallel steps, "
           f"{num_hidden_layers=}, {microbatches=}, {bs=}, {seqlen=}")
     # Run forward and backward
-    for _ in range(num_steps):
+    for step_idx in range(num_steps):
+        print(y_str(f"[Rank {rank}]") + " Starting step " + f"{step_idx}")
         context_scheduler.start()
         context_scheduler.wait_completion()
+        print(y_str(f"[Rank {rank}]") + " Step " + f"{step_idx} completed.")
+        dist.barrier()
+        
+    print(y_str(f"[Rank {rank}]") + " All steps completed.")
         
     with torch.profiler.record_function("BARRIER:EXEC_END"):
         dist.barrier()

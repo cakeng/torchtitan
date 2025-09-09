@@ -12,7 +12,7 @@ pp_size = 2
 ep_size = 2
 fsdp_size = 1
 num_hidden_layers = 8
-num_steps = 4
+num_steps = 2
 run_profiler = "True"
 
 if run_type == "1f1b":
