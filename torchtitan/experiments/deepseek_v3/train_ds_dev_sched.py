@@ -80,12 +80,12 @@ class TorchTitanExecutionEngine(ExecutionEngine):
                                           loss_fn=self.loss_fn,
                                           global_rank=global_rank)
         if self.pp_rank == 0:
-            y = self.pp_schedule.initialize_stage(self.x, scheduler=self.scheduler)
+            y = self.pp_schedule.initialize_stage(self.x, scheduler=self.scheduler, exec_id=self.exec_id)
         elif self.pp_rank == self.pp_size - 1:
             y = self.pp_schedule.initialize_stage(target=self.label, losses=self.losses, 
-                                                  scheduler=self.scheduler)
+                                                  scheduler=self.scheduler, exec_id=self.exec_id)
         else:
-            self.pp_schedule.initialize_stage(scheduler=self.scheduler)
+            self.pp_schedule.initialize_stage(scheduler=self.scheduler, exec_id=self.exec_id)
 
         print(g_str(f"[T{self.tid}]") + " ExecutionEngine initialized, "
               f"exec id " + y_str(f"{self.exec_id}") + ", microbatch id " + 
@@ -98,13 +98,13 @@ class TorchTitanExecutionEngine(ExecutionEngine):
 
     def step(self):
         if self.pp_rank == 0:
-            y = self.pp_schedule.step(self.x, scheduler=self.scheduler)
+            y = self.pp_schedule.step(self.x, scheduler=self.scheduler, exec_id=self.exec_id)
         elif self.pp_rank == self.pp_size - 1:
             y = self.pp_schedule.step(target=self.label, losses=self.losses, 
-                                    scheduler=self.scheduler)
+                                    scheduler=self.scheduler, exec_id=self.exec_id)
             loss = torch.mean(torch.stack(self.losses))
         else:
-            self.pp_schedule.step(scheduler=self.scheduler)
+            self.pp_schedule.step(scheduler=self.scheduler, exec_id=self.exec_id)
 
         if self.pp_rank == self.pp_size - 1:
             print(f"logits: {y.shape}")
@@ -119,7 +119,7 @@ class TorchTitanExecutionEngine(ExecutionEngine):
 
 # Run full model
 def run_full_model(
-    mesh: DeviceMesh,
+    meshes: list[DeviceMesh],
     mbp_size: int,
     num_hidden_layers: int,
     num_steps: int,
@@ -127,6 +127,9 @@ def run_full_model(
     rank = dist.get_rank()
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
+    microbatches = mbp_size
+
+    mesh = meshes[0]
     pp_mesh = mesh["pp"]
     ep_mesh = mesh["ep"]
     pp_rank = pp_mesh.get_local_rank()
@@ -158,39 +161,10 @@ def run_full_model(
     # load_weights_from_hf(model, model_id, device)
     base_model.train()
 
-    # Apply data parallelism
-    fsdp_mesh = mesh["fsdp"]
-    hsdp_mesh = mesh["ep", "fsdp"]
-    print(y_str(f"[Rank {rank}]") + f" fsdp_mesh: {fsdp_mesh}")
-    print(y_str(f"[Rank {rank}]") + f" hsdp_mesh: {hsdp_mesh}")
-    # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
-    # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
-    # Reason: the MoE is "sparsely activated" compared to the dense model, thus
-    # it will be ineconomical re-gather the weights.
-    # for layer in model.model.layers.values():
-    #     # Apply FSDP to experts
-    #     if hasattr(layer.mlp, "experts"):
-    #         for expert in layer.mlp.experts.values():
-    #             fully_shard(expert, mesh=fsdp_mesh, reshard_after_forward=False)
-    #     # Apply HSDP to other parts such as attention, layernorm, because they
-    #     # are doing DDP on EP dimension
-    #     fully_shard(layer, mesh=hsdp_mesh, reshard_after_forward=False)
-
-    # # Apply HSDP on root model (lm_head, embeddings, etc)
-    # fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
-
-    # Synthetic setting
-    microbatches = mbp_size
-    
-    # Use Symmetric Memory for MoE token shuffle.
-    # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
-    # currently supported for forward only. See `generate.py`.
-    # model.setup_symm_mem(torch.bfloat16, device)
-
     # Example inputs
     torch.manual_seed(ep_rank)
-    bs = 16
-    seqlen = 128
+    bs = 4
+    seqlen = 64
     x = torch.randint(model_args.vocab_size, (microbatches, bs, seqlen), device=device)
     label = torch.rand(microbatches, bs, seqlen, model_args.vocab_size, device=device)
 
@@ -198,26 +172,67 @@ def run_full_model(
     loss_fn = torch.nn.functional.cross_entropy
     
     context_scheduler = ContextScheduler(microbatches, 
-                                         debug=True, is_dist=True)
+                                        debug=True, is_dist=True)
     profiler = None
     # profiler = ModelProfiler(base_model, x[0], label[0], loss_fn)
-    for t in range(microbatches - 1):
-        with device, mesh, init_empty_weights():
-            model = DeepseekForCausalLM(model_args)
-        model.train()
-        materialize_meta_model(model, base_model)
-        TorchTitanExecutionEngine(model, x[t], label[t], loss_fn,
-                        microbatches, t, pp_rank, pp_size, device, pp_mesh, 
-                        context_scheduler, profiler=profiler, is_dist=True, debug=True)
-        
+
     with device, mesh, init_empty_weights():
         model = DeepseekForCausalLM(model_args)
     model.train()
     materialize_meta_model(model, base_model)
-    main_engine = TorchTitanExecutionEngine(model, x[microbatches - 1], label[microbatches - 1], loss_fn,
-                    microbatches, microbatches - 1, pp_rank, pp_size, device, pp_mesh, 
-                    context_scheduler, profiler=profiler, is_dist=True, debug=True, 
-                    main_thread=True)
+    main_engine = TorchTitanExecutionEngine(
+                        model, x[0], label[0], loss_fn,
+                        microbatches, 0, pp_rank, pp_size, device, pp_mesh, 
+                        context_scheduler, profiler=profiler, is_dist=True, 
+                        debug=True, main_thread=True)
+
+
+    for t in range(1, microbatches):
+        mesh = meshes[t]
+        pp_mesh = mesh["pp"]
+        ep_mesh = mesh["ep"]
+        pp_rank = pp_mesh.get_local_rank()
+        ep_rank = ep_mesh.get_local_rank()
+
+        with device, mesh, init_empty_weights():
+            model = DeepseekForCausalLM(model_args)
+        model.train()
+        materialize_meta_model(model, base_model)
+        TorchTitanExecutionEngine(
+                        model, x[t], label[t], loss_fn,
+                        microbatches, t, pp_rank, pp_size, device, pp_mesh, 
+                        context_scheduler, profiler=profiler, is_dist=True, 
+                        debug=True)
+    
+
+        # Apply data parallelism
+        # fsdp_mesh = mesh["fsdp"]
+        # hsdp_mesh = mesh["ep", "fsdp"]
+        # print(y_str(f"[Rank {rank}]") + f" fsdp_mesh: {fsdp_mesh}")
+        # print(y_str(f"[Rank {rank}]") + f" hsdp_mesh: {hsdp_mesh}")
+        # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
+        # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
+        # Reason: the MoE is "sparsely activated" compared to the dense model, thus
+        # it will be ineconomical re-gather the weights.
+        # for layer in model.model.layers.values():
+        #     # Apply FSDP to experts
+        #     if hasattr(layer.mlp, "experts"):
+        #         for expert in layer.mlp.experts.values():
+        #             fully_shard(expert, mesh=fsdp_mesh, reshard_after_forward=False)
+        #     # Apply HSDP to other parts such as attention, layernorm, because they
+        #     # are doing DDP on EP dimension
+        #     fully_shard(layer, mesh=hsdp_mesh, reshard_after_forward=False)
+
+        # # Apply HSDP on root model (lm_head, embeddings, etc)
+        # fully_shard(model, mesh=hsdp_mesh, reshard_after_forward=False)
+
+        # Synthetic setting
+        
+        # Use Symmetric Memory for MoE token shuffle.
+        # TODO: we are rewriting `moe_on_device` function. `setup_symm_mem` is
+        # currently supported for forward only. See `generate.py`.
+        # model.setup_symm_mem(torch.bfloat16, device)
+
 
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
@@ -252,8 +267,11 @@ if __name__ == "__main__":
     run_profiler = sys.argv[8] == "True"
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size),
-                                 mesh_dim_names=("pp", "ep", "fsdp"))
+    meshes = []
+    for i in range(mbp_size):
+        mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size),
+                                     mesh_dim_names=("pp", "ep", "fsdp"))
+        meshes.append(mesh)
 
     # Setup profiler
     run_id = os.getenv("RUN_ID", "0")
@@ -278,7 +296,7 @@ if __name__ == "__main__":
             with_stack=True
         ) as prof:
             time_start = datetime.now()
-            run_full_model(mesh, mbp_size, num_hidden_layers, num_steps)
+            run_full_model(meshes, mbp_size, num_hidden_layers, num_steps)
             prof.step()
             time_end = datetime.now()
             print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
@@ -307,7 +325,7 @@ if __name__ == "__main__":
                 print(f"Rank {dist.get_rank()} Compressed trace to {zip_name}")
     else:
         time_start = datetime.now()
-        run_full_model(mesh, mbp_size, num_hidden_layers, num_steps)
+        run_full_model(meshes, mbp_size, num_hidden_layers, num_steps)
         time_end = datetime.now()
         print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
         

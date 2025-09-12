@@ -168,6 +168,7 @@ class ExecContext:
     signal: threading.Event
     stream: torch.cuda.Stream
     event: torch.cuda.Event
+    comms_ops: list[dist.Work]
     serialized_regions: list[threading.Event]
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
@@ -207,6 +208,11 @@ class ContextScheduler:
         if len(self.waiting_exec_ids) > 0:
             self.next_exec_id = self.active_exec_id
             for exec_id in self.waiting_exec_ids:
+                if self.execs[exec_id].comms_ops != [] and\
+                    self._check_all_comms_completed(exec_id):
+                    self.execs[exec_id].comms_ops = []
+                    self.next_exec_id = exec_id
+                    break
                 if self.execs[exec_id].event.query():
                     self.next_exec_id = exec_id
                     break
@@ -214,13 +220,16 @@ class ContextScheduler:
                 self.next_exec_id = self.waiting_exec_ids[0]   
             
             if self.debug:
-                print(self.format_print("Scheduling next exec " + 
-                      y_str(f"{self.next_exec_id}") + ", current waiting execs: " + 
-                      y_str(f"{self.waiting_exec_ids}"), r_str))
+                print(self.format_print("Current waiting execs: " + 
+                      y_str(f"{self.waiting_exec_ids}") + ", Scheduling next exec " + 
+                      y_str(f"{self.next_exec_id}"), r_str))
         else: 
             # No execs waiting
             if force_switch:
                 self.next_exec_id = None # No active exec
+                if self.debug:
+                    print(self.format_print("No execs waiting, no active exec, setting next exec to NONE. " +
+                          "Scheduler will be deactivated.", r_str))
             else:
                 if self.debug:
                     print(self.format_print(" No execs waiting, scheduling active exec " + 
@@ -237,8 +246,9 @@ class ContextScheduler:
                   y_str(f"{self.active_exec_id}") + ", next scheduled exec " + 
                   y_str(f"{self.next_exec_id}") + "\n", b_str), end="")
         self.execs[self.active_exec_id].signal.clear()
-        self.execs[self.active_exec_id].event.record(
-            self.execs[self.active_exec_id].stream)
+        if self.execs[self.active_exec_id].comms_ops == []:
+            self.execs[self.active_exec_id].event.record(
+                self.execs[self.active_exec_id].stream)
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id].signal.set()
         self.active_exec_id = None
@@ -264,6 +274,13 @@ class ContextScheduler:
         if self.debug:
             print(self.format_print("Resuming exec context on stream " +
                 y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
+    
+    def _check_all_comms_completed(self, exec_id):
+        # Check if all comms ops are completed
+        for comms_op in self.execs[exec_id].comms_ops:
+            if not comms_op.is_completed():
+                return False
+        return True
 
     def add_exec(self, exec):
         # Add an exec to the scheduler.
@@ -277,6 +294,7 @@ class ContextScheduler:
         new_exec_signal.clear()
         new_exec_stream = torch.cuda.Stream()
         new_exec_event = torch.cuda.Event()
+        new_exec_comms_ops = []
         new_exec_event.record(new_exec_stream)
         new_exec_serialized_regions = []
         for i in range (self.num_serialized_regions):
@@ -286,6 +304,7 @@ class ContextScheduler:
                                               new_exec_signal, 
                                               new_exec_stream, 
                                               new_exec_event,
+                                              new_exec_comms_ops,
                                               new_exec_serialized_regions)
         if self.debug:
             print(self.format_print("Adding exec with id " + 
@@ -305,7 +324,7 @@ class ContextScheduler:
         # Attach the exec to the scheduler context
         # i.e., enter the waiting queue for next exec
         if self.debug:
-            print(self.format_print("Attaching exec"), b_str)
+            print(self.format_print(f"Attaching exec " + y_str(f"{exec_id}"), b_str))
         self._acquire_context(exec_id)
         return
 
@@ -339,6 +358,19 @@ class ContextScheduler:
         if self.debug:
             print(self.format_print("Exec " + y_str(f"{exec_id}") + r_str(f" Exiting") + 
                                     " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
+        return
+
+    def wait_for_comms(self, exec_id, comms_ops):
+        # Wait for all comms ops to complete
+        self.execs[exec_id].comms_ops = comms_ops
+        while not self._check_all_comms_completed(exec_id):
+            if self.debug:
+                print(self.format_print(f"Waiting for comms ops to complete, Ops: {comms_ops}", r_str))
+            self._release_context(exec_id)
+            self._acquire_context(exec_id)
+        if self.debug:
+            print(self.format_print(f"Comms ops completed, Ops: {comms_ops}", r_str))
+        self.execs[exec_id].comms_ops = []
         return
 
     def start(self):
