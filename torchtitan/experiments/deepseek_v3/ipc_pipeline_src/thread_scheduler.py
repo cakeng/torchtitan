@@ -322,21 +322,23 @@ class ContextScheduler:
                                     " detached and running independently from the scheduler context.", b_str))
         return
     
-    def enter_serialized_region(self, exec_id, region_id=0):
+    def enter_serialized_region(self, exec_id, region_id=0, region_name=""):
         # Enters a serialized region of code in the exec_id order.
         self.execs[exec_id].serialized_regions[region_id].wait()
         if self.debug:
-            print(self.format_print("Exec " + y_str(f"{exec_id}") + f" Entering serialized region {region_id}", b_str))
+            print(self.format_print("Exec " + y_str(f"{exec_id} ") + g_str(f" Entering") + 
+                                    " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
         return
     
-    def exit_serialized_region(self, exec_id, region_id=0):
+    def exit_serialized_region(self, exec_id, region_id=0, region_name=""):
         # Exits a serialized region of code in the exec_id order.
         self.execs[exec_id].serialized_regions[region_id].clear()
         if exec_id + 1 < self.num_execs:
             # Signal the next exec to enter the serialized region
             self.execs[exec_id + 1].serialized_regions[region_id].set()
         if self.debug:
-            print(self.format_print("Exec " + y_str(f"{exec_id}") + f" Exiting serialized region {region_id}", b_str))
+            print(self.format_print("Exec " + y_str(f"{exec_id}") + r_str(f" Exiting") + 
+                                    " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
         return
 
     def start(self):
@@ -346,7 +348,7 @@ class ContextScheduler:
             self.execs[exec_id].signal.clear()
         for i in range (self.num_serialized_regions):
             for j in range (self.num_execs):
-                if j == 0
+                if j == 0:
                     self.execs[j].serialized_regions[i].set()
                 else:
                     self.execs[j].serialized_regions[i].clear()
@@ -723,14 +725,14 @@ class ExecutionEngine(threading.Thread):
         
         print(self.format_print(f"Fwd pass finished. Loss: {self.loss}"))
         
-        self.scheduler.enter_serialized_region(self.exec_id)
+        self.scheduler.enter_serialized_region(self.exec_id, region_name="Backward")
         self.scheduler.attach_exec_to_context(self.exec_id)
         
         # Backward pass
         self.loss.backward()
         
         self.scheduler.detach_exec_from_context(self.exec_id)
-        self.scheduler.exit_serialized_region(self.exec_id)
+        self.scheduler.exit_serialized_region(self.exec_id, region_name="Backward")
         
         print(self.format_print("Bwd pass finished"))
 

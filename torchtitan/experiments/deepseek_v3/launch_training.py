@@ -45,7 +45,7 @@ def stream_output(process, rank, stream_type):
                     prefix = f"[MBP {rank}-ERR] "
             else:
                 if stream_type == "stderr":
-                    prefix = f"[ERR] "
+                    prefix = f"[{rank}-ERR] "
             print(f"{prefix}{line.rstrip()}", flush=True)
 
 # Launch four different training jobs asynchronously
