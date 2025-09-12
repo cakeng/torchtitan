@@ -308,7 +308,7 @@ class ScheduleTsched(TschedScheduleSingle):
             self._maybe_compute_loss(self._stage, output, target)
             
         if scheduler is not None:
-                scheduler.detach_exec_from_context(self._microbatch_idx)
+            scheduler.detach_exec_from_context(self._microbatch_idx)
 
         # No loss function, no need to run backward
         if scheduler is not None:

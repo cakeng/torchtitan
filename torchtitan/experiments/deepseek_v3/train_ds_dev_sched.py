@@ -152,6 +152,7 @@ def run_full_model(
     # Instantiate model
     with device, mesh:
         base_model = DeepseekForCausalLM(model_args)
+        print(y_str(f"[Rank {rank}]") + " Base model instantiated")
 
     # Load weights
     # load_weights_from_hf(model, model_id, device)
@@ -160,8 +161,8 @@ def run_full_model(
     # Apply data parallelism
     fsdp_mesh = mesh["fsdp"]
     hsdp_mesh = mesh["ep", "fsdp"]
-    print(f"{rank=}, fsdp_mesh: {fsdp_mesh}")
-    print(f"{rank=}, hsdp_mesh: {hsdp_mesh}")
+    print(y_str(f"[Rank {rank}]") + f" fsdp_mesh: {fsdp_mesh}")
+    print(y_str(f"[Rank {rank}]") + f" hsdp_mesh: {hsdp_mesh}")
     # Using `reshard_after_forward=False` to implement Zero-2, i.e. sharding the
     # optimizer (Zero-1) and gradients (Zero-2), but not the model weights.
     # Reason: the MoE is "sparsely activated" compared to the dense model, thus
@@ -188,7 +189,7 @@ def run_full_model(
 
     # Example inputs
     torch.manual_seed(ep_rank)
-    bs = 4
+    bs = 16
     seqlen = 128
     x = torch.randint(model_args.vocab_size, (microbatches, bs, seqlen), device=device)
     label = torch.rand(microbatches, bs, seqlen, model_args.vocab_size, device=device)
@@ -196,7 +197,8 @@ def run_full_model(
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy
     
-    context_scheduler = ContextScheduler(mbp_size, debug=True, is_dist=True)
+    context_scheduler = ContextScheduler(microbatches, 
+                                         debug=True, is_dist=True)
     profiler = None
     # profiler = ModelProfiler(base_model, x[0], label[0], loss_fn)
     for t in range(microbatches - 1):
@@ -227,6 +229,7 @@ def run_full_model(
         print(y_str(f"[Rank {rank}]") + " Starting step " + f"{step_idx}")
         context_scheduler.start()
         main_engine.step()
+        main_engine.sync_step_completion()
         context_scheduler.wait_completion()
         print(y_str(f"[Rank {rank}]") + " Step " + f"{step_idx} completed.")
         dist.barrier()

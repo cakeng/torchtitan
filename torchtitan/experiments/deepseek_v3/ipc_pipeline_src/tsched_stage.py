@@ -320,7 +320,8 @@ class _TschedStageBase(ABC):
                 else dist.get_global_rank(self.group, peer_rank)
             )
             ops.append(
-                dist.P2POp(dist.irecv, info.buffer, peer_global_rank, self.group)
+                dist.P2POp(dist.irecv, info.buffer, peer_global_rank, 
+                           self.group, tag=self.microbatch_idx)
             )
 
         return ops
@@ -444,7 +445,8 @@ class _TschedStageBase(ABC):
                     if self.group is None
                     else dist.get_global_rank(self.group, peer_rank)
                 )
-                ops.append(dist.P2POp(dist.isend, out, peer_global_rank, self.group))
+                ops.append(dist.P2POp(dist.isend, out, peer_global_rank, 
+                                      self.group, tag=self.microbatch_idx))
 
         return ops
 
@@ -473,7 +475,8 @@ class _TschedStageBase(ABC):
                     if self.group is None
                     else dist.get_global_rank(self.group, peer_rank)
                 )
-                ops.append(dist.P2POp(dist.isend, grad, peer_global_rank, self.group))
+                ops.append(dist.P2POp(dist.isend, grad, peer_global_rank, 
+                                      self.group, tag=self.microbatch_idx))
             else:
                 if not (grad is None and grad_recv_stage is None):
                     raise RuntimeError(

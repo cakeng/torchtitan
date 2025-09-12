@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import threading
+from sortedcontainers import SortedList
 import time
 import copy
 import faulthandler
@@ -167,16 +168,16 @@ class ExecContext:
     signal: threading.Event
     stream: torch.cuda.Stream
     event: torch.cuda.Event
-    backward_signal: threading.Event
-
+    serialized_regions: list[threading.Event]
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
-    def __init__(self, num_execs, is_dist = False, debug = False):
+    def __init__(self, num_execs, is_dist = False, num_serialized_regions = 6,
+                 debug = False):
         self.num_execs = num_execs
         self.active_exec_id = None
         self.next_exec_id = None
         self.stop_scheduling = False
-        self.waiting_exec_ids = []
+        self.waiting_exec_ids = SortedList()
         self.execs = {}
         self.debug = debug
         self.is_dist = is_dist
@@ -187,8 +188,8 @@ class ContextScheduler:
         self.completion_signal_c2m.clear()
         self.context_lock = threading.Lock()
         self.context_lock.acquire()
-        self.backward_semaphore = threading.Semaphore(1)
-
+        self.num_serialized_regions = num_serialized_regions
+        
     def format_print(self, message, color_fnc=b_str, ident=None):
         if ident is None:
             ident = threading.current_thread().ident
@@ -246,7 +247,7 @@ class ContextScheduler:
     def _acquire_context(self, exec_id):
         # Acquire the context lock and execute.
         # Append to the front of the list to maintain order
-        self.waiting_exec_ids.insert(0, exec_id)
+        self.waiting_exec_ids.add(exec_id)
         if self.active_exec_id is None and self.next_exec_id is None:
             self.next_exec_id = exec_id
             if self.debug:
@@ -270,18 +271,22 @@ class ContextScheduler:
             assert self.execs[exec_id].exec.tid != exec.tid, \
                 f"Exec {exec} already exists, thread ident {exec.tid}"
         new_exec_id = len(self.execs)
+        if new_exec_id >= self.num_execs:
+            raise ValueError(f"Expected {self.num_execs} execs, got {new_exec_id}")
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
         new_exec_stream = torch.cuda.Stream()
         new_exec_event = torch.cuda.Event()
         new_exec_event.record(new_exec_stream)
-        new_exec_backward_signal = threading.Event()
-        new_exec_backward_signal.clear()
+        new_exec_serialized_regions = []
+        for i in range (self.num_serialized_regions):
+            new_exec_serialized_regions.append(threading.Event())
+            new_exec_serialized_regions[i].clear()
         self.execs[new_exec_id] = ExecContext(exec, 
                                               new_exec_signal, 
                                               new_exec_stream, 
                                               new_exec_event,
-                                              new_exec_backward_signal)
+                                              new_exec_serialized_regions)
         if self.debug:
             print(self.format_print("Adding exec with id " + 
                   y_str(f"{new_exec_id}"), y_str))
@@ -313,23 +318,25 @@ class ContextScheduler:
         self._scheduler(force_switch=True)
         self._release_context(exec_id)
         if self.debug:
-            print(self.format_print("Exec detached and running independently from the scheduler context.", b_str))
+            print(self.format_print(f"Exec " + y_str(f"{exec_id}") + 
+                                    " detached and running independently from the scheduler context.", b_str))
         return
     
-    def enter_backward_region(self, exec_id):
-        # self.execs[exec_id].backward_signal.wait()
-        self.backward_semaphore.acquire()
+    def enter_serialized_region(self, exec_id, region_id=0):
+        # Enters a serialized region of code in the exec_id order.
+        self.execs[exec_id].serialized_regions[region_id].wait()
+        if self.debug:
+            print(self.format_print("Exec " + y_str(f"{exec_id}") + f" Entering serialized region {region_id}", b_str))
+        return
+    
+    def exit_serialized_region(self, exec_id, region_id=0):
+        # Exits a serialized region of code in the exec_id order.
+        self.execs[exec_id].serialized_regions[region_id].clear()
         if exec_id + 1 < self.num_execs:
-            self.execs[exec_id + 1].backward_signal.set()
+            # Signal the next exec to enter the serialized region
+            self.execs[exec_id + 1].serialized_regions[region_id].set()
         if self.debug:
-            print(self.format_print(" Entering backward region", b_str))
-        return
-    
-    def exit_backward_region(self, exec_id):
-        self.backward_semaphore.release()
-        # self.execs[exec_id].backward_signal.clear()
-        if self.debug:
-            print(self.format_print(" Exiting backward region", b_str))
+            print(self.format_print("Exec " + y_str(f"{exec_id}") + f" Exiting serialized region {region_id}", b_str))
         return
 
     def start(self):
@@ -337,7 +344,12 @@ class ContextScheduler:
             f"Expected {self.num_execs} execs, got {len(self.execs)}"
         for exec_id in self.execs:
             self.execs[exec_id].signal.clear()
-        # self.execs[0].backward_signal.set()
+        for i in range (self.num_serialized_regions):
+            for j in range (self.num_execs):
+                if j == 0
+                    self.execs[j].serialized_regions[i].set()
+                else:
+                    self.execs[j].serialized_regions[i].clear()
         self.active_exec_id = None
         self.stop_scheduling = False
         if self.next_exec_id is None:
@@ -686,10 +698,13 @@ class ExecutionEngine(threading.Thread):
         if self.debug:
             print(self.format_print("Waiting for all execs to complete."))
         self.scheduler.completion_barrier.wait() # Wait for all execs to complete
-        self.scheduler.completion_signal_c2m.set() # Signal that the main thread can proceed to acquire the context lock
-        self.scheduler.completion_signal_m2c.wait() # Wait for the main thread to acquire the context lock
-        if self.debug:
-            print(self.format_print("All execs completed! Waiting for next iteration..."))
+        if not self.main_thread:
+            self.scheduler.completion_signal_c2m.set() # Signal that the main thread can proceed to acquire the context lock
+            if self.debug:
+                print(self.format_print("All execs completed! Signaling main thread to acquire context lock."))
+            self.scheduler.completion_signal_m2c.wait() # Wait for the main thread to acquire the context lock
+            if self.debug:
+                print(self.format_print("All execs completed! Waiting for next iteration..."))
             
     def step(self):
         # Attach the exec to the scheduler context, 
@@ -708,14 +723,14 @@ class ExecutionEngine(threading.Thread):
         
         print(self.format_print(f"Fwd pass finished. Loss: {self.loss}"))
         
-        self.scheduler.enter_backward_region(self.exec_id)
+        self.scheduler.enter_serialized_region(self.exec_id)
         self.scheduler.attach_exec_to_context(self.exec_id)
         
         # Backward pass
         self.loss.backward()
         
         self.scheduler.detach_exec_from_context(self.exec_id)
-        self.scheduler.exit_backward_region(self.exec_id)
+        self.scheduler.exit_serialized_region(self.exec_id)
         
         print(self.format_print("Bwd pass finished"))
 
