@@ -138,35 +138,46 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: Optional[str] = None):
     if len(p2p_ops) == 0:
         return None
     desc_str = f"{desc}, " if desc else ""
-    return dist.batch_isend_irecv(p2p_ops).pop()
+    out = dist.batch_isend_irecv(p2p_ops)
+    print(f"Rank {dist.get_rank()} Returning from batch_p2p {desc}: {out}")
+    return out
 
-
-def _sorted_batch_p2p(
-    p2p_ops: list[dist.P2POp], desc: Optional[str] = None, microbatch_idx: int = 0
-) -> dict[int, dist.Work]:
+def _batch_p2p_non_coalescing(p2p_ops: list[dist.P2POp], desc: Optional[str] = None, microbatch_idx: int = 0):
     """
-    Sorts the list of P2P ops by the peer rank, and then calls
-    batch_isend_irecv. Return a dictionary of works by peer rank. This function
-    helps us avoid hangs in case of skip connections.
+    Process P2P operations sorted by peer rank to avoid hangs in case of skip connections.
+    Force individual operations instead of coalescing.
     """
-    # Arrange p2p_ops by peer rank:
-    #   int is the peer rank;
-    #   List is the list of ops towards the peer
-    ops_by_peer: dict[int, list[dist.P2POp]] = defaultdict(list)
-    work_by_peer: dict[int, dist.Work] = {}
     if len(p2p_ops) == 0:
-        return work_by_peer
-
-    # Classify the ops by peer rank
-    for op in p2p_ops:
-        ops_by_peer[op.peer].append(op)
-
-    # Call batch_isend_irecv per peer, in sorted order of the peers (to avoid hangs)
-    for peer, ops in sorted(ops_by_peer.items()):
-        print(f"Rank {dist.get_rank()} {desc}: Receiving/Sending microbatch {microbatch_idx} to/from rank {peer}: {ops}")
-        work_by_peer[peer] = _batch_p2p(ops, desc=desc)
-
-    return work_by_peer
+        return []
+    
+    # Sort operations by peer rank to avoid hangs
+    sorted_ops = sorted(p2p_ops, key=lambda op: op.peer)
+    
+    work_objects = []
+    for p2p_op in sorted_ops:
+        # Call individual isend/irecv directly
+        if p2p_op.op == dist.isend:
+            print(f"Rank {dist.get_rank()} {desc}: Sending microbatch {microbatch_idx} to rank {p2p_op.peer}: {p2p_op}")
+            work = dist.isend(
+                p2p_op.tensor,
+                dst=p2p_op.peer,
+                group=p2p_op.group,
+                tag=p2p_op.tag
+            )
+        elif p2p_op.op == dist.irecv:
+            print(f"Rank {dist.get_rank()} {desc}: Receiving microbatch {microbatch_idx} from rank {p2p_op.peer}: {p2p_op}")
+            work = dist.irecv(
+                p2p_op.tensor,
+                src=p2p_op.peer,
+                group=p2p_op.group,
+                tag=p2p_op.tag
+            )
+        
+        if work:
+            work_objects.append(work)
+    
+    print(f"Rank {dist.get_rank()} Returning from non-coalescing batch_p2p {desc}: {work_objects}")
+    return work_objects
 
 
 class TschedScheduleSingle(_TschedSchedule):
@@ -280,7 +291,7 @@ class ScheduleTsched(TschedScheduleSingle):
         if not self._stage_initialized:
             self._initialize_stage(args, kwargs)
 
-        works = {}
+        works = []
         ident = threading.current_thread().ident
         # Wait for the current microbatch to be scheduled
         # Forward pass
@@ -293,9 +304,9 @@ class ScheduleTsched(TschedScheduleSingle):
 
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward"):
             ops = self._stage.get_fwd_recv_ops()     
-            work_sync = _sorted_batch_p2p(ops, desc="fwd_recv", microbatch_idx=self._microbatch_idx) # P2P ops must be serialized in microbatch (exec) order
+            work_sync = _batch_p2p_non_coalescing(ops, desc="fwd_recv", microbatch_idx=self._microbatch_idx) # P2P ops must be serialized in microbatch (exec) order
             
-            scheduler.wait_for_comms(exec_id, work_sync.values())
+            scheduler.wait_for_comms(exec_id, work_sync)
 
             print(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
                   b_str(f"Forwarding {self._microbatch_idx}") + f", received {ops}")
@@ -316,15 +327,15 @@ class ScheduleTsched(TschedScheduleSingle):
             ops = self._stage.get_fwd_send_ops()
             print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                             b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
-            works.update(_sorted_batch_p2p(ops, desc="fwd_send", microbatch_idx=self._microbatch_idx))
+            works.extend(_batch_p2p_non_coalescing(ops, desc="fwd_send", microbatch_idx=self._microbatch_idx))
 
             # Compute loss if this is the last stage
             self._maybe_compute_loss(self._stage, output, target)
 
-            if scheduler is not None:
-                scheduler.detach_exec_from_context(exec_id)
-                # scheduler.exit_serialized_region(self._microbatch_idx, region_id=1, 
-                #                                  region_name="Forward Send")
+        if scheduler is not None:
+            scheduler.detach_exec_from_context(exec_id)
+            # scheduler.exit_serialized_region(self._microbatch_idx, region_id=1, 
+            #                                  region_name="Forward Send")
 
         # No loss function, no need to run backward
         if scheduler is not None:
@@ -335,8 +346,8 @@ class ScheduleTsched(TschedScheduleSingle):
         # Backward pass
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
             ops = self._stage.get_bwd_recv_ops()
-            work_sync = _sorted_batch_p2p(ops, desc="bwd_recv", microbatch_idx=self._microbatch_idx)
-            scheduler.wait_for_comms(exec_id, work_sync.values())
+            work_sync = _batch_p2p_non_coalescing(ops, desc="bwd_recv", microbatch_idx=self._microbatch_idx)
+            scheduler.wait_for_comms(exec_id, work_sync)
             print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          r_str(f"Backwarding {self._microbatch_idx}") + f", received {ops}")
 
@@ -349,14 +360,15 @@ class ScheduleTsched(TschedScheduleSingle):
             ops = self._stage.get_bwd_send_ops()
             print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                          r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
-            works.update(_sorted_batch_p2p(ops, desc="bwd_send", microbatch_idx=self._microbatch_idx))
+            works.extend(_batch_p2p_non_coalescing(ops, desc="bwd_send", microbatch_idx=self._microbatch_idx))
+            
+            # scheduler.wait_for_comms(exec_id, works.values())
             
         if scheduler is not None:
             scheduler.detach_exec_from_context(exec_id)
             scheduler.exit_serialized_region(exec_id, region_id=2, 
                                              region_name="Backward")
         # Wait immediately for single microbatch
-        scheduler.wait_for_comms(exec_id, works.values())
 
         # Return losses if there is a container passed in
         self._update_losses(self._stage, losses)

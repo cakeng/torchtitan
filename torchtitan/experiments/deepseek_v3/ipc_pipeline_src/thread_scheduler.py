@@ -264,7 +264,7 @@ class ContextScheduler:
                 print(self.format_print("No active execs, acquiring context lock", b_str))
         else:
             if self.debug:
-                print(self.format_print("Waiting for context switch", b_str))
+                print(self.format_print(f"Waiting for context switch of exec " + y_str(f"{exec_id}"), b_str))
             self.execs[exec_id].signal.wait()
         self.context_lock.acquire() 
         if exec_id in self.waiting_exec_ids:
@@ -363,11 +363,10 @@ class ContextScheduler:
     def wait_for_comms(self, exec_id, comms_ops):
         # Wait for all comms ops to complete
         self.execs[exec_id].comms_ops = comms_ops
+        if self.debug:
+            print(self.format_print(f"Waiting for comms ops to complete, Ops: {comms_ops}", r_str))
         while not self._check_all_comms_completed(exec_id):
-            if self.debug:
-                print(self.format_print(f"Waiting for comms ops to complete, Ops: {comms_ops}", r_str))
-            self._release_context(exec_id)
-            self._acquire_context(exec_id)
+            self.context_switch(exec_id)
         if self.debug:
             print(self.format_print(f"Comms ops completed, Ops: {comms_ops}", r_str))
         self.execs[exec_id].comms_ops = []
