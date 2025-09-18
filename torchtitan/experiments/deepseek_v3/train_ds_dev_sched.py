@@ -35,6 +35,7 @@ from ipc_pipeline_src.tsched_schedule import ScheduleTsched
 from ipc_pipeline_src.tsched_stage import TschedStage
 from ipc_pipeline_src.sync_traces import merge_chrome_traces_with_barriers
 from ipc_pipeline_src.thread_scheduler import ContextScheduler, ExecutionEngine, ModelProfiler, materialize_meta_model
+from ipc_pipeline_src.tsched_device_mesh import init_independent_device_mesh, compare_device_mesh_structures
 
 # Use DeepSeek-V2-Lite as a proxy
 model_id = "deepseek-ai/DeepSeek-V2-Lite"
@@ -79,6 +80,12 @@ class TorchTitanExecutionEngine(ExecutionEngine):
                                           self.microbatch_size, 
                                           loss_fn=self.loss_fn,
                                           global_rank=global_rank)
+        
+        print(g_str(f"[T{self.tid}]") + " ExecutionEngine initialized, "
+              f"exec id " + y_str(f"{self.exec_id}") + ", microbatch id " + 
+              y_str(f"{self.microbatch_index}") + ", global rank " + 
+              y_str(f"{global_rank}" + ", PP mesh " + y_str(f"{self.pp_mesh.get_group()}")))
+        
         if self.pp_rank == 0:
             y = self.pp_schedule.initialize_stage(self.x, scheduler=self.scheduler, exec_id=self.exec_id)
         elif self.pp_rank == self.pp_size - 1:
@@ -86,11 +93,6 @@ class TorchTitanExecutionEngine(ExecutionEngine):
                                                   scheduler=self.scheduler, exec_id=self.exec_id)
         else:
             self.pp_schedule.initialize_stage(scheduler=self.scheduler, exec_id=self.exec_id)
-
-        print(g_str(f"[T{self.tid}]") + " ExecutionEngine initialized, "
-              f"exec id " + y_str(f"{self.exec_id}") + ", microbatch id " + 
-              y_str(f"{self.microbatch_index}") + ", global rank " + 
-              y_str(f"{global_rank}"))
         
         self.init_exec(model=self.stage.submod)
         if not self.main_thread:
@@ -136,6 +138,7 @@ def run_full_model(
     ep_rank = ep_mesh.get_local_rank()
     pp_size = pp_mesh.size()
     ep_size = ep_mesh.size()
+    # warmup_nccl()
 
     # Get model configs
     model_args = deepseek_config_registry[model_id]
@@ -180,6 +183,7 @@ def run_full_model(
         model = DeepseekForCausalLM(model_args)
     model.train()
     materialize_meta_model(model, base_model)
+    dist.barrier()
     main_engine = TorchTitanExecutionEngine(
                         model, x[0], label[0], loss_fn,
                         microbatches, 0, pp_rank, pp_size, device, pp_mesh, 
@@ -198,6 +202,7 @@ def run_full_model(
             model = DeepseekForCausalLM(model_args)
         model.train()
         materialize_meta_model(model, base_model)
+        dist.barrier()
         TorchTitanExecutionEngine(
                         model, x[t], label[t], loss_fn,
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
@@ -266,11 +271,25 @@ if __name__ == "__main__":
     num_steps = int(sys.argv[7])
     run_profiler = sys.argv[8] == "True"
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    
+    original_mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size),
+                                          mesh_dim_names=("pp", "ep", "fsdp"))
 
     meshes = []
     for i in range(mbp_size):
+        # mesh = init_independent_device_mesh("cuda", (pp_size, ep_size, fsdp_size),
+        #                                     mesh_dim_names=("pp", "ep", "fsdp"),
+        #                                     mesh_id=f"mb_{i}")
+        # assert compare_device_mesh_structures(original_mesh, mesh, verbose=False)
         mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size),
                                      mesh_dim_names=("pp", "ep", "fsdp"))
+        # if i == 0:
+        #     pp_group_orig = original_mesh.get_group("pp")
+        #     pp_group = mesh.get_group("pp")
+        #     print(f"Rank {dist.get_rank()} pp_group_orig: {pp_group_orig}")
+        #     print(f"Rank {dist.get_rank()} pp_group: {pp_group}")
+        #     assert pp_group_orig != pp_group
+        print(f"Rank {dist.get_rank()} Mesh {i} created")
         meshes.append(mesh)
 
     # Setup profiler

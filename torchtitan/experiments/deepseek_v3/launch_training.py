@@ -46,7 +46,7 @@ def stream_output(process, rank, stream_type):
                     prefix = f"[MBP {rank}-ERR] "
             else:
                 if stream_type == "stderr":
-                    prefix = f"[{rank}-ERR] "
+                    prefix = f"[ERR] "
             print(f"{prefix}{line.rstrip()}", flush=True)
 
 # Launch four different training jobs asynchronously
@@ -58,6 +58,9 @@ for i in range(num_process_groups):
         "torchrun",
         f"--nproc_per_node={num_gpus}",
         f"--master_port={port}",
+        f"--master_addr=127.0.0.1",
+        f"--node_rank=0",                
+        f"--nnodes=1",
         train_script,
         str(pp_size),
         str(ep_size),
@@ -69,6 +72,16 @@ for i in range(num_process_groups):
         run_profiler
     ]
     cmd_str = " ".join(cmd)
+    
+    env = os.environ.copy()
+    env.update({
+        "NCCL_SOCKET_IFNAME": "lo",
+        "NCCL_P2P_DISABLE": "1", 
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_NET_GDR_LEVEL": "0",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": str(port)
+    })
     
     # Launch process asynchronously with real-time output streaming
     process = subprocess.Popen(

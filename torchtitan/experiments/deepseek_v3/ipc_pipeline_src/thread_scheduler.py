@@ -26,40 +26,83 @@ from sortedcontainers import SortedList
 import time
 import copy
 import faulthandler
+import traceback
+import sys
 from dataclasses import dataclass
 from collections import deque
 from typing import Dict, Callable
 import signal
 import torch.distributed as dist
+from torch.distributed import DeviceMesh
+from ipc_pipeline_src.tsched_device_mesh import init_independent_device_mesh
 
 from accelerate import init_empty_weights
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, logging
 logging.set_verbosity_error() # Suppress verbose warnings
 
-def g_str(s):
+def g_str(s): # green
     return "\033[32m" + s + "\033[0m"
-def r_str(s):
+def r_str(s): # red
     return "\033[31m" + s + "\033[0m"
-def b_str(s):
+def b_str(s): # blue
     return "\033[34m" + s + "\033[0m"
-def y_str(s):
+def y_str(s): # yellow
     return "\033[33m" + s + "\033[0m"
+def m_str(s): # magenta
+    return "\033[35m" + s + "\033[0m"
+def c_str(s): # cyan
+    return "\033[36m" + s + "\033[0m"
+def w_str(s): # white
+    return "\033[37m" + s + "\033[0m"
+def k_str(s): # black
+    return "\033[30m" + s + "\033[0m"
 
 # Enable automatic stack dumps on SIGQUIT
 faulthandler.enable()
 
-# Register custom signal handler for thread dumps
 def dump_all_threads(signum, frame):
-    print("\n" + "="*50)
-    print("THREAD DUMP")
-    print("="*50)
+    print("\n" + "="*80)
+    print("DETAILED THREAD DUMP (Ctrl+C detected)")
+    print("="*80)
+    
+    # Get all threads
+    threads = threading.enumerate()
+    current_thread = threading.current_thread()
+    
+    print(f"Total threads: {len(threads)}")
+    print(f"Current thread: {current_thread.name} (ID: {current_thread.ident})")
+    print("-" * 80)
+    
+    # Dump each thread's stack trace
+    for thread in threads:
+        print(f"\nThread: {thread.name} (ID: {thread.ident})")
+        print(f"  Alive: {thread.is_alive()}")
+        print(f"  Daemon: {thread.daemon}")
+        
+        # Get the frame for this thread
+        frame = sys._current_frames().get(thread.ident)
+        if frame:
+            print("  Stack trace:")
+            stack = traceback.extract_stack(frame)
+            for filename, lineno, name, line in stack[-10:]:  # Last 10 frames
+                print(f"    File '{filename}', line {lineno}, in {name}")
+                if line:
+                    print(f"      {line}")
+        else:
+            print("  No frame available")
+        print("-" * 40)
+    
+    print("="*80)
+    
+    # Also dump using faulthandler for complete info
+    print("FAULTHANDLER DUMP:")
     faulthandler.dump_traceback()
-    print(f"Active threads: {threading.active_count()}")
-    for thread in threading.enumerate():
-        print(f"  {thread.name}: {thread}")
-    print("="*50)
+    print("="*80)
 
-signal.signal(signal.SIGUSR1, dump_all_threads)
+# Register handlers
+signal.signal(signal.SIGINT, dump_all_threads)   # Ctrl+C
+signal.signal(signal.SIGUSR1, dump_all_threads)  # kill -USR1 <pid>
+signal.signal(signal.SIGQUIT, dump_all_threads)  # Ctrl+\
 
 # =============================================================================
 # COMPONENT 1: SELECTIVE DEEP-COPY
@@ -168,8 +211,9 @@ class ExecContext:
     signal: threading.Event
     stream: torch.cuda.Stream
     event: torch.cuda.Event
-    comms_ops: list[dist.Work]
+    gloo_group: dist.ProcessGroup
     serialized_regions: list[threading.Event]
+    ready_key: tuple[str, int] | tuple[str, list[dist.Work]] | None
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
     def __init__(self, num_execs, is_dist = False, num_serialized_regions = 6,
@@ -181,6 +225,7 @@ class ContextScheduler:
         self.waiting_exec_ids = SortedList()
         self.execs = {}
         self.debug = debug
+        self.skip_debug_num = 4
         self.is_dist = is_dist
         self.completion_barrier = threading.Barrier(num_execs)
         self.completion_signal_m2c = threading.Event()
@@ -201,25 +246,36 @@ class ContextScheduler:
         prefix = color_fnc(prefix) if color_fnc is not None else prefix
         return f"[{prefix}] {message}"
 
-    def _scheduler(self, force_switch = False):
+    def _scheduler(self, force_switch = False, skip_debug=False):
         if self.stop_scheduling:
             self.next_exec_id = None
             return
         if len(self.waiting_exec_ids) > 0:
             self.next_exec_id = self.active_exec_id
+            if self.debug and not skip_debug:
+                ready_keys = []
+                for exec_id, exec_context in self.execs.items():
+                    ready_keys.append(f"{exec_id}: {exec_context.ready_key}")
+                print(self.format_print("Current execs: " + 
+                      y_str(f"{ready_keys}"), r_str))
             for exec_id in self.waiting_exec_ids:
-                if self.execs[exec_id].comms_ops != [] and\
-                    self._check_all_comms_completed(exec_id):
-                    self.execs[exec_id].comms_ops = []
+                if self.execs[exec_id].ready_key == None and \
+                        self.execs[exec_id].event.query():
                     self.next_exec_id = exec_id
                     break
-                if self.execs[exec_id].event.query():
+                elif self.execs[exec_id].ready_key[0] == f"WAIT_COMMS" and\
+                        self._check_recv_comm_ready(exec_id):
                     self.next_exec_id = exec_id
                     break
+                elif self.execs[exec_id].ready_key[0] == f"SERIALIZED_REGION" and\
+                        self.execs[exec_id].serialized_regions[self.execs[exec_id].ready_key[1]].is_set():
+                    self.next_exec_id = exec_id
+                    break
+            
             if self.next_exec_id == self.active_exec_id and force_switch:
                 self.next_exec_id = self.waiting_exec_ids[0]   
             
-            if self.debug:
+            if self.debug and not skip_debug:
                 print(self.format_print("Current waiting execs: " + 
                       y_str(f"{self.waiting_exec_ids}") + ", Scheduling next exec " + 
                       y_str(f"{self.next_exec_id}"), r_str))
@@ -227,26 +283,28 @@ class ContextScheduler:
             # No execs waiting
             if force_switch:
                 self.next_exec_id = None # No active exec
-                if self.debug:
+                if self.debug and not skip_debug:
                     print(self.format_print("No execs waiting, no active exec, setting next exec to NONE. " +
                           "Scheduler will be deactivated.", r_str))
             else:
-                if self.debug:
+                if self.debug and not skip_debug:
                     print(self.format_print(" No execs waiting, scheduling active exec " + 
                         y_str(f"{self.active_exec_id}"), r_str))
                 self.next_exec_id = self.active_exec_id
 
-    def _release_context(self, exec_id):
+    def _release_context(self, exec_id, skip_debug=False):
         # Release the context lock and signal the next exec to resume.
         assert self.active_exec_id == exec_id, \
             f"Expected {self.active_exec_id} to be the active exec during release, " + \
             f"got {exec_id} running"
-        if self.debug:
+        if self.debug and not skip_debug:
             print(self.format_print("Yielding context of exec " + 
-                  y_str(f"{self.active_exec_id}") + ", next scheduled exec " + 
+                  y_str(f"{self.active_exec_id}") + ", ready key " + 
+                  y_str(f"{self.execs[self.active_exec_id].ready_key}") + ". " +
+                  "Next scheduled exec " + 
                   y_str(f"{self.next_exec_id}") + "\n", b_str), end="")
         self.execs[self.active_exec_id].signal.clear()
-        if self.execs[self.active_exec_id].comms_ops == []:
+        if self.execs[self.active_exec_id].ready_key == None:
             self.execs[self.active_exec_id].event.record(
                 self.execs[self.active_exec_id].stream)
         if self.next_exec_id is not None:
@@ -254,16 +312,16 @@ class ContextScheduler:
         self.active_exec_id = None
         self.context_lock.release()
 
-    def _acquire_context(self, exec_id):
+    def _acquire_context(self, exec_id, skip_debug=False):
         # Acquire the context lock and execute.
         # Append to the front of the list to maintain order
         self.waiting_exec_ids.add(exec_id)
         if self.active_exec_id is None and self.next_exec_id is None:
             self.next_exec_id = exec_id
-            if self.debug:
+            if self.debug and not skip_debug:
                 print(self.format_print("No active execs, acquiring context lock", b_str))
         else:
-            if self.debug:
+            if self.debug and not skip_debug:
                 print(self.format_print(f"Waiting for context switch of exec " + y_str(f"{exec_id}"), b_str))
             self.execs[exec_id].signal.wait()
         self.context_lock.acquire() 
@@ -271,16 +329,9 @@ class ContextScheduler:
             self.waiting_exec_ids.remove(exec_id)
         self.active_exec_id = exec_id
         torch.cuda.set_stream(self.execs[self.active_exec_id].stream)
-        if self.debug:
+        if self.debug and not skip_debug:
             print(self.format_print("Resuming exec context on stream " +
                 y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
-    
-    def _check_all_comms_completed(self, exec_id):
-        # Check if all comms ops are completed
-        for comms_op in self.execs[exec_id].comms_ops:
-            if not comms_op.is_completed():
-                return False
-        return True
 
     def add_exec(self, exec):
         # Add an exec to the scheduler.
@@ -294,9 +345,18 @@ class ContextScheduler:
         new_exec_signal.clear()
         new_exec_stream = torch.cuda.Stream()
         new_exec_event = torch.cuda.Event()
-        new_exec_comms_ops = []
         new_exec_event.record(new_exec_stream)
+        world_size = dist.get_world_size()
+        dist.barrier()
+        new_exec_gloo_group = dist.new_group(
+            ranks=list(range(world_size)),
+            backend="gloo",
+            group_desc=f"gloo_coordination_exec_{new_exec_id}"
+        )
+        print(self.format_print(f"New exec gloo group created, "
+                                f"ranks: {list(range(world_size))} - {new_exec_gloo_group}", r_str))
         new_exec_serialized_regions = []
+        new_exec_ready_key = None
         for i in range (self.num_serialized_regions):
             new_exec_serialized_regions.append(threading.Event())
             new_exec_serialized_regions[i].clear()
@@ -304,20 +364,23 @@ class ContextScheduler:
                                               new_exec_signal, 
                                               new_exec_stream, 
                                               new_exec_event,
-                                              new_exec_comms_ops,
-                                              new_exec_serialized_regions)
+                                              new_exec_gloo_group,
+                                              new_exec_serialized_regions,
+                                              new_exec_ready_key)
         if self.debug:
             print(self.format_print("Adding exec with id " + 
                   y_str(f"{new_exec_id}"), y_str))
         return new_exec_id
     
-    def context_switch(self, exec_id):
+    def context_switch(self, exec_id, skip_debug=False):
         # Schedule the next exec, release context of the current exec,
         # and enter the waiting queue until next context is acquired.
-        self._scheduler()
+        self._scheduler(skip_debug=skip_debug)
         if self.next_exec_id != self.active_exec_id:
-            self._release_context(exec_id)
-            self._acquire_context(exec_id)
+            self._release_context(exec_id, skip_debug=skip_debug)
+            self._acquire_context(exec_id, skip_debug=skip_debug)
+        elif self.debug and not skip_debug:
+            print(self.format_print("No context switch needed", b_str))
         return
 
     def attach_exec_to_context(self, exec_id):
@@ -343,9 +406,14 @@ class ContextScheduler:
     
     def enter_serialized_region(self, exec_id, region_id=0, region_name=""):
         # Enters a serialized region of code in the exec_id order.
-        self.execs[exec_id].serialized_regions[region_id].wait()
+        self.execs[exec_id].ready_key = (f"SERIALIZED_REGION", region_id)
+        loop_count = 0
+        while not self.execs[exec_id].serialized_regions[region_id].is_set():
+            self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
+            loop_count += 1
+        self.execs[exec_id].ready_key = None
         if self.debug:
-            print(self.format_print("Exec " + y_str(f"{exec_id} ") + g_str(f" Entering") + 
+            print(self.format_print("Exec " + y_str(f"{exec_id} ") + g_str(f"Entering") + 
                                     " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
         return
     
@@ -356,22 +424,69 @@ class ContextScheduler:
             # Signal the next exec to enter the serialized region
             self.execs[exec_id + 1].serialized_regions[region_id].set()
         if self.debug:
-            print(self.format_print("Exec " + y_str(f"{exec_id}") + r_str(f" Exiting") + 
+            print(self.format_print("Exec " + y_str(f"{exec_id} ") + r_str(f"Exiting") + 
                                     " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
         return
 
-    def wait_for_comms(self, exec_id, comms_ops):
+    def wait_for_send(self, exec_id, comm_region_id, comms_ops):
         # Wait for all comms ops to complete
-        self.execs[exec_id].comms_ops = comms_ops
         if self.debug:
-            print(self.format_print(f"Waiting for comms ops to complete, Ops: {comms_ops}", r_str))
-        while not self._check_all_comms_completed(exec_id):
-            self.context_switch(exec_id)
+            print(self.format_print(f"Waiting for comms ops to complete, region_id: {comm_region_id}, ops: {comms_ops}", r_str))
+        gloo_op_list = self._async_recv_comm_ready(exec_id, comm_region_id, comms_ops)
+        self.execs[exec_id].ready_key = (f"WAIT_COMMS", gloo_op_list)
+        loop_count = 0
+        while not self._check_recv_comm_ready(exec_id):
+            self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
+            loop_count += 1
+        self.execs[exec_id].ready_key = None
         if self.debug:
-            print(self.format_print(f"Comms ops completed, Ops: {comms_ops}", r_str))
-        self.execs[exec_id].comms_ops = []
+            print(self.format_print(f"Comms ops completed, region_id: {comm_region_id}, ops: {comms_ops}", r_str))
         return
-
+    
+    def _async_recv_comm_ready(self, exec_id, comm_region_id, comms_ops):
+        """Check if receiver is ready by polling for Gloo message from sender"""
+        gloo_op_list = []
+        for comms_op in comms_ops:
+            if comms_op.op == dist.irecv:
+                if self.debug:
+                    print(self.format_print(f"Converting nccl op to gloo op, "
+                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, peer: {comms_op.peer}", m_str))
+                # src = dist.get_global_rank(comms_op.group, comms_op.peer)
+                gloo_op = dist.irecv(torch.zeros(1, dtype=torch.int64), src=comms_op.peer, 
+                          group=self.execs[exec_id].gloo_group, tag=comm_region_id)
+                gloo_op_list.append(gloo_op)
+        if self.debug:
+            print(self.format_print(f"Receiving comm ready message, "
+                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, gloo_ops: {gloo_op_list}", m_str))
+        return gloo_op_list
+    
+    def _check_recv_comm_ready(self, exec_id):  
+        """Check if receiver is ready by polling for Gloo message from sender"""
+        gloo_op_list = self.execs[exec_id].ready_key[1]
+        for gloo_op in gloo_op_list:
+            if not gloo_op.is_completed():
+                return False
+        if self.debug:
+            print(self.format_print(f"Comms ops completed, gloo_ops: {gloo_op_list}", r_str))
+        return True
+        
+    def async_send_comm_ready(self, exec_id, comm_region_id, comms_ops):
+        gloo_op_list = []
+        for comms_op in comms_ops:
+            if comms_op.op == dist.isend:
+                if self.debug:
+                    print(self.format_print(f"Converting nccl op to gloo op, "
+                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, peer: {comms_op.peer}", c_str))
+                message_buffer = torch.tensor([comm_region_id], dtype=torch.int64)
+                # dst = dist.get_global_rank(comms_op.group, comms_op.peer)
+                gloo_op = dist.isend(message_buffer, dst=comms_op.peer, group=self.execs[exec_id].gloo_group,
+                           tag=comm_region_id)
+                gloo_op_list.append(gloo_op)
+        if self.debug:
+            print(self.format_print(f"Sending comm ready message, "
+                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, gloo_ops: {gloo_op_list}", c_str))
+        return
+    
     def start(self):
         assert len(self.execs) == self.num_execs, \
             f"Expected {self.num_execs} execs, got {len(self.execs)}"
@@ -400,6 +515,11 @@ class ContextScheduler:
         self.stop_scheduling = False
 
     def wait_completion(self):
+        if self.num_execs == 1:
+            if self.debug:
+                print(self.format_print("Single exec! Resuming main thread."))
+            self.context_lock.acquire()
+            return
         if self.debug:
             print(y_str(f"[Main Thread]") + " Waiting for completion of all execs.")
         self.completion_signal_c2m.wait() # Wait for all execs to complete
@@ -731,6 +851,10 @@ class ExecutionEngine(threading.Thread):
         if self.debug:
             print(self.format_print("Waiting for all execs to complete."))
         self.scheduler.completion_barrier.wait() # Wait for all execs to complete
+        if self.scheduler.num_execs == 1:
+            if self.debug:
+                print(self.format_print("Single exec! Waiting for next iteration..."))
+            return
         if not self.main_thread:
             self.scheduler.completion_signal_c2m.set() # Signal that the main thread can proceed to acquire the context lock
             if self.debug:
@@ -752,18 +876,16 @@ class ExecutionEngine(threading.Thread):
         # Detach the exec from the scheduler context,
         # The execution will now be independent of the scheduler and
         # the scheduler will no longer switch to this thread.
-        self.scheduler.detach_exec_from_context(self.exec_id)
         
         print(self.format_print(f"Fwd pass finished. Loss: {self.loss}"))
         
         self.scheduler.enter_serialized_region(self.exec_id, region_name="Backward")
-        self.scheduler.attach_exec_to_context(self.exec_id)
         
         # Backward pass
         self.loss.backward()
         
-        self.scheduler.detach_exec_from_context(self.exec_id)
         self.scheduler.exit_serialized_region(self.exec_id, region_name="Backward")
+        self.scheduler.detach_exec_from_context(self.exec_id)
         
         print(self.format_print("Bwd pass finished"))
 
@@ -813,6 +935,8 @@ class ExecutionEngine(threading.Thread):
             print(self.format_print(b_str(f"Forward hook") + " fired on " + 
                 y_str(f"{module.module_name}") + "\n", g_str), end="")
         self.scheduler.context_switch(self.exec_id)
+        if self.debug:
+            print(self.format_print("Forward hook completed", g_str))
 
     def backward_scheduler_hook(self, module, grad_input, grad_output):
         if self.backward_tid == -1:
@@ -824,6 +948,8 @@ class ExecutionEngine(threading.Thread):
             print(self.format_print(r_str(f"Backward hook") + " fired on " + 
                   y_str(f"{module.module_name}") + "\n", g_str, self.backward_tid), end="")
         self.scheduler.context_switch(self.exec_id)
+        if self.debug:
+            print(self.format_print("Backward hook completed", g_str))
 
     def create_backward_lock_hooks(self, layer_lock):
         """ Hooks to acquire/release a lock during the backward pass. """
