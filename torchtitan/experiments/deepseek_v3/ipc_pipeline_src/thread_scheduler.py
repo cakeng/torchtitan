@@ -34,7 +34,6 @@ from typing import Dict, Callable
 import signal
 import torch.distributed as dist
 from torch.distributed import DeviceMesh
-from ipc_pipeline_src.tsched_device_mesh import init_independent_device_mesh
 
 from accelerate import init_empty_weights
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, logging
