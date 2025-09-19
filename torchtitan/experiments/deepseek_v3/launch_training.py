@@ -7,7 +7,7 @@ from datetime import datetime
 import random
 
 run_type = sys.argv[1] if len(sys.argv) > 1 else ""
-mbp_size = 2
+mbp_size = 1
 pp_size = 2
 ep_size = 2
 fsdp_size = 1
@@ -29,7 +29,7 @@ num_gpus = pp_size * ep_size * fsdp_size
 run_id = datetime.now().strftime("%Y%m%d%H%M%S")
 #export run_id to env
 os.environ["RUN_ID"] = run_id
-os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_gpus))
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(0 + i) for i in range(num_gpus))
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "16"
 os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
 os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "3"

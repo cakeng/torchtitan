@@ -16,20 +16,16 @@
 #
 # All code formatted within 80 columns as requested [2025-05-21]
 
-from cProfile import label
-from tkinter import Y
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import threading
 from sortedcontainers import SortedList
-import time
-import copy
 import faulthandler
+import time
 import traceback
 import sys
 from dataclasses import dataclass
-from collections import deque
 from typing import Dict, Callable
 import signal
 import torch.distributed as dist
@@ -210,7 +206,7 @@ class ExecContext:
     signal: threading.Event
     stream: torch.cuda.Stream
     event: torch.cuda.Event
-    gloo_group: dist.ProcessGroup
+    mpi_group: dist.ProcessGroup
     serialized_regions: list[threading.Event]
     ready_key: tuple[str, int] | tuple[str, list[dist.Work]] | None
 class ContextScheduler:
@@ -332,6 +328,38 @@ class ContextScheduler:
             print(self.format_print("Resuming exec context on stream " +
                 y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
 
+    def check_mpi_comms(self):
+        send_work = []
+        recv_work = []
+        for exec_id in self.execs:
+            num_ranks = dist.get_world_size()
+            for i in range(num_ranks):
+                for j in range(num_ranks):
+                    if i == j:
+                        continue
+                    my_rank = dist.get_rank()
+                    tag = i * 10000 + j * 100 + exec_id
+                    test_tensor = torch.tensor([my_rank])
+                    if my_rank == i:
+                        dist.isend(test_tensor, dst=j, 
+                                   group=self.execs[exec_id].mpi_group, tag=tag).wait()
+                        if self.debug:
+                            print(self.format_print(f"[Exec {exec_id}] MPI comms check, sending: "
+                                                    f"rank: {my_rank}, src: {i}, dst: {j}, tag: {tag}, test_tensor: {test_tensor}", g_str))
+                    elif my_rank == j:
+                        dist.irecv(test_tensor, 
+                                   src=i, group=self.execs[exec_id].mpi_group, tag=tag).wait() 
+                        if self.debug:
+                            print(self.format_print(f"[Exec {exec_id}] MPI comms check, receiving: "
+                                                    f"rank: {my_rank}, src: {i}, dst: {j}, tag: {tag}, test_tensor: {test_tensor}", g_str))
+                        if test_tensor.item() != i:
+                            assert False, f"MPI comms check failed, receiving: " + \
+                                f"rank: {my_rank}, src: {i}, dst: {j}, tag: {tag}, test_tensor: {test_tensor}" + \
+                                f"Expected: {i}, Actual: {test_tensor.item()}"
+        if self.debug:
+            print(self.format_print("MPI comms check passed", g_str))
+        return True
+
     def add_exec(self, exec):
         # Add an exec to the scheduler.
         for exec_id in self.execs:
@@ -347,13 +375,13 @@ class ContextScheduler:
         new_exec_event.record(new_exec_stream)
         world_size = dist.get_world_size()
         dist.barrier()
-        new_exec_gloo_group = dist.new_group(
+        new_exec_mpi_group = dist.new_group(
             ranks=list(range(world_size)),
-            backend="gloo",
-            group_desc=f"gloo_coordination_exec_{new_exec_id}"
+            backend="mpi",
+            group_desc=f"mpi_coordination_exec_{new_exec_id}"
         )
-        print(self.format_print(f"New exec gloo group created, "
-                                f"ranks: {list(range(world_size))} - {new_exec_gloo_group}", r_str))
+        print(self.format_print(f"New exec mpi group created, "
+                                f"ranks: {list(range(world_size))} - {new_exec_mpi_group}", r_str))
         new_exec_serialized_regions = []
         new_exec_ready_key = None
         for i in range (self.num_serialized_regions):
@@ -363,7 +391,7 @@ class ContextScheduler:
                                               new_exec_signal, 
                                               new_exec_stream, 
                                               new_exec_event,
-                                              new_exec_gloo_group,
+                                              new_exec_mpi_group,
                                               new_exec_serialized_regions,
                                               new_exec_ready_key)
         if self.debug:
@@ -431,8 +459,8 @@ class ContextScheduler:
         # Wait for all comms ops to complete
         if self.debug:
             print(self.format_print(f"Waiting for comms ops to complete, region_id: {comm_region_id}, ops: {comms_ops}", r_str))
-        gloo_op_list = self._async_recv_comm_ready(exec_id, comm_region_id, comms_ops)
-        self.execs[exec_id].ready_key = (f"WAIT_COMMS", gloo_op_list)
+        mpi_op_list = self._async_recv_comm_ready(exec_id, comm_region_id, comms_ops)
+        self.execs[exec_id].ready_key = (f"WAIT_COMMS", mpi_op_list)
         loop_count = 0
         while not self._check_recv_comm_ready(exec_id):
             self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
@@ -443,47 +471,72 @@ class ContextScheduler:
         return
     
     def _async_recv_comm_ready(self, exec_id, comm_region_id, comms_ops):
-        """Check if receiver is ready by polling for Gloo message from sender"""
-        gloo_op_list = []
+        """Check if receiver is ready by polling for MPI message from sender"""
+        mpi_op_list = []
         for comms_op in comms_ops:
             if comms_op.op == dist.irecv:
-                if self.debug:
-                    print(self.format_print(f"Converting nccl op to gloo op, "
-                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, peer: {comms_op.peer}", m_str))
                 # src = dist.get_global_rank(comms_op.group, comms_op.peer)
-                gloo_op = dist.irecv(torch.zeros(1, dtype=torch.int64), src=comms_op.peer, 
-                          group=self.execs[exec_id].gloo_group, tag=comm_region_id)
-                gloo_op_list.append(gloo_op)
+                recv_rank = dist.get_rank()
+                send_rank = comms_op.peer
+                tag = send_rank * 1000000 + recv_rank * 10000 + exec_id * 100 + comm_region_id
+                if self.debug:
+                    print(self.format_print(f"Receiving MPI message, "
+                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, send_rank: {send_rank}, recv_rank: {recv_rank}, tag: {tag}", m_str))
+                message_buffer = torch.tensor([0], dtype=torch.int64, device=torch.device("cpu"))
+                mpi_op = dist.irecv(message_buffer, src=send_rank, 
+                          group=self.execs[exec_id].mpi_group, tag=tag)
+                mpi_op_list.append((mpi_op, message_buffer, comm_region_id, send_rank, recv_rank, tag))
         if self.debug:
-            print(self.format_print(f"Receiving comm ready message, "
-                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, gloo_ops: {gloo_op_list}", m_str))
-        return gloo_op_list
+            print(self.format_print(f"Receiving comm ready MPI messages, "
+                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, mpi_ops: {mpi_op_list}", m_str))
+        return mpi_op_list
     
     def _check_recv_comm_ready(self, exec_id):  
-        """Check if receiver is ready by polling for Gloo message from sender"""
-        gloo_op_list = self.execs[exec_id].ready_key[1]
-        for gloo_op in gloo_op_list:
-            if not gloo_op.is_completed():
+        """Check if receiver is ready by polling for MPI message from sender"""
+        # if self.debug:
+        #     print(self.format_print(f"Checking if all recv ready, exec_id: {exec_id}, ready_key: {self.execs[exec_id].ready_key}", r_str))
+        mpi_op_list = self.execs[exec_id].ready_key[1]
+        for mpi_op in mpi_op_list:
+            # mpi_op[0].wait()
+            while not mpi_op[0].is_completed():
+                time.sleep(0.1)
+                pass
+            if not mpi_op[0].is_completed():
                 return False
-        if self.debug:
-            print(self.format_print(f"Comms ops completed, gloo_ops: {gloo_op_list}", r_str))
+            message_buffer = mpi_op[1]
+            send_rank = mpi_op[3]
+            recv_rank = mpi_op[4]
+            tag = mpi_op[5]
+            if self.debug:
+                print(self.format_print(f"Received MPI message, " + \
+                                        f"src: {send_rank}, send_rank: {recv_rank}, recv_rank: {send_rank}, tag: {tag}, test_tensor: {message_buffer}" + \
+                                        f"Expected: {mpi_op[2]}, Actual: {message_buffer.item()}", g_str))
+            assert message_buffer.item() == mpi_op[2], self.format_print(f"MPI comms check failed, receiving: " + \
+                f"src: {send_rank}, dst: {recv_rank}, tag: {tag}, test_tensor: {message_buffer}" + \
+                f"Expected: {mpi_op[2]}, Actual: {message_buffer.item()}", r_str)
+        
+        if self.debug:  
+            print(self.format_print(f"All recv ready, mpi_ops: {mpi_op_list}", r_str))
         return True
         
     def async_send_comm_ready(self, exec_id, comm_region_id, comms_ops):
-        gloo_op_list = []
+        mpi_op_list = []
         for comms_op in comms_ops:
             if comms_op.op == dist.isend:
-                if self.debug:
-                    print(self.format_print(f"Converting nccl op to gloo op, "
-                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, peer: {comms_op.peer}", c_str))
-                message_buffer = torch.tensor([comm_region_id], dtype=torch.int64)
+                send_rank = dist.get_rank()
+                recv_rank = comms_op.peer
+                tag = send_rank * 1000000 + recv_rank * 10000 + exec_id * 100 + comm_region_id
+                message_buffer = torch.tensor([comm_region_id], dtype=torch.int64, device=torch.device("cpu"))
                 # dst = dist.get_global_rank(comms_op.group, comms_op.peer)
-                gloo_op = dist.isend(message_buffer, dst=comms_op.peer, group=self.execs[exec_id].gloo_group,
-                           tag=comm_region_id)
-                gloo_op_list.append(gloo_op)
+                if self.debug:
+                    print(self.format_print(f"Sending MPI message, "
+                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, send_rank: {send_rank}, recv_rank: {recv_rank}, tag: {tag}", c_str))
+                mpi_op = dist.isend(message_buffer, dst=recv_rank, group=self.execs[exec_id].mpi_group,
+                           tag=tag)
+                mpi_op_list.append((mpi_op, message_buffer, comm_region_id, send_rank, recv_rank, tag))
         if self.debug:
-            print(self.format_print(f"Sending comm ready message, "
-                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, gloo_ops: {gloo_op_list}", c_str))
+            print(self.format_print(f"Sent comm ready MPI messages, "
+                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, mpi_ops: {mpi_op_list}", c_str))
         return
     
     def start(self):

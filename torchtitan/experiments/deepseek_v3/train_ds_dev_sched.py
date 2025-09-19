@@ -238,6 +238,10 @@ def run_full_model(
         # currently supported for forward only. See `generate.py`.
         # model.setup_symm_mem(torch.bfloat16, device)
 
+    # dist.barrier()
+    # context_scheduler.check_gloo_comms()
+    # dist.barrier()
+    # assert 0
 
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
