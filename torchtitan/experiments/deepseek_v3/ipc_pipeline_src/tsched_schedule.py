@@ -315,8 +315,8 @@ class ScheduleTsched(TschedScheduleSingle):
             scheduler.enter_serialized_region(exec_id, region_id=0, 
                                               region_name="Forward_recv")
             ops = self._stage.get_fwd_recv_ops()     
-            scheduler.wait_for_send(exec_id, 0, ops)
             work_sync = _batch_p2p_non_coalescing(ops, desc="fwd_recv", microbatch_idx=self._microbatch_idx) # P2P ops must be serialized in microbatch (exec) order
+            scheduler.wait_for_send(exec_id, 0, work_sync)
             for work in work_sync:
                 work.wait()
             scheduler.exit_serialized_region(exec_id, region_id=0, 
@@ -353,8 +353,8 @@ class ScheduleTsched(TschedScheduleSingle):
         # Backward pass
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
             ops = self._stage.get_bwd_recv_ops()
-            scheduler.wait_for_send(exec_id, 1, ops)
             work_sync = _batch_p2p_non_coalescing(ops, desc="bwd_recv", microbatch_idx=self._microbatch_idx)
+            scheduler.wait_for_send(exec_id, 1, work_sync)
             for work in work_sync:
                 work.wait()
             print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
