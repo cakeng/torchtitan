@@ -312,36 +312,24 @@ class ScheduleTsched(TschedScheduleSingle):
         scheduler.attach_exec_to_context(exec_id) 
 
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward"):
-            scheduler.enter_serialized_region(exec_id, region_id=0, 
-                                              region_name="Forward_recv")
-            ops = self._stage.get_fwd_recv_ops()     
-            work_sync = _batch_p2p_non_coalescing(ops, desc="fwd_recv", microbatch_idx=self._microbatch_idx) # P2P ops must be serialized in microbatch (exec) order
-            scheduler.wait_for_send(exec_id, 0, work_sync)
-            for work in work_sync:
-                work.wait()
-            scheduler.exit_serialized_region(exec_id, region_id=0, 
-                                              region_name="Forward_recv")
-            
-            
-
+            ops, comm_key = self._stage.get_fwd_recv_ops()     
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, desc="fwd_recv", microbatch_idx=self._microbatch_idx),
+                                    comm_key, True)
             print(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
-                  b_str(f"Forwarding {self._microbatch_idx}") + f", received {ops}")
+                  b_str(f"Forwarding {self._microbatch_idx}") + f", received {ops}, comm_key: {comm_key}")
             
         
             with torch.profiler.record_function(f"Forward {step_idx}"):
                 output = self._stage.forward_one_chunk(args, kwargs)
         
-            
-            scheduler.enter_serialized_region(exec_id, region_id=1, 
-                                            region_name="Forward_send")
+
             ops = self._stage.get_fwd_send_ops()
             print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                            b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}")
-            # scheduler.async_send_comm_ready(exec_id, 0, ops)
-            works.extend(_batch_p2p_non_coalescing(ops, desc="fwd_send", microbatch_idx=self._microbatch_idx))
-            
-            scheduler.exit_serialized_region(exec_id, region_id=1, 
-                                            region_name="Forward_send")
+                            b_str(f"Forwarded {self._microbatch_idx}") + f", sending {ops}, comm_key: {comm_key}")
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, desc="fwd_send", microbatch_idx=self._microbatch_idx),
+                                    1, False)
 
             # Compute loss if this is the last stage
             self._maybe_compute_loss(self._stage, output, target)
@@ -352,13 +340,13 @@ class ScheduleTsched(TschedScheduleSingle):
                                               region_name="Backward")
         # Backward pass
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
-            ops = self._stage.get_bwd_recv_ops()
-            work_sync = _batch_p2p_non_coalescing(ops, desc="bwd_recv", microbatch_idx=self._microbatch_idx)
-            scheduler.wait_for_send(exec_id, 1, work_sync)
-            for work in work_sync:
-                work.wait()
+            ops, comm_key = self._stage.get_bwd_recv_ops()
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, desc="bwd_recv", microbatch_idx=self._microbatch_idx),
+                                    comm_key, True)
+
             print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                         r_str(f"Backwarding {self._microbatch_idx}") + f", received {ops}")
+                         r_str(f"Backwarding {self._microbatch_idx}") + f", received {ops}, comm_key: {comm_key}")
 
             # For single microbatch, loss is directly available
             loss = self._maybe_get_loss(self._stage)
@@ -366,11 +354,12 @@ class ScheduleTsched(TschedScheduleSingle):
                 f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward pass"):
                 self._stage.backward_one_chunk(loss=loss)
                 
-            ops = self._stage.get_bwd_send_ops()
+            ops, comm_key = self._stage.get_bwd_send_ops()
             print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                         r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}")
-            # scheduler.async_send_comm_ready(exec_id, 1, ops)
-            works.extend(_batch_p2p_non_coalescing(ops, desc="bwd_send", microbatch_idx=self._microbatch_idx))
+                         r_str(f"Backwarded {self._microbatch_idx}") + f", sending {ops}, comm_key: {comm_key}")
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, desc="bwd_send", microbatch_idx=self._microbatch_idx),
+                                    comm_key, False)
             self._update_losses(self._stage, losses)
             
         scheduler.exit_serialized_region(exec_id, region_id=2, 

@@ -206,9 +206,10 @@ class ExecContext:
     signal: threading.Event
     stream: torch.cuda.Stream
     event: torch.cuda.Event
-    gloo_group: dist.ProcessGroup
     serialized_regions: list[threading.Event]
-    ready_key: tuple[str, int] | tuple[str, list[dist.Work]] | None
+    ready_info: dict[str, any]
+    comm_works_wait: list[dist.Work] = []
+    comm_works_dispatch: list[dist.Work] = []
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
     def __init__(self, num_execs, is_dist = False, num_serialized_regions = 6,
@@ -222,6 +223,7 @@ class ContextScheduler:
         self.debug = debug
         self.skip_debug_num = 4
         self.is_dist = is_dist
+        self.comm_order_key = 0
         self.completion_barrier = threading.Barrier(num_execs)
         self.completion_signal_m2c = threading.Event()
         self.completion_signal_m2c.clear()
@@ -248,22 +250,22 @@ class ContextScheduler:
         if len(self.waiting_exec_ids) > 0:
             self.next_exec_id = self.active_exec_id
             if self.debug and not skip_debug:
-                ready_keys = []
+                ready_infos = []
                 for exec_id, exec_context in self.execs.items():
-                    ready_keys.append(f"{exec_id}: {exec_context.ready_key}")
+                    ready_infos.append(f"{exec_id}: {exec_context.ready_info}")
                 print(self.format_print("Current execs: " + 
-                      y_str(f"{ready_keys}"), r_str))
+                      y_str(f"{ready_infos}"), r_str))
             for exec_id in self.waiting_exec_ids:
-                if self.execs[exec_id].ready_key == None and \
+                if self.execs[exec_id].ready_info == None and \
                         self.execs[exec_id].event.query():
                     self.next_exec_id = exec_id
                     break
-                elif self.execs[exec_id].ready_key[0] == f"WAIT_COMMS" and\
-                        self._check_recv_comm_ready(exec_id):
+                elif self.execs[exec_id].ready_info["key"] == "WAIT_COMMS" and\
+                        self._check_comm(exec_id):
                     self.next_exec_id = exec_id
                     break
-                elif self.execs[exec_id].ready_key[0] == f"SERIALIZED_REGION" and\
-                        self.execs[exec_id].serialized_regions[self.execs[exec_id].ready_key[1]].is_set():
+                elif self.execs[exec_id].ready_info["key"] == "SERIALIZED_REGION" and\
+                        self.execs[exec_id].serialized_regions[self.execs[exec_id].ready_info["region_id"]].is_set():
                     self.next_exec_id = exec_id
                     break
             
@@ -295,11 +297,11 @@ class ContextScheduler:
         if self.debug and not skip_debug:
             print(self.format_print("Yielding context of exec " + 
                   y_str(f"{self.active_exec_id}") + ", ready key " + 
-                  y_str(f"{self.execs[self.active_exec_id].ready_key}") + ". " +
+                  y_str(f"{self.execs[self.active_exec_id].ready_info}") + ". " +
                   "Next scheduled exec " + 
                   y_str(f"{self.next_exec_id}") + "\n", b_str), end="")
         self.execs[self.active_exec_id].signal.clear()
-        if self.execs[self.active_exec_id].ready_key == None:
+        if self.execs[self.active_exec_id].ready_info == None:
             self.execs[self.active_exec_id].event.record(
                 self.execs[self.active_exec_id].stream)
         if self.next_exec_id is not None:
@@ -328,38 +330,6 @@ class ContextScheduler:
             print(self.format_print("Resuming exec context on stream " +
                 y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
 
-    def check_gloo_comms(self):
-        send_work = []
-        recv_work = []
-        for exec_id in self.execs:
-            num_ranks = dist.get_world_size()
-            for i in range(num_ranks):
-                for j in range(num_ranks):
-                    if i == j:
-                        continue
-                    my_rank = dist.get_rank()
-                    tag = i * 10000 + j * 100 + exec_id
-                    test_tensor = torch.tensor([my_rank])
-                    if my_rank == i:
-                        dist.isend(test_tensor, dst=j, 
-                                   group=self.execs[exec_id].gloo_group, tag=tag).wait()
-                        if self.debug:
-                            print(self.format_print(f"[Exec {exec_id}] Gloo comms check, sending: "
-                                                    f"rank: {my_rank}, src: {i}, dst: {j}, tag: {tag}, test_tensor: {test_tensor}", g_str))
-                    elif my_rank == j:
-                        dist.irecv(test_tensor, 
-                                   src=i, group=self.execs[exec_id].gloo_group, tag=tag).wait() 
-                        if self.debug:
-                            print(self.format_print(f"[Exec {exec_id}] Gloo comms check, receiving: "
-                                                    f"rank: {my_rank}, src: {i}, dst: {j}, tag: {tag}, test_tensor: {test_tensor}", g_str))
-                        if test_tensor.item() != i:
-                            assert False, f"Gloo comms check failed, receiving: " + \
-                                f"rank: {my_rank}, src: {i}, dst: {j}, tag: {tag}, test_tensor: {test_tensor}" + \
-                                f"Expected: {i}, Actual: {test_tensor.item()}"
-        if self.debug:
-            print(self.format_print("Gloo comms check passed", g_str))
-        return True
-
     def add_exec(self, exec):
         # Add an exec to the scheduler.
         for exec_id in self.execs:
@@ -373,17 +343,8 @@ class ContextScheduler:
         new_exec_stream = torch.cuda.Stream()
         new_exec_event = torch.cuda.Event()
         new_exec_event.record(new_exec_stream)
-        world_size = dist.get_world_size()
-        dist.barrier()
-        new_exec_gloo_group = dist.new_group(
-            ranks=list(range(world_size)),
-            backend="gloo",
-            group_desc=f"gloo_coordination_exec_{new_exec_id}"
-        )
-        print(self.format_print(f"New exec gloo group created, "
-                                f"ranks: {list(range(world_size))} - {new_exec_gloo_group}", r_str))
         new_exec_serialized_regions = []
-        new_exec_ready_key = None
+        new_exec_ready_info = None
         for i in range (self.num_serialized_regions):
             new_exec_serialized_regions.append(threading.Event())
             new_exec_serialized_regions[i].clear()
@@ -391,9 +352,8 @@ class ContextScheduler:
                                               new_exec_signal, 
                                               new_exec_stream, 
                                               new_exec_event,
-                                              new_exec_gloo_group,
                                               new_exec_serialized_regions,
-                                              new_exec_ready_key)
+                                              new_exec_ready_info)
         if self.debug:
             print(self.format_print("Adding exec with id " + 
                   y_str(f"{new_exec_id}"), y_str))
@@ -433,12 +393,12 @@ class ContextScheduler:
     
     def enter_serialized_region(self, exec_id, region_id=0, region_name=""):
         # Enters a serialized region of code in the exec_id order.
-        self.execs[exec_id].ready_key = (f"SERIALIZED_REGION", region_id)
+        self.execs[exec_id].ready_info = {"key": "SERIALIZED_REGION", "region_id": region_id}
         loop_count = 0
         while not self.execs[exec_id].serialized_regions[region_id].is_set():
             self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
             loop_count += 1
-        self.execs[exec_id].ready_key = None
+        self.execs[exec_id].ready_info = None
         if self.debug:
             print(self.format_print("Exec " + y_str(f"{exec_id} ") + g_str(f"Entering") + 
                                     " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
@@ -455,99 +415,59 @@ class ContextScheduler:
                                     " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
         return
 
-    def wait_for_send(self, exec_id, comm_region_id, comms_ops):
+    def schedule_comm(self, exec_id, comm_func, comm_key, wait_for_completion):
         # Wait for all comms ops to complete
         if self.debug:
-            print(self.format_print(f"Waiting for comms ops to complete, region_id: {comm_region_id}, ops: {comms_ops}", r_str))
-        # gloo_op_list = self._async_recv_comm_ready(exec_id, comm_region_id, comms_ops)
-        self.execs[exec_id].ready_key = (f"WAIT_COMMS", comms_ops)
+            print(self.format_print(f"Waiting for comms ops to complete, comm_key: {comm_key}, func: {comm_func}", r_str))
+        self.execs[exec_id].ready_info = {"key": "WAIT_COMMS", 
+                                          "comm_func": comm_func, 
+                                          "comm_key": comm_key, 
+                                          "wait_for_completion": wait_for_completion}
         loop_count = 0
-        while not self._check_recv_comm_ready(exec_id):
+        while not self._check_comm(exec_id):
             self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
             loop_count += 1
-        self.execs[exec_id].ready_key = None
+        self.execs[exec_id].ready_info = None
         if self.debug:
-            print(self.format_print(f"Comms ops completed, region_id: {comm_region_id}, ops: {comms_ops}", r_str))
+            print(self.format_print(f"Comms ops completed, comm_key: {comm_key}, func: {comm_func}", r_str))
         return
     
-    def _async_recv_comm_ready(self, exec_id, comm_region_id, comms_ops):
+    def _check_comm(self, exec_id):  
         """Check if receiver is ready by polling for Gloo message from sender"""
-        gloo_op_list = []
-        for comms_op in comms_ops:
-            if comms_op.op == dist.irecv:
-                # src = dist.get_global_rank(comms_op.group, comms_op.peer)
-                recv_rank = dist.get_rank()
-                send_rank = comms_op.peer
-                tag = send_rank * 1000000 + recv_rank * 10000 + exec_id * 100 + comm_region_id
-                if self.debug:
-                    print(self.format_print(f"Receiving Gloo message, "
-                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, send_rank: {send_rank}, recv_rank: {recv_rank}, tag: {tag}", m_str))
-                message_buffer = torch.tensor([0], dtype=torch.int64, device=torch.device("cpu"))
-                gloo_op = dist.irecv(message_buffer, src=send_rank, 
-                          group=self.execs[exec_id].gloo_group, tag=tag)
-                gloo_op_list.append((gloo_op, message_buffer, comm_region_id, send_rank, recv_rank, tag))
-        if self.debug:
-            print(self.format_print(f"Receiving comm ready Gloo messages, "
-                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, gloo_ops: {gloo_op_list}", m_str))
-        return gloo_op_list
-    
-    def _check_recv_comm_ready(self, exec_id):  
-        """Check if receiver is ready by polling for Gloo message from sender"""
-        # if self.debug:
-        #     print(self.format_print(f"Checking if all recv ready, exec_id: {exec_id}, ready_key: {self.execs[exec_id].ready_key}", r_str))
-        # gloo_op_list = self.execs[exec_id].ready_key[1]
-        # for gloo_op in gloo_op_list:
-        #     # gloo_op[0].wait()
-        #     while not gloo_op[0].is_completed():
-        #         time.sleep(0.1)
-        #         pass
-        #     if not gloo_op[0].is_completed():
-        #         return False
-        #     message_buffer = gloo_op[1]
-        #     send_rank = gloo_op[3]
-        #     recv_rank = gloo_op[4]
-        #     tag = gloo_op[5]
-        #     if self.debug:
-        #         print(self.format_print(f"Received Gloo message, " + \
-        #                                 f"src: {send_rank}, send_rank: {recv_rank}, recv_rank: {send_rank}, tag: {tag}, test_tensor: {message_buffer}" + \
-        #                                 f"Expected: {gloo_op[2]}, Actual: {message_buffer.item()}", g_str))
-        #     assert message_buffer.item() == gloo_op[2], self.format_print(f"Gloo comms check failed, receiving: " + \
-        #         f"src: {send_rank}, dst: {recv_rank}, tag: {tag}, test_tensor: {message_buffer}" + \
-        #         f"Expected: {gloo_op[2]}, Actual: {message_buffer.item()}", r_str)
-        
-        # if self.debug:  
-        #     print(self.format_print(f"All recv ready, gloo_ops: {gloo_op_list}", r_str))
-        # return True
+        if self.comm_order_key == self.execs[exec_id].ready_info["comm_key"]:
+            self.execs[exec_id].ready_info["comm_key"] = -1
+            if not self.execs[exec_id].ready_info["wait_for_completion"]:
+                self.execs[exec_id].comm_works_dispatch.extend(self.execs[exec_id].ready_info["comm_func"]())
+            else:
+                self.execs[exec_id].comm_works_wait.extend(self.execs[exec_id].ready_info["comm_func"]())
+            self.comm_order_key += 1
+        if not self.execs[exec_id].ready_info["wait_for_completion"]:
+            return True
+        if self.execs[exec_id].ready_info["comm_key"] == -1:
+            for work in self.execs[exec_id].comm_works_wait:
+                if not work.is_completed():
+                    return False
+            self.execs[exec_id].comm_works_wait = []
+            return True
+        if self.execs[exec_id].ready_info["comm_key"] != -1 and self.comm_order_key > self.execs[exec_id].ready_info["comm_key"]:
+            raise ValueError(r_str(f"Comm total order failed! Order key {self.comm_order_key} is greater than comm key {self.execs[exec_id].ready_info[2]}"))
 
-        comms_list = self.execs[exec_id].ready_key[1]
-        for comm in comms_list:
-            if not comm.is_completed():
-                return False
-        return True
-        
-    def async_send_comm_ready(self, exec_id, comm_region_id, comms_ops):
-        gloo_op_list = []
-        for comms_op in comms_ops:
-            if comms_op.op == dist.isend:
-                send_rank = dist.get_rank()
-                recv_rank = comms_op.peer
-                tag = send_rank * 1000000 + recv_rank * 10000 + exec_id * 100 + comm_region_id
-                message_buffer = torch.tensor([comm_region_id], dtype=torch.int64, device=torch.device("cpu"))
-                # dst = dist.get_global_rank(comms_op.group, comms_op.peer)
-                if self.debug:
-                    print(self.format_print(f"Sending Gloo message, "
-                                            f"region_id: {comm_region_id}, nccl op: {comms_op}, send_rank: {send_rank}, recv_rank: {recv_rank}, tag: {tag}", c_str))
-                gloo_op = dist.isend(message_buffer, dst=recv_rank, group=self.execs[exec_id].gloo_group,
-                           tag=tag)
-                gloo_op_list.append((gloo_op, message_buffer, comm_region_id, send_rank, recv_rank, tag))
-        if self.debug:
-            print(self.format_print(f"Sent comm ready Gloo messages, "
-                                    f"region_id: {comm_region_id}, nccl ops: {comms_ops}, gloo_ops: {gloo_op_list}", c_str))
+        return False
+
+    def wait_all_comm_works(self, exec_id):
+        for work in self.execs[exec_id].comm_works_wait:
+            work.wait()
+        self.execs[exec_id].comm_works_wait = []
+        for work in self.execs[exec_id].comm_works_dispatch:
+            work.wait()
+        self.execs[exec_id].comm_works_dispatch = []
         return
-    
-    def start(self):
-        assert len(self.execs) == self.num_execs, \
-            f"Expected {self.num_execs} execs, got {len(self.execs)}"
+
+    def increment_comm_order_key(self):
+        self.comm_order_key += 1
+        return
+
+    def reset(self):
         for exec_id in self.execs:
             self.execs[exec_id].signal.clear()
         for i in range (self.num_serialized_regions):
@@ -558,12 +478,20 @@ class ContextScheduler:
                     self.execs[j].serialized_regions[i].clear()
         self.active_exec_id = None
         self.stop_scheduling = False
+        self.comm_order_key = 0
+        self.completion_signal_c2m.clear()
+        self.completion_signal_m2c.clear()
+        return
+    
+    def start(self, reset=True):
+        assert len(self.execs) == self.num_execs, \
+            f"Expected {self.num_execs} execs, got {len(self.execs)}"
+        if reset:
+            self.reset()
         if self.next_exec_id is None:
             self._scheduler(force_switch=True)
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id].signal.set()
-        self.completion_signal_c2m.clear()
-        self.completion_signal_m2c.clear()
         self.context_lock.release()
         return
         

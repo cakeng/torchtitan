@@ -166,6 +166,7 @@ class _TschedStageBase(ABC):
         self.num_stages = num_stages
         self.device = device
         self.group = group
+        self.total_order_keys = []
 
         self.dw_builder = dw_builder
 
@@ -210,6 +211,8 @@ class _TschedStageBase(ABC):
         self.stage_index_to_group_rank: dict[int, int] = {
             i: i % self.group_size for i in range(self.num_stages)
         }
+
+        self._calculate_total_order_keys()
 
     @property
     def has_backward(self) -> bool:
@@ -403,6 +406,13 @@ class _TschedStageBase(ABC):
             )
             info.buffer = tensor
 
+    def _calculate_total_order_keys(self) -> int:
+        self.total_order_keys.append(self.stage_index)
+        print(g_str(f"[Stage {self.stage_index}] ") + 
+              r_str(f"Calculated total order key: ") +  
+              f"{self.total_order_keys}")
+        return
+
     def get_fwd_recv_ops(self) -> list[dist.P2POp]:
         """
         Returns a list of ops that are needed to receive the input arguments
@@ -410,7 +420,7 @@ class _TschedStageBase(ABC):
         """
         recv_infos: tuple[InputInfo, ...] = self.args_recv_info
 
-        return self._get_recv_ops(recv_infos)
+        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx][0]
 
     def get_bwd_recv_ops(self) -> list[dist.P2POp]:
         """
@@ -421,7 +431,7 @@ class _TschedStageBase(ABC):
             return []
 
         recv_infos = self.grad_recv_info    
-        return self._get_recv_ops(recv_infos)
+        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx][1]
 
     def get_fwd_send_ops(self) -> list[dist.P2POp]:
         """
@@ -448,7 +458,7 @@ class _TschedStageBase(ABC):
                 ops.append(dist.P2POp(dist.isend, out, peer_global_rank, 
                                       self.group))
 
-        return ops
+        return ops, self.total_order_keys[self.microbatch_idx][2]
 
     def get_bwd_send_ops(self) -> list[dist.P2POp]:
         """
@@ -483,7 +493,7 @@ class _TschedStageBase(ABC):
                         f"[{self.stage_index}] for chunk {self.microbatch_idx} has gradients {grad} "
                         f"and is expecting to send gradients to stage {grad_recv_stage}"
                     )
-        return ops
+        return ops, self.total_order_keys[self.microbatch_idx][3]
 
     def clear_runtime_states(self) -> None:
         """
