@@ -159,6 +159,10 @@ class _TschedStageBase(ABC):
             raise ValueError(
                 f"Stage index {stage_index} is out of range of {num_stages}"
             )
+        if num_stages % 2 != 0:
+            raise ValueError(
+                f"Number of stages {num_stages} must be even"
+            )
 
         self.submod = submodule
         self.microbatch_idx = microbatch_idx
@@ -407,7 +411,34 @@ class _TschedStageBase(ABC):
             info.buffer = tensor
 
     def _calculate_total_order_keys(self) -> int:
-        self.total_order_keys.append(self.stage_index)
+        pp_stage = self.stage_index 
+        num_stages = self.num_stages
+        delta = num_stages  - pp_stage
+        num_microbatches = self.num_microbatches
+        order_key = 0
+        for n in range(num_microbatches):
+            self.total_order_keys[n] = {"fwd_recv": -1, "fwd_send": -1, 
+                                        "bwd_recv": -1, "bwd_send": -1}
+        for n in range(num_microbatches):
+            if pp_stage % 2 == 0:
+                self.total_order_keys[n - pp_stage//2]["fwd_recv"] = order_key
+                order_key += 1
+                self.total_order_keys[n - 2*num_stages + pp_stage//2]["bwd_recv"] = order_key
+                order_key += 1
+                self.total_order_keys[n - 2*num_stages + pp_stage//2]["bwd_send"] = order_key
+                order_key += 1
+                self.total_order_keys[n - pp_stage//2]["fwd_send"] = order_key
+                order_key += 1
+            else:
+                self.total_order_keys[n - 1 - pp_stage//2]["fwd_send"] = order_key
+                order_key += 1
+                self.total_order_keys[n + 2*num_stages - pp_stage//2]["bwd_send"] = order_key
+                order_key += 1
+                self.total_order_keys[n + 2*num_stages - pp_stage//2 + 1]["bwd_recv"] = order_key
+                order_key += 1
+                self.total_order_keys[n - pp_stage//2]["fwd_recv"] = order_key
+                order_key += 1
+                
         print(g_str(f"[Stage {self.stage_index}] ") + 
               r_str(f"Calculated total order key: ") +  
               f"{self.total_order_keys}")
@@ -420,7 +451,7 @@ class _TschedStageBase(ABC):
         """
         recv_infos: tuple[InputInfo, ...] = self.args_recv_info
 
-        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx][0]
+        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx]["fwd_recv"]
 
     def get_bwd_recv_ops(self) -> list[dist.P2POp]:
         """
@@ -431,7 +462,7 @@ class _TschedStageBase(ABC):
             return []
 
         recv_infos = self.grad_recv_info    
-        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx][1]
+        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx]["bwd_recv"]
 
     def get_fwd_send_ops(self) -> list[dist.P2POp]:
         """
@@ -458,7 +489,7 @@ class _TschedStageBase(ABC):
                 ops.append(dist.P2POp(dist.isend, out, peer_global_rank, 
                                       self.group))
 
-        return ops, self.total_order_keys[self.microbatch_idx][2]
+        return ops, self.total_order_keys[self.microbatch_idx]["fwd_send"]
 
     def get_bwd_send_ops(self) -> list[dist.P2POp]:
         """
@@ -493,7 +524,7 @@ class _TschedStageBase(ABC):
                         f"[{self.stage_index}] for chunk {self.microbatch_idx} has gradients {grad} "
                         f"and is expecting to send gradients to stage {grad_recv_stage}"
                     )
-        return ops, self.total_order_keys[self.microbatch_idx][3]
+        return ops, self.total_order_keys[self.microbatch_idx]["bwd_send"]
 
     def clear_runtime_states(self) -> None:
         """
