@@ -66,6 +66,7 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         
         self.stage = TschedStage(
             self.model,
+            self.microbatch_size,
             self.microbatch_index,
             self.pp_rank,
             self.pp_size,

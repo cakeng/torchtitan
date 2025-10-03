@@ -25,7 +25,7 @@ import faulthandler
 import time
 import traceback
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Callable
 import signal
 import torch.distributed as dist
@@ -208,8 +208,9 @@ class ExecContext:
     event: torch.cuda.Event
     serialized_regions: list[threading.Event]
     ready_info: dict[str, any]
-    comm_works_wait: list[dist.Work] = []
-    comm_works_dispatch: list[dist.Work] = []
+    comm_works_wait: list[dist.Work] = field(default_factory=list)
+    comm_works_dispatch: list[dist.Work] = field(default_factory=list)
+    
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
     def __init__(self, num_execs, is_dist = False, num_serialized_regions = 6,
@@ -236,10 +237,10 @@ class ContextScheduler:
     def format_print(self, message, color_fnc=b_str, ident=None):
         if ident is None:
             ident = threading.current_thread().ident
-        prefix = f"T{ident}"
+        prefix = f"T{str(ident)[:-6]}"
         if self.is_dist:
             prefix += f" R{dist.get_rank()}"
-        prefix += f" C{self.active_exec_id}"
+        prefix += f" C{self.active_exec_id} CK{self.comm_order_key}"
         prefix = color_fnc(prefix) if color_fnc is not None else prefix
         return f"[{prefix}] {message}"
 
@@ -345,6 +346,8 @@ class ContextScheduler:
         new_exec_event.record(new_exec_stream)
         new_exec_serialized_regions = []
         new_exec_ready_info = None
+        new_exec_comm_works_wait = []
+        new_exec_comm_works_dispatch = []
         for i in range (self.num_serialized_regions):
             new_exec_serialized_regions.append(threading.Event())
             new_exec_serialized_regions[i].clear()
@@ -353,7 +356,9 @@ class ContextScheduler:
                                               new_exec_stream, 
                                               new_exec_event,
                                               new_exec_serialized_regions,
-                                              new_exec_ready_info)
+                                              new_exec_ready_info,
+                                              new_exec_comm_works_wait,
+                                              new_exec_comm_works_dispatch)
         if self.debug:
             print(self.format_print("Adding exec with id " + 
                   y_str(f"{new_exec_id}"), y_str))
@@ -422,36 +427,39 @@ class ContextScheduler:
         self.execs[exec_id].ready_info = {"key": "WAIT_COMMS", 
                                           "comm_func": comm_func, 
                                           "comm_key": comm_key, 
-                                          "wait_for_completion": wait_for_completion}
+                                          "wait_for_completion": wait_for_completion,
+                                          "fired": False}
         loop_count = 0
         while not self._check_comm(exec_id):
             self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
             loop_count += 1
         self.execs[exec_id].ready_info = None
         if self.debug:
-            print(self.format_print(f"Comms ops completed, comm_key: {comm_key}, func: {comm_func}", r_str))
+            print(self.format_print(g_str(f"Comms ops completed: ") + 
+                                    f"comm_key: {comm_key}, func: {comm_func}", r_str))
         return
     
     def _check_comm(self, exec_id):  
-        """Check if receiver is ready by polling for Gloo message from sender"""
         if self.comm_order_key == self.execs[exec_id].ready_info["comm_key"]:
-            self.execs[exec_id].ready_info["comm_key"] = -1
             if not self.execs[exec_id].ready_info["wait_for_completion"]:
                 self.execs[exec_id].comm_works_dispatch.extend(self.execs[exec_id].ready_info["comm_func"]())
             else:
                 self.execs[exec_id].comm_works_wait.extend(self.execs[exec_id].ready_info["comm_func"]())
+            self.execs[exec_id].ready_info["fired"] = True
             self.comm_order_key += 1
-        if not self.execs[exec_id].ready_info["wait_for_completion"]:
+            if self.debug:
+                print(self.format_print(y_str(f"Fired comm with comm_key: ") + 
+                                        f"{self.execs[exec_id].ready_info['comm_key']}, " +
+                                        f"wait: {self.execs[exec_id].ready_info['wait_for_completion']}", r_str))
+        if self.execs[exec_id].ready_info["fired"] and not self.execs[exec_id].ready_info["wait_for_completion"]:
             return True
-        if self.execs[exec_id].ready_info["comm_key"] == -1:
+        if self.execs[exec_id].ready_info["fired"]:
             for work in self.execs[exec_id].comm_works_wait:
                 if not work.is_completed():
                     return False
             self.execs[exec_id].comm_works_wait = []
             return True
-        if self.execs[exec_id].ready_info["comm_key"] != -1 and self.comm_order_key > self.execs[exec_id].ready_info["comm_key"]:
-            raise ValueError(r_str(f"Comm total order failed! Order key {self.comm_order_key} is greater than comm key {self.execs[exec_id].ready_info[2]}"))
-
+            
         return False
 
     def wait_all_comm_works(self, exec_id):
@@ -809,10 +817,10 @@ class ExecutionEngine(threading.Thread):
             self.tid = self.ident
         if tid is None:
             tid = self.tid
-        prefix = f"T{tid}"
+        prefix = f"T{str(tid)[:-6]}"
         if self.is_dist:
             prefix += f" R{dist.get_rank()}"
-        prefix += f" E{self.exec_id}"
+        prefix += f" E{self.exec_id} CK{self.scheduler.comm_order_key}"
         prefix = color_fnc(prefix) if color_fnc is not None else prefix
         return f"[{prefix}] {message}"
         
