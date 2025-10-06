@@ -312,16 +312,20 @@ class ScheduleTsched(TschedScheduleSingle):
         scheduler.attach_exec_to_context(exec_id) 
 
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward"):
-            ops, comm_key = self._stage.get_fwd_recv_ops()   
+            ops, comm_key, recv_pair_key = self._stage.get_fwd_recv_ops()   
             if comm_key != -1:
                 scheduler.schedule_comm(exec_id, 
                                         lambda: _batch_p2p_non_coalescing(ops, 
                                         desc="fwd_recv", microbatch_idx=self._microbatch_idx),
                                         comm_key, True)
-                print(g_str(f"[T{ident} R{self._global_rank} E{self._microbatch_idx}] ") + 
+                print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                       b_str(f"Forwarding {self._microbatch_idx}") + 
                       f", received {ops}, comm_key: {comm_key}")
-            
+            if recv_pair_key is not None:
+                print(g_str(f"[T{ident} R{self._global_rank} FR{self._microbatch_idx}] ") + 
+                      b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
+                scheduler.thread_barrier(exec_id, 2, recv_pair_key)
+                
         
             with torch.profiler.record_function(f"Forward {step_idx}"):
                 output = self._stage.forward_one_chunk(args, kwargs)
@@ -346,7 +350,7 @@ class ScheduleTsched(TschedScheduleSingle):
                                               region_name="Backward")
         # Backward pass
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
-            ops, comm_key = self._stage.get_bwd_recv_ops()
+            ops, comm_key, recv_pair_key = self._stage.get_bwd_recv_ops()
             if comm_key != -1:
                 scheduler.schedule_comm(exec_id, 
                                         lambda: _batch_p2p_non_coalescing(ops, 
@@ -355,6 +359,10 @@ class ScheduleTsched(TschedScheduleSingle):
                 print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
                             r_str(f"Backwarding {self._microbatch_idx}") + 
                             f", received {ops}, comm_key: {comm_key}")
+            if recv_pair_key is not None:
+                print(g_str(f"[T{ident} R{self._global_rank} BR{self._microbatch_idx}] ") + 
+                      b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
+                scheduler.thread_barrier(exec_id, 2, recv_pair_key)
 
             # For single microbatch, loss is directly available
             loss = self._maybe_get_loss(self._stage)

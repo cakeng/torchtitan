@@ -233,11 +233,12 @@ class ContextScheduler:
         self.context_lock = threading.Lock()
         self.context_lock.acquire()
         self.num_serialized_regions = num_serialized_regions
+        self.thread_barriers = {}
         
     def format_print(self, message, color_fnc=b_str, ident=None):
         if ident is None:
             ident = threading.current_thread().ident
-        prefix = f"T{str(ident)[:-6]}"
+        prefix = f"T{str(ident)[-6:]}"
         if self.is_dist:
             prefix += f" R{dist.get_rank()}"
         prefix += f" C{self.active_exec_id} CK{self.comm_order_key}"
@@ -248,14 +249,14 @@ class ContextScheduler:
         if self.stop_scheduling:
             self.next_exec_id = None
             return
+        if self.debug and not skip_debug:
+            ready_infos = []
+            for exec_id, exec_context in self.execs.items():
+                ready_infos.append(f"{exec_id}: {exec_context.ready_info}")
+            print(self.format_print("Current execs: " + 
+                    y_str(f"{ready_infos}"), r_str))
         if len(self.waiting_exec_ids) > 0:
             self.next_exec_id = self.active_exec_id
-            if self.debug and not skip_debug:
-                ready_infos = []
-                for exec_id, exec_context in self.execs.items():
-                    ready_infos.append(f"{exec_id}: {exec_context.ready_info}")
-                print(self.format_print("Current execs: " + 
-                      y_str(f"{ready_infos}"), r_str))
             for exec_id in self.waiting_exec_ids:
                 if self.execs[exec_id].ready_info == None and \
                         self.execs[exec_id].event.query():
@@ -263,6 +264,10 @@ class ContextScheduler:
                     break
                 elif self.execs[exec_id].ready_info["key"] == "WAIT_COMMS" and\
                         self._check_comm(exec_id):
+                    self.next_exec_id = exec_id
+                    break
+                elif self.execs[exec_id].ready_info["key"] == "THREAD_BARRIER" and\
+                        self.execs[exec_id].ready_info["num_threads"] == self.thread_barriers[self.execs[exec_id].ready_info["barrier_id"]]:
                     self.next_exec_id = exec_id
                     break
                 elif self.execs[exec_id].ready_info["key"] == "SERIALIZED_REGION" and\
@@ -380,6 +385,7 @@ class ContextScheduler:
         # i.e., enter the waiting queue for next exec
         if self.debug:
             print(self.format_print(f"Attaching exec " + y_str(f"{exec_id}"), b_str))
+        self.execs[exec_id].wait_keys = None
         self._acquire_context(exec_id)
         return
 
@@ -389,11 +395,37 @@ class ContextScheduler:
         assert self.active_exec_id == exec_id, \
             f"Expected {self.active_exec_id} to be the active exec during detach, " + \
             f"got {exec_id} running"
+        self.execs[exec_id].wait_keys = {"key": "DETACHED"}
         self._scheduler(force_switch=True)
         self._release_context(exec_id)
         if self.debug:
             print(self.format_print(f"Exec " + y_str(f"{exec_id}") + 
                                     " detached and running independently from the scheduler context.", b_str))
+        return
+
+    def thread_barrier(self, exec_id, num_threads = 2, barrier_id=0):
+        if barrier_id not in self.thread_barriers:
+            self.thread_barriers[barrier_id] = 1
+        else:
+            self.thread_barriers[barrier_id] += 1
+        self.execs[exec_id].ready_info = {"key": "THREAD_BARRIER", 
+                                          "barrier_id": barrier_id,
+                                          "num_threads": num_threads}
+        if self.debug:
+            print(self.format_print("Exec " + y_str(f"{exec_id} ") + 
+                                    g_str(f"Entering thread barrier ") + 
+                                    y_str(f"{barrier_id} ") + 
+                                    f", {self.thread_barriers[barrier_id]} / {num_threads} threads"), b_str)
+        loop_count = 0
+        while self.thread_barriers[barrier_id] < num_threads:
+            self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
+            loop_count += 1
+        self.execs[exec_id].ready_info = None
+        if self.debug:
+            print(self.format_print("Exec " + y_str(f"{exec_id} ") + 
+                                    g_str(f"Passed thread barrier ") + 
+                                    y_str(f"{barrier_id} ") + 
+                                    f", {self.thread_barriers[barrier_id]} / {num_threads} threads"), b_str)
         return
     
     def enter_serialized_region(self, exec_id, region_id=0, region_name=""):
@@ -487,6 +519,7 @@ class ContextScheduler:
         self.active_exec_id = None
         self.stop_scheduling = False
         self.comm_order_key = 0
+        self.thread_barriers = {}
         self.completion_signal_c2m.clear()
         self.completion_signal_m2c.clear()
         return
@@ -817,7 +850,7 @@ class ExecutionEngine(threading.Thread):
             self.tid = self.ident
         if tid is None:
             tid = self.tid
-        prefix = f"T{str(tid)[:-6]}"
+        prefix = f"T{str(tid)[-6:]}"
         if self.is_dist:
             prefix += f" R{dist.get_rank()}"
         prefix += f" E{self.exec_id} CK{self.scheduler.comm_order_key}"
