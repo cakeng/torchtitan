@@ -52,7 +52,7 @@ def y_str(s):
 class TorchTitanExecutionEngine(ExecutionEngine):
     def __init__(self, model, x, label, loss_fn, microbatch_size, microbatch_index,
                  pp_rank, pp_size, device, pp_mesh, context_scheduler, 
-                 profiler=None, is_dist=False, debug=True, main_thread=False):
+                 profiler=None, is_dist=False, debug=False, main_thread=False):
         super().__init__(model, x, label, loss_fn, context_scheduler, 
                          profiler=profiler, start_exec=False, is_dist=is_dist, 
                          debug=debug, main_thread=main_thread)
@@ -117,7 +117,6 @@ class TorchTitanExecutionEngine(ExecutionEngine):
             param = self.model.get_parameter("model.layers.0.self_attn.q_proj.weight")
             print(f"{torch.linalg.norm(param.grad)=}")
 
-        self.model.zero_grad()
         print("Backward done")
 
 # Run full model
@@ -131,6 +130,7 @@ def run_full_model(
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
     microbatches = mbp_size
+    debug = True
 
     mesh = meshes[0]
     pp_mesh = mesh["pp"]
@@ -176,7 +176,7 @@ def run_full_model(
     loss_fn = torch.nn.functional.cross_entropy
     
     context_scheduler = ContextScheduler(microbatches, 
-                                        debug=True, is_dist=True)
+                                        debug=debug, is_dist=True)
     profiler = None
     # profiler = ModelProfiler(base_model, x[0], label[0], loss_fn)
 
@@ -189,7 +189,7 @@ def run_full_model(
                         model, x[0], label[0], loss_fn,
                         microbatches, 0, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, profiler=profiler, is_dist=True, 
-                        debug=True, main_thread=True)
+                        debug=debug, main_thread= True)
 
 
     for t in range(1, microbatches):
@@ -208,7 +208,7 @@ def run_full_model(
                         model, x[t], label[t], loss_fn,
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, profiler=profiler, is_dist=True, 
-                        debug=True)
+                        debug=debug)
     
 
         # Apply data parallelism

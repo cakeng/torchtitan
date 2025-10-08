@@ -344,10 +344,6 @@ class ScheduleTsched(TschedScheduleSingle):
             # Compute loss if this is the last stage
             self._maybe_compute_loss(self._stage, output, target)
             
-        # No loss function, no need to run backward
-        
-        scheduler.enter_serialized_region(exec_id, region_id=2, 
-                                              region_name="Backward")
         # Backward pass
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
             ops, comm_key, recv_pair_key = self._stage.get_bwd_recv_ops()
@@ -364,11 +360,17 @@ class ScheduleTsched(TschedScheduleSingle):
                       b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
                 scheduler.thread_barrier(exec_id, 2, recv_pair_key)
 
+            scheduler.enter_serialized_region(exec_id, region_id=2, 
+                                              region_name="Backward")
+
             # For single microbatch, loss is directly available
             loss = self._maybe_get_loss(self._stage)
             with torch.profiler.record_function(
                 f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward pass"):
                 self._stage.backward_one_chunk(loss=loss)
+
+            scheduler.exit_serialized_region(exec_id, region_id=2, 
+                                            region_name="Backward")
                 
             ops, comm_key = self._stage.get_bwd_send_ops()
             if comm_key != -1:
@@ -381,8 +383,7 @@ class ScheduleTsched(TschedScheduleSingle):
                                         comm_key, False)
             self._update_losses(self._stage, losses)
             
-        scheduler.exit_serialized_region(exec_id, region_id=2, 
-                                            region_name="Backward")
+        
         scheduler.detach_exec_from_context(exec_id) 
         # Wait immediately for single microbatch
         for work in works:

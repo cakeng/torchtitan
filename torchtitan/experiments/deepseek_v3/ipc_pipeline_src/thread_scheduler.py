@@ -222,7 +222,7 @@ class ContextScheduler:
         self.waiting_exec_ids = SortedList()
         self.execs = {}
         self.debug = debug
-        self.skip_debug_num = 4
+        self.skip_debug_num = 2
         self.is_dist = is_dist
         self.comm_order_key = 0
         self.completion_barrier = threading.Barrier(num_execs)

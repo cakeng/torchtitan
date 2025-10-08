@@ -413,6 +413,22 @@ class _TschedStageBase(ABC):
             )
             info.buffer = tensor
 
+    def _print_total_order_keys(self, debug=False):
+        if debug:
+            output = g_str(f"[Stage {self.stage_index}] ")
+            num_microbatches = self.num_microbatches
+            for i in range(num_microbatches * 4):
+                target_op = None
+                target_mb = None
+                for mb in range(num_microbatches):
+                    for op in ["fwd_recv", "fwd_send", "bwd_recv", "bwd_send"]:
+                        if self.total_order_keys[mb][op] == i:
+                            target_op = op
+                            target_mb = mb
+                            break
+                output += f"{target_op} {target_mb}, "
+            print(b_str(f"Total Order: ") + f"{output}")
+
     def _calculate_total_order_keys(self, debug=False) -> int:
         pp_stage = self.stage_index 
         num_stages = self.num_stages
@@ -422,111 +438,65 @@ class _TschedStageBase(ABC):
         for n in range(num_microbatches):
             self.total_order_keys.append({"fwd_recv": -1, "fwd_send": -1, 
                                           "bwd_recv": -1, "bwd_send": -1})
-        for n in range(num_microbatches + num_stages):
+        for n in range(num_microbatches + num_stages * 2):
             if pp_stage % 2 == 0:
-                fwr_mb = n - pp_stage//2
+                fwr_mb = n - pp_stage
                 do_fwr_mb = fwr_mb >= 0 and fwr_mb < num_microbatches
-                bwr_mb = n - num_stages + pp_stage//2
+                bwr_mb = n - num_stages * 2 + pp_stage + 1
                 do_bwr_mb = bwr_mb >= 0 and bwr_mb < num_microbatches
-                bws_mb = n - num_stages + pp_stage//2
+                bws_mb = n - num_stages * 2 + pp_stage
                 do_bws_mb = bws_mb >= 0 and bws_mb < num_microbatches
-                fws_mb = n - pp_stage//2
+                fws_mb = n - pp_stage - 1
                 do_fws_mb = fws_mb >= 0 and fws_mb < num_microbatches
+
                 if do_fwr_mb:
                     self.total_order_keys[fwr_mb]["fwd_recv"] = order_key
                     self.total_order_keys[fwr_mb]["fwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                       if do_bwr_mb else None
-                    if debug:
-                        print(g_str(f"[Stage {self.stage_index}] 0 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting fwd_recv for microbatch {fwr_mb} to {order_key} " + 
-                        f"fwd_recv_pair: {bwr_mb if do_bwr_mb else None} " + 
-                        f"key {fwr_mb * num_microbatches + bwr_mb if do_bwr_mb else None}")
+                    order_key += 1
+                if do_fws_mb:
+                    self.total_order_keys[fws_mb]["fwd_send"] = order_key
                     order_key += 1
                 if do_bwr_mb:
                     self.total_order_keys[bwr_mb]["bwd_recv"] = order_key
                     self.total_order_keys[bwr_mb]["bwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                           if do_fwr_mb else None
-                    if debug:
-                        print(g_str(f"[Stage {self.stage_index}] 1 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting bwd_recv for microbatch {bwr_mb} to {order_key} " + 
-                        f"bwd_recv_pair: {fwr_mb if do_fwr_mb else None} " + 
-                        f"key {fwr_mb * num_microbatches + bwr_mb if do_fwr_mb else None}")
-                    order_key += 1
-
-                if do_fws_mb:
-                    self.total_order_keys[fws_mb]["fwd_send"] = order_key
-                    if debug:
-                        print(g_str(f"[Stage {self.stage_index}] 3 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting fwd_send for microbatch {fws_mb} to {order_key}")
                     order_key += 1
                 if do_bws_mb:
                     self.total_order_keys[bws_mb]["bwd_send"] = order_key
-                    if debug:
-                        print(g_str(f"[Stage {self.stage_index}] 2 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting bwd_send for microbatch {bws_mb} to {order_key}")
                     order_key += 1
             else:
-                fws_mb = n - pp_stage//2 - 1
+                fws_mb = n - pp_stage - 1
                 do_fws_mb = fws_mb >= 0 and fws_mb < num_microbatches
-                bws_mb = n - num_stages + pp_stage//2
+                bws_mb = n - num_stages * 2 + pp_stage
                 do_bws_mb = bws_mb >= 0 and bws_mb < num_microbatches
-                bwr_mb = n - num_stages + pp_stage//2 + 1
+                bwr_mb = n - num_stages * 2 + pp_stage + 1
                 do_bwr_mb = bwr_mb >= 0 and bwr_mb < num_microbatches
-                fwr_mb = n - pp_stage//2
+                fwr_mb = n - pp_stage
                 do_fwr_mb = fwr_mb >= 0 and fwr_mb < num_microbatches
+                
+                
                 if do_fws_mb:
                     self.total_order_keys[fws_mb]["fwd_send"] = order_key
-                    if debug:  
-                        print(g_str(f"[Stage {self.stage_index}] 4 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting fwd_send for microbatch {fws_mb} to {order_key}")
                     order_key += 1
-                if do_bws_mb:
-                    self.total_order_keys[bws_mb]["bwd_send"] = order_key
-                    if debug:
-                        print(g_str(f"[Stage {self.stage_index}] 5 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting bwd_send for microbatch {bws_mb} to {order_key}")
-                    order_key += 1
-
                 if do_fwr_mb:
                     self.total_order_keys[fwr_mb]["fwd_recv"] = order_key
                     self.total_order_keys[fwr_mb]["fwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                       if do_bwr_mb else None
-                    if debug:
-                        print(g_str(f"[Stage {self.stage_index}] 7 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting fwd_recv for microbatch {fwr_mb} to {order_key} " + 
-                        f"fwd_recv_pair: {bwr_mb if do_bwr_mb else None} " + 
-                        f"key {fwr_mb * num_microbatches + bwr_mb if do_bwr_mb else None}")
+                    order_key += 1
+                if do_bws_mb:
+                    self.total_order_keys[bws_mb]["bwd_send"] = order_key
                     order_key += 1
                 if do_bwr_mb:
                     self.total_order_keys[bwr_mb]["bwd_recv"] = order_key
                     self.total_order_keys[bwr_mb]["bwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                           if do_fwr_mb else None
-                    if debug:
-                        print(g_str(f"[Stage {self.stage_index}] 6 ") + 
-                        f"pp_stage: {pp_stage}, num_stages: {num_stages}, " +
-                        f"num_microbatches: {num_microbatches} " +
-                        f"Setting bwd_recv for microbatch {bwr_mb} to {order_key} " + 
-                        f"bwd_recv_pair: {fwr_mb if do_fwr_mb else None} " + 
-                        f"key {fwr_mb * num_microbatches + bwr_mb if do_fwr_mb else None}")
                     order_key += 1
         if debug:
             print(g_str(f"[Stage {self.stage_index}] ") + 
             r_str(f"Calculated total order key: ") +  
             f"{self.total_order_keys}")
+            self._print_total_order_keys(debug)
         return
 
     def get_fwd_recv_ops(self) -> list[dist.P2POp]:
