@@ -403,7 +403,7 @@ class ContextScheduler:
                                     " detached and running independently from the scheduler context.", b_str))
         return
 
-    def thread_barrier(self, exec_id, num_threads = 2, barrier_id=0):
+    def thread_barrier(self, exec_id, num_threads = 2, barrier_id=0, reschedule=False):
         if barrier_id not in self.thread_barriers:
             self.thread_barriers[barrier_id] = 1
         else:
@@ -426,6 +426,8 @@ class ContextScheduler:
                                     g_str(f"Passed thread barrier ") + 
                                     y_str(f"{barrier_id} ") + 
                                     f", {self.thread_barriers[barrier_id]} / {num_threads} threads"), b_str)
+        if reschedule:
+            self.context_switch(exec_id)
         return
     
     def enter_serialized_region(self, exec_id, region_id=0, region_name=""):

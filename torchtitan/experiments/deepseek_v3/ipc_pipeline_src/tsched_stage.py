@@ -219,7 +219,7 @@ class _TschedStageBase(ABC):
             i: i % self.group_size for i in range(self.num_stages)
         }
 
-        self._calculate_total_order_keys(debug=True)
+        self._calculate_total_order_keys(debug=False)
 
     @property
     def has_backward(self) -> bool:

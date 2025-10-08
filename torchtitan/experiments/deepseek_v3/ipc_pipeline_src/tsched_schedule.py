@@ -324,7 +324,7 @@ class ScheduleTsched(TschedScheduleSingle):
             if recv_pair_key is not None:
                 print(g_str(f"[T{ident} R{self._global_rank} FR{self._microbatch_idx}] ") + 
                       b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
-                scheduler.thread_barrier(exec_id, 2, recv_pair_key)
+                scheduler.thread_barrier(exec_id, 2, recv_pair_key, reschedule=True)
                 
         
             with torch.profiler.record_function(f"Forward {step_idx}"):
