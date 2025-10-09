@@ -167,8 +167,8 @@ def run_full_model(
 
     # Example inputs
     torch.manual_seed(ep_rank)
-    bs = 4
-    seqlen = 64
+    bs = 16
+    seqlen = 128
     x = torch.randint(model_args.vocab_size, (microbatches, bs, seqlen), device=device)
     label = torch.rand(microbatches, bs, seqlen, model_args.vocab_size, device=device)
 

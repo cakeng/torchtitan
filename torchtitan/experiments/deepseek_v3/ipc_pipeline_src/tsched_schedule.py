@@ -324,11 +324,16 @@ class ScheduleTsched(TschedScheduleSingle):
             if recv_pair_key is not None:
                 print(g_str(f"[T{ident} R{self._global_rank} FR{self._microbatch_idx}] ") + 
                       b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
-                scheduler.thread_barrier(exec_id, 2, recv_pair_key, reschedule=True)
+                scheduler.thread_barrier(exec_id, 2, recv_pair_key, pass_id=1)
                 
+            scheduler.enter_serialized_region(exec_id, region_id=1, 
+                                              region_name="Forward")
         
             with torch.profiler.record_function(f"Forward {step_idx}"):
                 output = self._stage.forward_one_chunk(args, kwargs)
+
+            scheduler.exit_serialized_region(exec_id, region_id=1, 
+                                              region_name="Forward")
         
 
             ops, comm_key = self._stage.get_fwd_send_ops()
@@ -358,7 +363,7 @@ class ScheduleTsched(TschedScheduleSingle):
             if recv_pair_key is not None:
                 print(g_str(f"[T{ident} R{self._global_rank} BR{self._microbatch_idx}] ") + 
                       b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
-                scheduler.thread_barrier(exec_id, 2, recv_pair_key)
+                scheduler.thread_barrier(exec_id, 2, recv_pair_key, pass_id=0)
 
             scheduler.enter_serialized_region(exec_id, region_id=2, 
                                               region_name="Backward")
