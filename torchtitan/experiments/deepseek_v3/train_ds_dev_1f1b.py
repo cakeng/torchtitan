@@ -286,6 +286,8 @@ def run_full_model(
     mesh: DeviceMesh,
     mbp_size: int,
     num_hidden_layers: int,
+    batch_size: int,
+    seq_len: int,
     num_steps: int,
 ):
     rank = dist.get_rank()
@@ -302,7 +304,7 @@ def run_full_model(
     model_args = deepseek_config_registry[model_id]
     # [Note]: I am making the model smaller for testing / avoiding OOM. If you
     # have sufficient GPUs for model parallelism, you can remove this line.
-    model_args.num_hidden_layers = 8
+    model_args.num_hidden_layers = num_hidden_layers
 
     # Apply model parallelism
     model_args.ep_size = ep_size
@@ -352,8 +354,8 @@ def run_full_model(
 
     # Example inputs
     torch.manual_seed(ep_rank)
-    bs = 4
-    seqlen = 128
+    bs = batch_size
+    seqlen = seq_len
     x = torch.randint(model_args.vocab_size, (microbatches * bs, seqlen), device=device)
     label = torch.rand(microbatches * bs, seqlen, model_args.vocab_size, device=device)
 
@@ -414,9 +416,11 @@ if __name__ == "__main__":
     fsdp_size = int(sys.argv[3])
     mbp_size = int(sys.argv[4])
     mbp_rank = int(sys.argv[5])
-    num_hidden_layers = int(sys.argv[6])
-    num_steps = int(sys.argv[7])
-    run_profiler = sys.argv[8] == "True"
+    batch_size = int(sys.argv[6])
+    seq_len = int(sys.argv[7])
+    num_hidden_layers = int(sys.argv[8])
+    num_steps = int(sys.argv[9])
+    run_profiler = sys.argv[10] == "True"
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
     mesh = dist.init_device_mesh("cuda", (pp_size, ep_size, fsdp_size),
@@ -424,7 +428,7 @@ if __name__ == "__main__":
 
     # Setup profiler
     run_id = os.getenv("RUN_ID", "0")
-    log_dir = f"./tensorboard_traces/run_1f1b_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}"
+    log_dir = f"./tensorboard_traces/run_1f1b_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}"
     os.makedirs(log_dir, exist_ok=True)
 
     # Profile the execution
@@ -445,7 +449,7 @@ if __name__ == "__main__":
             with_stack=True
         ) as prof:
             time_start = datetime.now()
-            run_full_model(mesh, mbp_size, num_hidden_layers, num_steps)
+            run_full_model(mesh, mbp_size, num_hidden_layers, batch_size, seq_len, num_steps)
             prof.step()
             time_end = datetime.now()
             print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
@@ -465,7 +469,7 @@ if __name__ == "__main__":
                     whole_trace=False,
                 )
                 # compress the merged trace
-                zip_name = f"{log_dir}/{run_id}_1f1b_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_steps_{num_steps}_merged_trace.zip" 
+                zip_name = f"{log_dir}/{run_id}_1f1b_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}_merged_trace.zip" 
                 with zipfile.ZipFile(zip_name, "w",
                                     compression=zipfile.ZIP_DEFLATED, 
                                     compresslevel=9) as zipf:
@@ -474,7 +478,7 @@ if __name__ == "__main__":
                 print(f"Rank {dist.get_rank()} Compressed trace to {zip_name}")
     else:
         time_start = datetime.now()
-        run_full_model(mesh, mbp_size, num_hidden_layers, num_steps)
+        run_full_model(mesh, mbp_size, num_hidden_layers, batch_size, seq_len, num_steps)
         time_end = datetime.now()
         print(f"Rank {dist.get_rank()} Time elapsed: {time_end - time_start}\n", end="")
         

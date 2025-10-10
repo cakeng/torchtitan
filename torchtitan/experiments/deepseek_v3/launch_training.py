@@ -7,12 +7,14 @@ from datetime import datetime
 import random
 
 run_type = sys.argv[1] if len(sys.argv) > 1 else ""
-mbp_size = 5
+mbp_size = 6
 pp_size = 2
 ep_size = 2
 fsdp_size = 1
-num_hidden_layers = 16
-num_steps = 3
+batch_size = 16
+seq_len = 128
+num_hidden_layers = 12
+num_steps = 4
 run_profiler = "True"
 
 if run_type == "1f1b":
@@ -68,6 +70,8 @@ for i in range(num_process_groups):
         str(fsdp_size),
         str(mbp_size),
         str(i),
+        str(batch_size),
+        str(seq_len),
         str(num_hidden_layers),
         str(num_steps),
         run_profiler

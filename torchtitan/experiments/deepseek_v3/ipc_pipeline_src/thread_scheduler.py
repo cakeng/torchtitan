@@ -935,39 +935,39 @@ class ExecutionEngine(threading.Thread):
         """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
         print(self.format_print(" Attaching hooks...", y_str))
         self.detach_hooks() # Clear any old hooks first
-        for module in self.model.modules():
-            module_name = module.module_name
-            module_list = self.context_switch_module_list + ["context_switch_module"]
-            if any(module_class_str in module_name for module_class_str in module_list):
-                fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
-                try:
-                    bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
-                    print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
-                except Exception as e:
-                    print(f"Failed to register backward hook for {module_name}: {e}")
-                    bwd_hook = None
-                self.hooks[module_name] = (fwd_hook, bwd_hook)
-                if self.debug:
-                    print(self.format_print("Attached forward and backward hooks to " + 
-                          y_str(f"{module_name}") + "\n", g_str), end="")
-                continue
-            elif self.profiler is not None and module_name in self.profiler.modules:
-                module_info = self.profiler.modules[module_name]
-                if module_info.fire_context_switch:
-                    fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
-                    try:
-                        bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
-                        print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
-                    except Exception as e:
-                        print(f"Failed to register backward hook for {module_name}: {e}")
-                        bwd_hook = None
-                    self.hooks[module_name] = (
-                        fwd_hook,
-                        bwd_hook
-                    )
-                    if self.debug:
-                        print(self.format_print("Attached forward and backward hooks to " + 
-                              y_str(f"{module_name}") + "\n", g_str), end="")
+        # for module in self.model.modules():
+        #     module_name = module.module_name
+        #     module_list = self.context_switch_module_list + ["context_switch_module"]
+        #     if any(module_class_str in module_name for module_class_str in module_list):
+        #         fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
+        #         try:
+        #             bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
+        #             print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
+        #         except Exception as e:
+        #             print(f"Failed to register backward hook for {module_name}: {e}")
+        #             bwd_hook = None
+        #         self.hooks[module_name] = (fwd_hook, bwd_hook)
+        #         if self.debug:
+        #             print(self.format_print("Attached forward and backward hooks to " + 
+        #                   y_str(f"{module_name}") + "\n", g_str), end="")
+        #         continue
+        #     elif self.profiler is not None and module_name in self.profiler.modules:
+        #         module_info = self.profiler.modules[module_name]
+        #         if module_info.fire_context_switch:
+        #             fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
+        #             try:
+        #                 bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
+        #                 print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
+        #             except Exception as e:
+        #                 print(f"Failed to register backward hook for {module_name}: {e}")
+        #                 bwd_hook = None
+        #             self.hooks[module_name] = (
+        #                 fwd_hook,
+        #                 bwd_hook
+        #             )
+        #             if self.debug:
+        #                 print(self.format_print("Attached forward and backward hooks to " + 
+        #                       y_str(f"{module_name}") + "\n", g_str), end="")
         print(self.format_print("Hooks: " + y_str(f"{self.hooks}")))
     
     def detach_hooks(self):

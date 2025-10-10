@@ -166,18 +166,18 @@ def _batch_p2p_non_coalescing(p2p_ops: list[dist.P2POp], desc: Optional[str] = N
         for p2p_op in sorted_ops:
             # Call individual isend/irecv directly
             if p2p_op.op == dist.isend:
-                print(c_str(f"[COMMS R{dist.get_rank()}]") + b_str(f" {desc}: ") + 
-                      f"Sending microbatch {microbatch_idx} to rank {p2p_op.peer}: {p2p_op}")
+                # print(c_str(f"[COMMS R{dist.get_rank()}]") + b_str(f" {desc}: ") + 
+                #       f"Sending microbatch {microbatch_idx} to rank {p2p_op.peer}: {p2p_op}")
                 work = dist.isend(
                     p2p_op.tensor,
                     dst=p2p_op.peer,
                     group=p2p_op.group,
                 )
-                print(c_str(f"[COMMS R{dist.get_rank()}]") + b_str(f" {desc}: ") + 
-                      f"Sent microbatch {microbatch_idx} to rank {p2p_op.peer}: {p2p_op}")
+                # print(c_str(f"[COMMS R{dist.get_rank()}]") + b_str(f" {desc}: ") + 
+                #       f"Sent microbatch {microbatch_idx} to rank {p2p_op.peer}: {p2p_op}")
             elif p2p_op.op == dist.irecv:
-                print(m_str(f"[COMMS R{dist.get_rank()}]") + r_str(f" {desc}: ") + 
-                      f"Receiving microbatch {microbatch_idx} from rank {p2p_op.peer}: {p2p_op}")
+                # print(m_str(f"[COMMS R{dist.get_rank()}]") + r_str(f" {desc}: ") + 
+                #       f"Receiving microbatch {microbatch_idx} from rank {p2p_op.peer}: {p2p_op}")
                 work = dist.irecv(
                     p2p_op.tensor,
                     src=p2p_op.peer,
