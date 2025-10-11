@@ -182,13 +182,13 @@ def run_full_model(
     profiler = None
     # profiler = ModelProfiler(base_model, x[0], label[0], loss_fn)
 
-    with device, mesh, init_empty_weights():
-        model = DeepseekForCausalLM(model_args)
-    model.train()
-    materialize_meta_model(model, base_model)
+    # with device, mesh, init_empty_weights():
+    #     model = DeepseekForCausalLM(model_args)
+    # model.train()
+    # materialize_meta_model(model, base_model)
     dist.barrier()
     main_engine = TorchTitanExecutionEngine(
-                        model, x[0], label[0], loss_fn,
+                        base_model, x[0], label[0], loss_fn,
                         microbatches, 0, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, profiler=profiler, is_dist=True, 
                         debug=debug, main_thread= True)
@@ -201,13 +201,13 @@ def run_full_model(
         pp_rank = pp_mesh.get_local_rank()
         ep_rank = ep_mesh.get_local_rank()
 
-        with device, mesh, init_empty_weights():
-            model = DeepseekForCausalLM(model_args)
-        model.train()
-        materialize_meta_model(model, base_model)
+        # with device, mesh, init_empty_weights():
+        #     model = DeepseekForCausalLM(model_args)
+        # model.train()
+        # materialize_meta_model(model, base_model)
         dist.barrier()
         TorchTitanExecutionEngine(
-                        model, x[t], label[t], loss_fn,
+                        base_model, x[t], label[t], loss_fn,
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, profiler=profiler, is_dist=True, 
                         debug=debug)

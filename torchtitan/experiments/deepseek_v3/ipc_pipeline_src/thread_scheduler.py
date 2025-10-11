@@ -371,7 +371,8 @@ class ContextScheduler:
             raise ValueError(f"Expected {self.num_execs} execs, got {new_exec_id}")
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
-        new_exec_stream = torch.cuda.Stream()
+        # new_exec_stream = torch.cuda.Stream()
+        new_exec_stream = torch.cuda.current_stream()
         new_exec_event = torch.cuda.Event()
         new_exec_event.record(new_exec_stream)
         new_exec_serialized_regions = []
