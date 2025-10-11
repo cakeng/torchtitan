@@ -54,8 +54,8 @@ class TorchTitanExecutionEngine(ExecutionEngine):
     def __init__(self, model, x, label, loss_fn, microbatch_size, microbatch_index,
                  pp_rank, pp_size, device, pp_mesh, context_scheduler, 
                  profiler=None, is_dist=False, debug=False, main_thread=False):
-        super().__init__(model, x, label, loss_fn, context_scheduler, 
-                         profiler=profiler, start_exec=False, is_dist=is_dist, 
+        super().__init__(x, label, loss_fn, context_scheduler, 
+                         start_exec=False, is_dist=is_dist, device=device,
                          debug=debug, main_thread=main_thread)
         
         self.microbatch_size = microbatch_size
@@ -64,10 +64,9 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         self.pp_size = pp_size
         self.device = device
         self.pp_mesh = pp_mesh
-        self.exec_id = None
         
         self.stage = TschedStage(
-            self.model,
+            self.scheduler.model,
             self.microbatch_size,
             self.microbatch_index,
             self.pp_rank,
@@ -91,7 +90,7 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         else:
             self.pp_schedule.initialize_stage()
 
-        print(g_str(f"[T{self.tid}]") + " TorchTitan ExecutionEngine initialized, "
+        print(g_str(f"[T{self.ident}]") + " TorchTitan ExecutionEngine initialized, "
               f"microbatch id " + y_str(f"{self.microbatch_index}") + ", global rank " + 
               y_str(f"{global_rank}" + ", PP mesh " + y_str(f"{self.pp_mesh.get_group()}")))
         
@@ -111,7 +110,7 @@ class TorchTitanExecutionEngine(ExecutionEngine):
             print(f"{loss=}")
 
         if self.pp_rank == 0:
-            param = self.model.get_parameter("model.layers.0.self_attn.q_proj.weight")
+            param = self.scheduler.model.get_parameter("model.layers.0.self_attn.q_proj.weight")
             print(f"{torch.linalg.norm(param.grad)=}")
 
         print("Backward done")
@@ -173,16 +172,15 @@ def run_full_model(
 
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy
-    
-    context_scheduler = ContextScheduler(model, microbatches, 
-                                         debug=debug, is_dist=True)
     profiler = None
+    context_scheduler = ContextScheduler(model, microbatches, 
+                                         debug=debug, is_dist=True, profiler=profiler)
 
     dist.barrier()
     main_engine = TorchTitanExecutionEngine(
-                        x[0], label[0], loss_fn,
+                        model, x[0], label[0], loss_fn,
                         microbatches, 0, pp_rank, pp_size, device, pp_mesh, 
-                        context_scheduler, profiler=profiler, is_dist=True, 
+                        context_scheduler, is_dist=True, 
                         debug=debug, main_thread= True)
     engines = [main_engine]
 
@@ -196,9 +194,9 @@ def run_full_model(
         dist.barrier()
         print(f"Rank {rank} Creating engine thread {t}...\n", end="")
         engine_thread = TorchTitanExecutionEngine(
-                        x[t], label[t], loss_fn,
+                        model, x[t], label[t], loss_fn,
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
-                        context_scheduler, profiler=profiler, is_dist=True, 
+                        context_scheduler, is_dist=True, 
                         debug=debug)
         engines.append(engine_thread)
 
@@ -236,16 +234,14 @@ def run_full_model(
     # assert 0
 
     context_scheduler.attach_hooks()
-    main_engine.init_exec(model=main_engine.stage.submod)
     for t in range(1, microbatches):
+        print(y_str(f"[Rank {rank}]") + " Starting engine thread " + f"{t}")
         engines[t].start()
 
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
     
-    
-
-    print(y_str(f"[Rank {rank}]") + " Running " + f"{num_steps} thread-parallel steps, "
+    print(g_str(f"[Rank {rank}]") + " Running " + f"{num_steps} thread-parallel steps, "
           f"{num_hidden_layers=}, {microbatches=}, {bs=}, {seqlen=}")
     # Run forward and backward
     for step_idx in range(num_steps):

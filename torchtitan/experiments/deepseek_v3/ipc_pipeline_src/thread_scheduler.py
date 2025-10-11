@@ -239,16 +239,20 @@ class ExecContext:
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
     def __init__(self, model, num_execs, is_dist = False, num_serialized_regions = 6,
-                 debug = False):
+                 context_switch_module_list = ["moe_forward1", "moe_forward2"], 
+                 profiler = None, debug = False):
         self.model = model
         self.num_execs = num_execs
         self.active_exec_id = None
         self.next_exec_id = None
         self.stop_scheduling = False
         self.waiting_exec_ids = SortedList()
+        self.hooks = {} 
         self.execs = {}
-        self.tid_to_exec = {}
+        self.ident_to_exec_id = {}
         self.backward_exec_id = None
+        self.context_switch_module_list = context_switch_module_list
+        self.profiler = profiler
         self.debug = debug
         self.skip_debug_num = 2
         self.is_dist = is_dist
@@ -366,26 +370,35 @@ class ContextScheduler:
                 y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
 
     def add_exec(self, exec):
-        # Add an exec to the scheduler.
+        # Add an exec to the scheduler.\
+        print(f"Adding exec {exec.ident} to scheduler, length of execs: {len(self.execs)}\n", end="")
         for exec_id in self.execs:
-            assert self.execs[exec_id].exec.tid != exec.tid, \
-                f"Exec {exec} already exists, thread id {exec.tid} - Execs: {self.execs}"
+            assert self.execs[exec_id].exec.ident != exec.ident, \
+                f"Exec {exec} already exists, ident {exec.ident} - ident_to_exec_id: {self.ident_to_exec_id}"
         new_exec_id = len(self.execs)
-        if new_exec_id >= self.num_execs:
-            raise ValueError(f"Expected {self.num_execs} execs, got {new_exec_id}")
+        print(f"New exec id: {new_exec_id}, num_execs: {self.num_execs}\n", end="")
+        assert new_exec_id < self.num_execs, \
+            f"Expected {self.num_execs} execs, got {new_exec_id}"
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
+        print(f"New exec signal created for exec {exec.ident}\n", end="")
         # new_exec_stream = torch.cuda.Stream()
-        new_exec_stream = torch.cuda.default_stream()
+        dev = exec.device
+        new_exec_stream = torch.cuda.default_stream(dev)
+        torch.cuda.set_stream(new_exec_stream)
         new_exec_event = torch.cuda.Event()
-        new_exec_event.record(new_exec_stream)
+        print(f"New exec event created for exec {exec.ident}\n", end="")
         new_exec_serialized_regions = []
         new_exec_ready_info = None
+        print(f"New exec ready info created for exec {exec.ident}\n", end="")
         new_exec_comm_works_wait = []
         new_exec_comm_works_dispatch = []
+        print(f"Creating exec context for exec {exec.ident}\n", end="")
         for i in range (self.num_serialized_regions):
             new_exec_serialized_regions.append(threading.Event())
             new_exec_serialized_regions[i].clear()
+        self.ident_to_exec_id[exec.ident] = new_exec_id
+        print(f"Adding exec context to execs for exec {exec.ident}\n", end="")
         self.execs[new_exec_id] = ExecContext(exec, 
                                               new_exec_signal, 
                                               new_exec_stream, 
@@ -395,7 +408,7 @@ class ContextScheduler:
                                               new_exec_comm_works_wait,
                                               new_exec_comm_works_dispatch)
         if self.debug:
-            print(self.format_print("Adding exec with id " + 
+            print(self.format_print(f"Added exec {exec.ident} with id " + 
                   y_str(f"{new_exec_id}"), y_str))
         return new_exec_id
     
@@ -605,6 +618,7 @@ class ContextScheduler:
     def attach_hooks(self):
         """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
         print(self.format_print(" Attaching hooks...", y_str))
+        self.tag_module_name(self.model)
         self.detach_hooks() # Clear any old hooks first
         for module in self.model.modules():
             module_name = module.module_name
@@ -657,7 +671,7 @@ class ContextScheduler:
         force_switch = False
         if isinstance(module, ContextSwitchModule):
             force_switch = module.force_switch
-        exec_id = self.tid_to_exec[threading.current_thread().ident]
+        exec_id = self.ident_to_exec_id[threading.current_thread().ident]
         self.context_switch(exec_id, force_switch=force_switch)
         if self.debug:
             print(self.format_print("Forward hook completed", g_str))
@@ -912,31 +926,28 @@ class ExecutionEngine(threading.Thread):
     
     """ A dedicated thread to run a single training step (fwd/bwd). """
     def __init__(
-        self, model, x, label, loss_fn, scheduler,
-        profiler = None, start_exec = True, 
-        context_switch_module_list = ["moe_forward1", "moe_forward2"],
-        is_dist = False, debug = False, 
+        self, x, label, loss_fn, scheduler, start_exec = True, 
+        is_dist = False, device = None, debug = False, 
         main_thread = False,
     ):
         super().__init__(daemon=not main_thread)
-        self.model = model
         self.x = x
         self.label = label
         self.loss_fn = loss_fn
         self.scheduler = scheduler
         self.loss = None
-        self.profiler = profiler
+        
         self.backward_tid = -1
-        self.hooks = {} 
         self.debug = debug
+        self.device = device
         self.is_dist = is_dist
         self.stop_exec = False
         self.main_thread = main_thread
-        self.context_switch_module_list = context_switch_module_list
+        if self.main_thread:
+            self.exec_id = self.scheduler.add_exec(self)
         if start_exec:
-            self.init_exec()
             self.start()
-        
+     
     def stop_exec(self):
         self.stop_exec = True
 
@@ -951,8 +962,7 @@ class ExecutionEngine(threading.Thread):
         return f"[{prefix}] {message}"
 
     def run(self):
-        if self.exec_id is None:
-            raise ValueError(r_str("ExecutionEngine not initialized. Please call init_exec() first."))
+        self.exec_id = self.scheduler.add_exec(self)
         print(self.format_print(" Running..."))
         while not self.stop_exec:
             self.step()
@@ -982,8 +992,8 @@ class ExecutionEngine(threading.Thread):
         self.scheduler.attach_exec_to_context(self.exec_id)
 
         # Forward pass
-        self.model.train()
-        outputs = self.model(self.x, labels=self.label)
+        self.scheduler.model.train()
+        outputs = self.scheduler.model(self.x, labels=self.label)
         self.loss = self.loss_fn(outputs, self.label)
         
         # Detach the exec from the scheduler context,
