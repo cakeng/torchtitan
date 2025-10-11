@@ -14,6 +14,7 @@ import os
 from random import Random
 from typing import Optional
 
+from numpy import False_
 from regex import R
 import torch
 import torch.distributed as dist
@@ -63,6 +64,7 @@ class TorchTitanExecutionEngine(ExecutionEngine):
         self.pp_size = pp_size
         self.device = device
         self.pp_mesh = pp_mesh
+        self.exec_id = None
         
         self.stage = TschedStage(
             self.model,
@@ -82,23 +84,18 @@ class TorchTitanExecutionEngine(ExecutionEngine):
                                           loss_fn=self.loss_fn,
                                           global_rank=global_rank)
         
-        print(g_str(f"[T{self.tid}]") + " ExecutionEngine initialized, "
-              f"exec id " + y_str(f"{self.exec_id}") + ", microbatch id " + 
-              y_str(f"{self.microbatch_index}") + ", global rank " + 
+        if self.pp_rank == 0:
+            y = self.pp_schedule.initialize_stage(self.x)
+        elif self.pp_rank == self.pp_size - 1:
+            y = self.pp_schedule.initialize_stage()
+        else:
+            self.pp_schedule.initialize_stage()
+
+        print(g_str(f"[T{self.tid}]") + " TorchTitan ExecutionEngine initialized, "
+              f"microbatch id " + y_str(f"{self.microbatch_index}") + ", global rank " + 
               y_str(f"{global_rank}" + ", PP mesh " + y_str(f"{self.pp_mesh.get_group()}")))
         
-        if self.pp_rank == 0:
-            y = self.pp_schedule.initialize_stage(self.x, scheduler=self.scheduler, exec_id=self.exec_id)
-        elif self.pp_rank == self.pp_size - 1:
-            y = self.pp_schedule.initialize_stage(target=self.label, losses=self.losses, 
-                                                  scheduler=self.scheduler, exec_id=self.exec_id)
-        else:
-            self.pp_schedule.initialize_stage(scheduler=self.scheduler, exec_id=self.exec_id)
         
-        self.init_exec(model=self.stage.submod)
-        if not self.main_thread:
-            self.start()
-
     def step(self):
         if self.pp_rank == 0:
             y = self.pp_schedule.step(self.x, scheduler=self.scheduler, exec_id=self.exec_id)
@@ -132,7 +129,7 @@ def run_full_model(
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
     microbatches = mbp_size
-    debug = False
+    debug = True
 
     mesh = meshes[0]
     pp_mesh = mesh["pp"]
@@ -160,12 +157,12 @@ def run_full_model(
 
     # Instantiate model
     with device, mesh:
-        base_model = DeepseekForCausalLM(model_args)
+        model = DeepseekForCausalLM(model_args)
         print(y_str(f"[Rank {rank}]") + " Base model instantiated")
 
     # Load weights
     # load_weights_from_hf(model, model_id, device)
-    base_model.train()
+    model.train()
 
     # Example inputs
     torch.manual_seed(ep_rank)
@@ -177,22 +174,17 @@ def run_full_model(
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy
     
-    context_scheduler = ContextScheduler(microbatches, 
-                                        debug=debug, is_dist=True)
+    context_scheduler = ContextScheduler(model, microbatches, 
+                                         debug=debug, is_dist=True)
     profiler = None
-    # profiler = ModelProfiler(base_model, x[0], label[0], loss_fn)
 
-    # with device, mesh, init_empty_weights():
-    #     model = DeepseekForCausalLM(model_args)
-    # model.train()
-    # materialize_meta_model(model, base_model)
     dist.barrier()
     main_engine = TorchTitanExecutionEngine(
-                        base_model, x[0], label[0], loss_fn,
+                        x[0], label[0], loss_fn,
                         microbatches, 0, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, profiler=profiler, is_dist=True, 
                         debug=debug, main_thread= True)
-
+    engines = [main_engine]
 
     for t in range(1, microbatches):
         mesh = meshes[t]
@@ -201,17 +193,14 @@ def run_full_model(
         pp_rank = pp_mesh.get_local_rank()
         ep_rank = ep_mesh.get_local_rank()
 
-        # with device, mesh, init_empty_weights():
-        #     model = DeepseekForCausalLM(model_args)
-        # model.train()
-        # materialize_meta_model(model, base_model)
         dist.barrier()
-        TorchTitanExecutionEngine(
-                        base_model, x[t], label[t], loss_fn,
+        print(f"Rank {rank} Creating engine thread {t}...\n", end="")
+        engine_thread = TorchTitanExecutionEngine(
+                        x[t], label[t], loss_fn,
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, profiler=profiler, is_dist=True, 
                         debug=debug)
-    
+        engines.append(engine_thread)
 
         # Apply data parallelism
         # fsdp_mesh = mesh["fsdp"]
@@ -246,8 +235,15 @@ def run_full_model(
     # dist.barrier()
     # assert 0
 
+    context_scheduler.attach_hooks()
+    main_engine.init_exec(model=main_engine.stage.submod)
+    for t in range(1, microbatches):
+        engines[t].start()
+
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
+    
+    
 
     print(y_str(f"[Rank {rank}]") + " Running " + f"{num_steps} thread-parallel steps, "
           f"{num_hidden_layers=}, {microbatches=}, {bs=}, {seqlen=}")
@@ -265,6 +261,10 @@ def run_full_model(
         
     with torch.profiler.record_function("BARRIER:EXEC_END"):
         dist.barrier()
+
+    for t in range(1, microbatches):
+        engines[t].stop_exec()
+        engines[t].join()
 
 
 if __name__ == "__main__":

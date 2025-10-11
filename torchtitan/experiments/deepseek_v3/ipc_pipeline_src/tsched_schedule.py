@@ -267,11 +267,6 @@ class ScheduleTsched(TschedScheduleSingle):
     def initialize_stage(
         self,
         *args,
-        target: Optional[torch.Tensor] = None,
-        losses: Optional[list] = None,
-        scheduler: Optional[ContextScheduler] = None,
-        exec_id: Optional[int] = None,
-        step_idx=0,
         **kwargs,
     ):
         """

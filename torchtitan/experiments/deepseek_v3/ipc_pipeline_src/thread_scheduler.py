@@ -77,6 +77,7 @@ class ContextSwitchModule(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Ensures a grad_fn exists even if this would be a pure identity
+        # return x
         return _PassThrough.apply(x)
 
 def dump_all_threads(signum, frame):
@@ -237,14 +238,17 @@ class ExecContext:
     
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
-    def __init__(self, num_execs, is_dist = False, num_serialized_regions = 6,
+    def __init__(self, model, num_execs, is_dist = False, num_serialized_regions = 6,
                  debug = False):
+        self.model = model
         self.num_execs = num_execs
         self.active_exec_id = None
         self.next_exec_id = None
         self.stop_scheduling = False
         self.waiting_exec_ids = SortedList()
         self.execs = {}
+        self.tid_to_exec = {}
+        self.backward_exec_id = None
         self.debug = debug
         self.skip_debug_num = 2
         self.is_dist = is_dist
@@ -365,14 +369,14 @@ class ContextScheduler:
         # Add an exec to the scheduler.
         for exec_id in self.execs:
             assert self.execs[exec_id].exec.tid != exec.tid, \
-                f"Exec {exec} already exists, thread ident {exec.tid}"
+                f"Exec {exec} already exists, thread id {exec.tid} - Execs: {self.execs}"
         new_exec_id = len(self.execs)
         if new_exec_id >= self.num_execs:
             raise ValueError(f"Expected {self.num_execs} execs, got {new_exec_id}")
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
         # new_exec_stream = torch.cuda.Stream()
-        new_exec_stream = torch.cuda.current_stream()
+        new_exec_stream = torch.cuda.default_stream()
         new_exec_event = torch.cuda.Event()
         new_exec_event.record(new_exec_stream)
         new_exec_serialized_regions = []
@@ -459,7 +463,7 @@ class ContextScheduler:
     
     def enter_serialized_region(self, exec_id, region_id=0, region_name=""):
         # Enters a serialized region of code in the exec_id order.
-        self.execs[exec_id].ready_info = {"key": "SERIALIZED_REGION", "region_id": region_id}
+        self.execs[exec_id].ready_info = {"key": "SERIALIZED_REGION", "region_id": region_id, "region_name": region_name}
         loop_count = 0
         while not self.execs[exec_id].serialized_regions[region_id].is_set():
             self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
@@ -467,18 +471,22 @@ class ContextScheduler:
         self.execs[exec_id].ready_info = None
         if self.debug:
             print(self.format_print("Exec " + y_str(f"{exec_id} ") + g_str(f"Entering") + 
-                                    " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
+                                    " serialized region " + y_str(f"{region_id}, {region_name}"), b_str))
+        if region_name == "Backward":
+            self.backward_exec_id = exec_id
         return
     
     def exit_serialized_region(self, exec_id, region_id=0, region_name=""):
         # Exits a serialized region of code in the exec_id order.
+        if region_name == "Backward":
+            self.backward_exec_id = None
         self.execs[exec_id].serialized_regions[region_id].clear()
         if exec_id + 1 < self.num_execs:
             # Signal the next exec to enter the serialized region
             self.execs[exec_id + 1].serialized_regions[region_id].set()
         if self.debug:
             print(self.format_print("Exec " + y_str(f"{exec_id} ") + r_str(f"Exiting") + 
-                                    " serialized region " + y_str(f"{region_id} {region_name}"), b_str))
+                                    " serialized region " + y_str(f"{region_id}, {region_name}"), b_str))
         return
 
     def schedule_comm(self, exec_id, comm_func, comm_key, wait_for_completion):
@@ -583,6 +591,89 @@ class ContextScheduler:
         self.completion_signal_m2c.set() # Signal that the main thread has acquired the context lock
         if self.debug:
             print(y_str(f"[Main Thread]") + " All execs completed! Resuming main thread.")
+
+    def tag_module_name(self, module, module_name=None):
+        # Set the exec_name for the current module
+        if module_name is None:
+            module.module_name = module.__class__.__name__
+        else:
+            module.module_name = module_name    
+        
+        for child_name, child_module in module.named_children():
+            self.tag_module_name(child_module, module.module_name + "_" + child_name)
+
+    def attach_hooks(self):
+        """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
+        print(self.format_print(" Attaching hooks...", y_str))
+        self.detach_hooks() # Clear any old hooks first
+        for module in self.model.modules():
+            module_name = module.module_name
+            module_list = self.context_switch_module_list + ["context_switch_module"]
+            if any(module_class_str in module_name for module_class_str in module_list):
+                fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
+                try:
+                    bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
+                    print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
+                except Exception as e:
+                    print(f"Failed to register backward hook for {module_name}: {e}")
+                    bwd_hook = None
+                self.hooks[module_name] = (fwd_hook, bwd_hook)
+                if self.debug:
+                    print(self.format_print("Attached forward and backward hooks to " + 
+                          y_str(f"{module_name}") + "\n", g_str), end="")
+                continue
+            elif self.profiler is not None and module_name in self.profiler.modules:
+                module_info = self.profiler.modules[module_name]
+                if module_info.fire_context_switch:
+                    fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
+                    try:
+                        bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
+                        print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
+                    except Exception as e:
+                        print(f"Failed to register backward hook for {module_name}: {e}")
+                        bwd_hook = None
+                    self.hooks[module_name] = (
+                        fwd_hook,
+                        bwd_hook
+                    )
+                    if self.debug:
+                        print(self.format_print("Attached forward and backward hooks to " + 
+                              y_str(f"{module_name}") + "\n", g_str), end="")
+        print(self.format_print("Hooks: " + y_str(f"{self.hooks}")))
+    
+    def detach_hooks(self):
+        """ ### IMPLEMENTATION: Remove all attached hooks. ### """
+        # Clear all events
+        for fwd_hook, bwd_hook in self.hooks.values():
+            fwd_hook.remove()
+            if bwd_hook is not None:
+                bwd_hook.remove()
+        self.hooks = {}
+        
+    def forward_scheduler_hook(self, module, input, output):
+        if self.debug:
+            print(self.format_print(b_str(f"Forward hook") + " fired on " + 
+                y_str(f"{module.module_name}") + "\n", g_str), end="")
+        force_switch = False
+        if isinstance(module, ContextSwitchModule):
+            force_switch = module.force_switch
+        exec_id = self.tid_to_exec[threading.current_thread().ident]
+        self.context_switch(exec_id, force_switch=force_switch)
+        if self.debug:
+            print(self.format_print("Forward hook completed", g_str))
+
+    def backward_scheduler_hook(self, module, grad_input, grad_output):
+        if self.debug:
+            print(self.format_print(r_str(f"Backward hook") + " fired on " + 
+                    y_str(f"{module.module_name}") + "\n", g_str, self.backward_tid), end="")
+        force_switch = False
+        if isinstance(module, ContextSwitchModule):
+            force_switch = module.force_switch
+        exec_id = self.backward_exec_id
+        self.context_switch(exec_id, force_switch=force_switch)
+        if self.debug:
+            print(self.format_print("Backward hook completed", g_str))
+
             
 @dataclass
 class ModuleInfo():
@@ -841,53 +932,32 @@ class ExecutionEngine(threading.Thread):
         self.is_dist = is_dist
         self.stop_exec = False
         self.main_thread = main_thread
-        if self.main_thread:
-            self.tid = threading.current_thread().ident
-        else:
-            self.tid = None
-        self.exec_id = scheduler.add_exec(self)
         self.context_switch_module_list = context_switch_module_list
         if start_exec:
             self.init_exec()
             self.start()
-            
-    def init_exec(self, model=None):
-        if model is not None:
-            self.model = model
-        self.tag_module_name(self.model)
-        self.attach_hooks()
         
     def stop_exec(self):
-        self.detach_hooks()
         self.stop_exec = True
 
     def format_print(self, message, color_fnc=b_str, tid=None):
-        if self.tid is None:
-            self.tid = self.ident
-        if tid is None:
-            tid = self.tid
-        prefix = f"T{str(tid)[-6:]}"
+        if self.exec_id is None:
+            raise ValueError(r_str("ExecutionEngine not initialized. Please call init_exec() first."))
+        prefix = f"T{str(threading.current_thread().ident)[-6:]}"
         if self.is_dist:
             prefix += f" R{dist.get_rank()}"
         prefix += f" E{self.exec_id} CK{self.scheduler.comm_order_key}"
         prefix = color_fnc(prefix) if color_fnc is not None else prefix
         return f"[{prefix}] {message}"
-        
-    def tag_module_name(self, module, module_name=None):
-        # Set the exec_name for the current module
-        if module_name is None:
-            module.module_name = module.__class__.__name__
-        else:
-            module.module_name = module_name    
-        
-        for child_name, child_module in module.named_children():
-            self.tag_module_name(child_module, module.module_name + "_" + child_name)
 
     def run(self):
+        if self.exec_id is None:
+            raise ValueError(r_str("ExecutionEngine not initialized. Please call init_exec() first."))
         print(self.format_print(" Running..."))
         while not self.stop_exec:
             self.step()
             self.sync_step_completion()
+        print(self.format_print(" ExecutionEngine stopped."))
             
     def sync_step_completion(self):
         # Wait for all execs to complete.
@@ -931,97 +1001,6 @@ class ExecutionEngine(threading.Thread):
         self.scheduler.detach_exec_from_context(self.exec_id)
         
         print(self.format_print("Bwd pass finished"))
-
-    def attach_hooks(self):
-        """ ### IMPLEMENTATION: Attach hooks to all modules. ### """
-        print(self.format_print(" Attaching hooks...", y_str))
-        self.detach_hooks() # Clear any old hooks first
-        # for module in self.model.modules():
-        #     module_name = module.module_name
-        #     module_list = self.context_switch_module_list + ["context_switch_module"]
-        #     if any(module_class_str in module_name for module_class_str in module_list):
-        #         fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
-        #         try:
-        #             bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
-        #             print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
-        #         except Exception as e:
-        #             print(f"Failed to register backward hook for {module_name}: {e}")
-        #             bwd_hook = None
-        #         self.hooks[module_name] = (fwd_hook, bwd_hook)
-        #         if self.debug:
-        #             print(self.format_print("Attached forward and backward hooks to " + 
-        #                   y_str(f"{module_name}") + "\n", g_str), end="")
-        #         continue
-        #     elif self.profiler is not None and module_name in self.profiler.modules:
-        #         module_info = self.profiler.modules[module_name]
-        #         if module_info.fire_context_switch:
-        #             fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
-        #             try:
-        #                 bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
-        #                 print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
-        #             except Exception as e:
-        #                 print(f"Failed to register backward hook for {module_name}: {e}")
-        #                 bwd_hook = None
-        #             self.hooks[module_name] = (
-        #                 fwd_hook,
-        #                 bwd_hook
-        #             )
-        #             if self.debug:
-        #                 print(self.format_print("Attached forward and backward hooks to " + 
-        #                       y_str(f"{module_name}") + "\n", g_str), end="")
-        print(self.format_print("Hooks: " + y_str(f"{self.hooks}")))
-    
-    def detach_hooks(self):
-        """ ### IMPLEMENTATION: Remove all attached hooks. ### """
-        # Clear all events
-        for fwd_hook, bwd_hook in self.hooks.values():
-            fwd_hook.remove()
-            if bwd_hook is not None:
-                bwd_hook.remove()
-        self.hooks = {}
-        
-    def forward_scheduler_hook(self, module, input, output):
-        if self.tid is None:
-            self.tid = self.ident
-        assert threading.current_thread().ident == self.tid, \
-            f"Expected {self.tid} to be the current exec during forward hook, " + \
-            f"got {threading.current_thread().ident}"
-        if self.debug:
-            print(self.format_print(b_str(f"Forward hook") + " fired on " + 
-                y_str(f"{module.module_name}") + "\n", g_str), end="")
-        force_switch = False
-        if isinstance(module, ContextSwitchModule):
-            force_switch = module.force_switch
-
-        self.scheduler.context_switch(self.exec_id, force_switch=force_switch)
-        if self.debug:
-            print(self.format_print("Forward hook completed", g_str))
-
-    def backward_scheduler_hook(self, module, grad_input, grad_output):
-        if self.backward_tid == -1:
-            self.backward_tid = threading.current_thread().ident
-        assert threading.current_thread().ident == self.backward_tid, \
-            f"Expected {self.backward_tid} to be the current exec during backward hook, " + \
-            f"got {threading.current_thread().ident}"
-        if self.debug:
-            print(self.format_print(r_str(f"Backward hook") + " fired on " + 
-                    y_str(f"{module.module_name}") + "\n", g_str, self.backward_tid), end="")
-        force_switch = False
-        if isinstance(module, ContextSwitchModule):
-            force_switch = module.force_switch
-        self.scheduler.context_switch(self.exec_id, force_switch=force_switch)
-        if self.debug:
-            print(self.format_print("Backward hook completed", g_str))
-
-    def create_backward_lock_hooks(self, layer_lock):
-        """ Hooks to acquire/release a lock during the backward pass. """
-        def pre_hook(module, grad_input):
-            print(self.format_print(r_str(f"Backward Pre-hook") + " fired on " + 
-                  y_str(f"{module.module_name}") + "\n", g_str, self.backward_tid), end="")
-        def post_hook(module, grad_input, grad_output):
-            print(self.format_print(r_str(f"Backward Post-hook") + " fired on " + 
-                  y_str(f"{module.module_name}") + "\n", g_str, self.backward_tid), end="")
-        return pre_hook, post_hook
 
 # =============================================================================
 # E2E TEST AND MODEL DEFINITION
