@@ -236,7 +236,7 @@ def run_full_model(
     context_scheduler.attach_hooks()
     for t in range(1, microbatches):
         print(y_str(f"[Rank {rank}]") + " Starting engine thread " + f"{t}")
-        engines[t].start()
+        engines[t].start_exec()
 
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
@@ -257,10 +257,6 @@ def run_full_model(
         
     with torch.profiler.record_function("BARRIER:EXEC_END"):
         dist.barrier()
-
-    for t in range(1, microbatches):
-        engines[t].stop_exec()
-        engines[t].join()
 
 
 if __name__ == "__main__":

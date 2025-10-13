@@ -369,36 +369,38 @@ class ContextScheduler:
             print(self.format_print("Resuming exec context on stream " +
                 y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
 
-    def add_exec(self, exec):
+    def add_exec(self, exec, ident = None):
         # Add an exec to the scheduler.\
-        print(f"Adding exec {exec.ident} to scheduler, length of execs: {len(self.execs)}\n", end="")
+        if ident is None:
+            ident = exec.ident
+        print(f"Adding exec {ident} to scheduler, length of execs: {len(self.execs)}\n", end="")
         for exec_id in self.execs:
-            assert self.execs[exec_id].exec.ident != exec.ident, \
-                f"Exec {exec} already exists, ident {exec.ident} - ident_to_exec_id: {self.ident_to_exec_id}"
+            assert self.execs[exec_id].exec.ident != ident, \
+                f"Exec {exec} already exists, ident {ident} - ident_to_exec_id: {self.ident_to_exec_id}"
         new_exec_id = len(self.execs)
         print(f"New exec id: {new_exec_id}, num_execs: {self.num_execs}\n", end="")
         assert new_exec_id < self.num_execs, \
             f"Expected {self.num_execs} execs, got {new_exec_id}"
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
-        print(f"New exec signal created for exec {exec.ident}\n", end="")
+        print(f"New exec signal created for exec {ident}\n", end="")
         # new_exec_stream = torch.cuda.Stream()
         dev = exec.device
         new_exec_stream = torch.cuda.default_stream(dev)
         torch.cuda.set_stream(new_exec_stream)
         new_exec_event = torch.cuda.Event()
-        print(f"New exec event created for exec {exec.ident}\n", end="")
+        print(f"New exec event created for exec {ident}\n", end="")
         new_exec_serialized_regions = []
         new_exec_ready_info = None
-        print(f"New exec ready info created for exec {exec.ident}\n", end="")
+        print(f"New exec ready info created for exec {ident}\n", end="")
         new_exec_comm_works_wait = []
         new_exec_comm_works_dispatch = []
-        print(f"Creating exec context for exec {exec.ident}\n", end="")
+        print(f"Creating exec context for exec {ident}\n", end="")
         for i in range (self.num_serialized_regions):
             new_exec_serialized_regions.append(threading.Event())
             new_exec_serialized_regions[i].clear()
-        self.ident_to_exec_id[exec.ident] = new_exec_id
-        print(f"Adding exec context to execs for exec {exec.ident}\n", end="")
+        self.ident_to_exec_id[ident] = new_exec_id
+        print(f"Adding exec context to execs for exec {ident}\n", end="")
         self.execs[new_exec_id] = ExecContext(exec, 
                                               new_exec_signal, 
                                               new_exec_stream, 
@@ -408,7 +410,7 @@ class ContextScheduler:
                                               new_exec_comm_works_wait,
                                               new_exec_comm_works_dispatch)
         if self.debug:
-            print(self.format_print(f"Added exec {exec.ident} with id " + 
+            print(self.format_print(f"Added exec {ident} with id " + 
                   y_str(f"{new_exec_id}"), y_str))
         return new_exec_id
     
@@ -679,7 +681,8 @@ class ContextScheduler:
     def backward_scheduler_hook(self, module, grad_input, grad_output):
         if self.debug:
             print(self.format_print(r_str(f"Backward hook") + " fired on " + 
-                    y_str(f"{module.module_name}") + "\n", g_str, self.backward_tid), end="")
+                    y_str(f"{module.module_name}") + "\n", g_str, 
+                    self.backward_exec_id), end="")
         force_switch = False
         if isinstance(module, ContextSwitchModule):
             force_switch = module.force_switch
@@ -936,20 +939,24 @@ class ExecutionEngine(threading.Thread):
         self.loss_fn = loss_fn
         self.scheduler = scheduler
         self.loss = None
+        self.exec_id = None
         
         self.backward_tid = -1
         self.debug = debug
         self.device = device
-        self.is_dist = is_dist
-        self.stop_exec = False
+        self.is_dist = is_dist        
         self.main_thread = main_thread
         if self.main_thread:
-            self.exec_id = self.scheduler.add_exec(self)
+            ident = threading.current_thread().ident
+            self.exec_id = self.scheduler.add_exec(self, ident)
         if start_exec:
             self.start()
      
-    def stop_exec(self):
-        self.stop_exec = True
+    def start_exec(self):
+        self.start()
+        while self.exec_id is None:
+            time.sleep(0.01)
+        return self.exec_id
 
     def format_print(self, message, color_fnc=b_str, tid=None):
         if self.exec_id is None:
@@ -963,11 +970,10 @@ class ExecutionEngine(threading.Thread):
 
     def run(self):
         self.exec_id = self.scheduler.add_exec(self)
-        print(self.format_print(" Running..."))
-        while not self.stop_exec:
+        print(self.format_print(f"Running exec {self.exec_id}..."))
+        while True:
             self.step()
             self.sync_step_completion()
-        print(self.format_print(" ExecutionEngine stopped."))
             
     def sync_step_completion(self):
         # Wait for all execs to complete.
