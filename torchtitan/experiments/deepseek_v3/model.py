@@ -716,8 +716,7 @@ class MoE(nn.Module):
                 input_splits.tolist(),
                 self.ep_group,
             ) 
-        x = self.context_switch_module(x)
-        ####### CONTEXT SWITCH HERE #######
+        
 
         # This part prepares a 1D tensor with the same length as
         # `gathered_tokens`. The 1D tensor is filled with local expert IDs which
@@ -748,7 +747,7 @@ class MoE(nn.Module):
         #     processed_tokens[gatherd_idxs == i] = expert(
         #         gathered_tokens[gatherd_idxs == i]
         #     )
-
+        
         # --- OPTIMIZED EXPERT PROCESSING ---
         # This section is modified to remove per-expert synchronization.
 
@@ -764,18 +763,24 @@ class MoE(nn.Module):
         # Create an inverse permutation to scatter the results back.
         _, unpermutation_indices = torch.sort(permutation_indices)
 
+
+        
         # SINGLE SYNC POINT: Get the token counts for each expert.
         # We use bincount and then transfer the result to the CPU. This is the
         # one synchronization we accept to avoid the expensive per-expert syncs.
         tokens_per_local_expert = torch.bincount(
             sorted_expert_idxs, minlength=len(self.experts)
-        ).tolist()
+        )
 
         # Calculate the offsets for slicing into the permuted tensor.
         # e.g., [10, 20, 5] -> [0, 10, 30, 35]
-        offsets = [0] + torch.cumsum(
-            torch.tensor(tokens_per_local_expert), dim=0
-        ).tolist()
+        offsets = torch.cat([
+            torch.tensor([0], device=tokens_per_local_expert.device, dtype=tokens_per_local_expert.dtype),
+            torch.cumsum(tokens_per_local_expert, dim=0)
+        ])
+        
+        offsets = self.context_switch_module(offsets)
+        offsets = offsets.tolist()
 
         # Prepare the output buffer.
         if self.shuffle_method == "symm_mem":
