@@ -436,8 +436,8 @@ class _TschedStageBase(ABC):
         num_microbatches = self.num_microbatches
         order_key = 0
         for n in range(num_microbatches):
-            self.total_order_keys.append({"fwd_recv": -1, "fwd_send": -1, 
-                                          "bwd_recv": -1, "bwd_send": -1})
+            self.total_order_keys.append({"fwd_recv_key": -1, "fwd_send_key": -1, 
+                                          "bwd_recv_key": -1, "bwd_send_key": -1})
         for n in range(num_microbatches + num_stages * 2):
             if pp_stage % 2 == 0:
                 fwr_mb = n - pp_stage
@@ -450,20 +450,22 @@ class _TschedStageBase(ABC):
                 do_fws_mb = fws_mb >= 0 and fws_mb < num_microbatches
 
                 if do_fwr_mb:
-                    self.total_order_keys[fwr_mb]["fwd_recv"] = order_key
+                    self.total_order_keys[fwr_mb]["fwd_recv_key"] = order_key
+                    self.total_order_keys[fwr_mb]["fwd_recv_pair_id"] = bwr_mb if do_bwr_mb else None
                     self.total_order_keys[fwr_mb]["fwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                       if do_bwr_mb else None
                     order_key += 1
                 if do_fws_mb:
-                    self.total_order_keys[fws_mb]["fwd_send"] = order_key
+                    self.total_order_keys[fws_mb]["fwd_send_key"] = order_key
                     order_key += 1
                 if do_bwr_mb:
-                    self.total_order_keys[bwr_mb]["bwd_recv"] = order_key
+                    self.total_order_keys[bwr_mb]["bwd_recv_key"] = order_key
+                    self.total_order_keys[bwr_mb]["bwd_recv_pair_id"] = fwr_mb if do_fwr_mb else None
                     self.total_order_keys[bwr_mb]["bwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                           if do_fwr_mb else None
                     order_key += 1
                 if do_bws_mb:
-                    self.total_order_keys[bws_mb]["bwd_send"] = order_key
+                    self.total_order_keys[bws_mb]["bwd_send_key"] = order_key
                     order_key += 1
             else:
                 fws_mb = n - pp_stage - 1
@@ -475,28 +477,29 @@ class _TschedStageBase(ABC):
                 fwr_mb = n - pp_stage
                 do_fwr_mb = fwr_mb >= 0 and fwr_mb < num_microbatches
                 
-                
                 if do_fws_mb:
-                    self.total_order_keys[fws_mb]["fwd_send"] = order_key
+                    self.total_order_keys[fws_mb]["fwd_send_key"] = order_key
                     order_key += 1
                 if do_fwr_mb:
-                    self.total_order_keys[fwr_mb]["fwd_recv"] = order_key
+                    self.total_order_keys[fwr_mb]["fwd_recv_key"] = order_key
+                    self.total_order_keys[fwr_mb]["fwd_recv_pair_id"] = bwr_mb if do_bwr_mb else None
                     self.total_order_keys[fwr_mb]["fwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                       if do_bwr_mb else None
                     order_key += 1
                 if do_bws_mb:
-                    self.total_order_keys[bws_mb]["bwd_send"] = order_key
+                    self.total_order_keys[bws_mb]["bwd_send_key"] = order_key
                     order_key += 1
                 if do_bwr_mb:
-                    self.total_order_keys[bwr_mb]["bwd_recv"] = order_key
+                    self.total_order_keys[bwr_mb]["bwd_recv_key"] = order_key
+                    self.total_order_keys[bwr_mb]["bwd_recv_pair_id"] = fwr_mb if do_fwr_mb else None
                     self.total_order_keys[bwr_mb]["bwd_recv_pair_key"] = fwr_mb * num_microbatches + bwr_mb \
                                                                           if do_fwr_mb else None
                     order_key += 1
-        if debug:
-            print(g_str(f"[Stage {self.stage_index}] ") + 
-            r_str(f"Calculated total order key: ") +  
-            f"{self.total_order_keys}")
-            self._print_total_order_keys(debug)
+
+        print(g_str(f"[Stage {self.stage_index}] ") + 
+        r_str(f"Calculated total order key: ") +  
+        f"{self.total_order_keys}")
+        self._print_total_order_keys(debug)
         return
 
     def get_fwd_recv_ops(self) -> list[dist.P2POp]:
@@ -505,22 +508,24 @@ class _TschedStageBase(ABC):
         for this stage.
         """
         recv_infos: tuple[InputInfo, ...] = self.args_recv_info
+        key_dict = self.total_order_keys[self.microbatch_idx]
 
-        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx]["fwd_recv"], \
-            self.total_order_keys[self.microbatch_idx]["fwd_recv_pair_key"]
+        return self._get_recv_ops(recv_infos), key_dict["fwd_recv_key"], \
+                key_dict["fwd_recv_pair_id"], key_dict["fwd_recv_pair_key"]
 
     def get_bwd_recv_ops(self) -> list[dist.P2POp]:
         """
         Returns a list of ops that are needed to receive the gradients
         for this stage.
         """
+        key_dict = self.total_order_keys[self.microbatch_idx]
         if not self.has_backward or self.is_last:
-            return [], self.total_order_keys[self.microbatch_idx]["bwd_recv"], \
-                self.total_order_keys[self.microbatch_idx]["bwd_recv_pair_key"]
+            return [], key_dict["bwd_recv_key"], \
+                key_dict["bwd_recv_pair_id"], key_dict["bwd_recv_pair_key"]
 
         recv_infos = self.grad_recv_info    
-        return self._get_recv_ops(recv_infos), self.total_order_keys[self.microbatch_idx]["bwd_recv"], \
-            self.total_order_keys[self.microbatch_idx]["bwd_recv_pair_key"]
+        return self._get_recv_ops(recv_infos), key_dict["bwd_recv_key"], \
+                key_dict["bwd_recv_pair_id"], key_dict["bwd_recv_pair_key"]
 
     def get_fwd_send_ops(self) -> list[dist.P2POp]:
         """
@@ -547,14 +552,14 @@ class _TschedStageBase(ABC):
                 ops.append(dist.P2POp(dist.isend, out, peer_global_rank, 
                                       self.group))
 
-        return ops, self.total_order_keys[self.microbatch_idx]["fwd_send"]
+        return ops, self.total_order_keys[self.microbatch_idx]["fwd_send_key"]
 
     def get_bwd_send_ops(self) -> list[dist.P2POp]:
         """
         Get the gradient send ops for current stage's backward.
         """
         if not self.has_backward or self.is_first:
-            return [], self.total_order_keys[self.microbatch_idx]["bwd_send"]
+            return [], self.total_order_keys[self.microbatch_idx]["bwd_send_key"]
 
         # Create bwd send infra lazily
         if self.grad_send_info is None:
@@ -582,7 +587,7 @@ class _TschedStageBase(ABC):
                         f"[{self.stage_index}] for chunk {self.microbatch_idx} has gradients {grad} "
                         f"and is expecting to send gradients to stage {grad_recv_stage}"
                     )
-        return ops, self.total_order_keys[self.microbatch_idx]["bwd_send"]
+        return ops, self.total_order_keys[self.microbatch_idx]["bwd_send_key"]
 
     def clear_runtime_states(self) -> None:
         """

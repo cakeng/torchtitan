@@ -128,7 +128,8 @@ def run_full_model(
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
     microbatches = mbp_size
-    debug = True
+    # debug = True
+    debug = False
 
     mesh = meshes[0]
     pp_mesh = mesh["pp"]

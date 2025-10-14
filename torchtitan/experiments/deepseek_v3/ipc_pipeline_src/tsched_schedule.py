@@ -307,59 +307,63 @@ class ScheduleTsched(TschedScheduleSingle):
         scheduler.attach_exec_to_context(exec_id) 
 
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward"):
-            ops, comm_key, recv_pair_key = self._stage.get_fwd_recv_ops()   
-            if comm_key != -1:
-                scheduler.schedule_comm(exec_id, 
-                                        lambda: _batch_p2p_non_coalescing(ops, 
-                                        desc="fwd_recv", microbatch_idx=self._microbatch_idx),
-                                        comm_key, True)
-                print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                      b_str(f"Forwarding {self._microbatch_idx}") + 
-                      f", received {ops}, comm_key: {comm_key}")
+            ops, comm_key, recv_pair_id, recv_pair_key = self._stage.get_fwd_recv_ops() 
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, 
+                                    desc="fwd_recv", microbatch_idx=self._microbatch_idx),
+                                    comm_key, True)
+            print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                    b_str(f"Forwarding {self._microbatch_idx}, ") + 
+                    f"received {ops}, comm_key: {comm_key}")
             if recv_pair_key is not None:
                 print(g_str(f"[T{ident} R{self._global_rank} FR{self._microbatch_idx}] ") + 
-                      b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
-                scheduler.thread_barrier(exec_id, 2, recv_pair_key, pass_id=1)
+                      b_str(f"Waiting for forward recv pair ") + f"{recv_pair_id}, " +
+                      b_str(f"recv pair key ") + f"{recv_pair_key}")
+                scheduler.pair_thread_barrier(exec_id, recv_pair_id, recv_pair_key, 2, pass_id=1)
                 
             scheduler.enter_serialized_region(exec_id, region_id=1, 
                                               region_name="Forward")
         
-            with torch.profiler.record_function(f"Forward {step_idx}"):
+            with torch.profiler.record_function(
+                f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Forward pass"):
                 output = self._stage.forward_one_chunk(args, kwargs)
+
+            print(b_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                  b_str(f"Forward pass completed"), g_str)
+            scheduler.signal_exec_iter_completion(exec_id)
 
             scheduler.exit_serialized_region(exec_id, region_id=1, 
                                               region_name="Forward")
         
 
             ops, comm_key = self._stage.get_fwd_send_ops()
-            if comm_key != -1:
-                print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                            b_str(f"Forwarded {self._microbatch_idx}") + 
-                            f", sending {ops}, comm_key: {comm_key}")
-                scheduler.schedule_comm(exec_id, 
-                                        lambda: _batch_p2p_non_coalescing(ops, 
-                                        desc="fwd_send", microbatch_idx=self._microbatch_idx),
-                                        comm_key, False)
+            print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                        b_str(f"Forwarded {self._microbatch_idx}, ") + 
+                        f"sending {ops}, comm_key: {comm_key}")
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, 
+                                    desc="fwd_send", microbatch_idx=self._microbatch_idx),
+                                    comm_key, False)
 
             # Compute loss if this is the last stage
             self._maybe_compute_loss(self._stage, output, target)
             
         # Backward pass
         with record_function(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward"):
-            ops, comm_key, recv_pair_key = self._stage.get_bwd_recv_ops()
-            if comm_key != -1:
-                scheduler.schedule_comm(exec_id, 
-                                        lambda: _batch_p2p_non_coalescing(ops, 
-                                        desc="bwd_recv", microbatch_idx=self._microbatch_idx),
-                                        comm_key, True)
-                print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                            r_str(f"Backwarding {self._microbatch_idx}") + 
-                            f", received {ops}, comm_key: {comm_key}")
+            ops, comm_key, recv_pair_id, recv_pair_key = self._stage.get_bwd_recv_ops()
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, 
+                                    desc="bwd_recv", microbatch_idx=self._microbatch_idx),
+                                    comm_key, True)
+            print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                        r_str(f"Backwarding {self._microbatch_idx}, ") + 
+                        f"received {ops}, comm_key: {comm_key}")
             if recv_pair_key is not None:
                 print(g_str(f"[T{ident} R{self._global_rank} BR{self._microbatch_idx}] ") + 
-                      b_str(f"Waiting for recv pair barrier {recv_pair_key}"))
-                scheduler.thread_barrier(exec_id, 2, recv_pair_key, pass_id=0)
-
+                      b_str(f"Waiting for backward recv pair ") + f"{recv_pair_id}, " +
+                      b_str(f"recv pair key ") + f"{recv_pair_key}")
+                scheduler.pair_thread_barrier(exec_id, recv_pair_id, recv_pair_key, 2, pass_id=0)
+            
             scheduler.enter_serialized_region(exec_id, region_id=2, 
                                               region_name="Backward")
 
@@ -368,19 +372,21 @@ class ScheduleTsched(TschedScheduleSingle):
             with torch.profiler.record_function(
                 f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] Backward pass"):
                 self._stage.backward_one_chunk(loss=loss)
+            print(r_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                  b_str(f"Backward pass completed"), g_str)
+            scheduler.signal_exec_iter_completion(exec_id)
 
             scheduler.exit_serialized_region(exec_id, region_id=2, 
                                             region_name="Backward")
                 
             ops, comm_key = self._stage.get_bwd_send_ops()
-            if comm_key != -1:
-                print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
-                            r_str(f"Backwarded {self._microbatch_idx}") + 
-                            f", sending {ops}, comm_key: {comm_key}")
-                scheduler.schedule_comm(exec_id, 
-                                        lambda: _batch_p2p_non_coalescing(ops, 
-                                        desc="bwd_send", microbatch_idx=self._microbatch_idx),
-                                        comm_key, False)
+            print(g_str(f"[T{ident} R{self._global_rank} M{self._microbatch_idx}] ") + 
+                        r_str(f"Backwarded {self._microbatch_idx}, ") + 
+                        f"sending {ops}, comm_key: {comm_key}")
+            scheduler.schedule_comm(exec_id, 
+                                    lambda: _batch_p2p_non_coalescing(ops, 
+                                    desc="bwd_send", microbatch_idx=self._microbatch_idx),
+                                    comm_key, False)
             self._update_losses(self._stage, losses)
             
         

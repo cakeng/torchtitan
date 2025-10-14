@@ -231,10 +231,13 @@ class ExecContext:
     signal: threading.Event
     stream: torch.cuda.Stream
     event: torch.cuda.Event
+    event_done: bool
     serialized_regions: list[threading.Event]
     ready_info: dict[str, any]
     comm_works_wait: list[dist.Work] = field(default_factory=list)
     comm_works_dispatch: list[dist.Work] = field(default_factory=list)
+    pair_exec_id: int = None
+    exec_iter: int = 0
     
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
@@ -290,23 +293,35 @@ class ContextScheduler:
         if len(self.waiting_exec_ids) > 0:
             self.next_exec_id = self.active_exec_id
             for exec_id in self.waiting_exec_ids:
-                if self.execs[exec_id].ready_info == None:
-                    if self.execs[exec_id].event.query():
-                        self.next_exec_id = exec_id
-                        break
-                elif self.execs[exec_id].ready_info["key"] == "WAIT_COMMS":
+                exec_context = self.execs[exec_id]
+                if exec_context.ready_info["key"] == "CONTEXT_SWITCH_HOOK":
+                    if exec_context.event_done or exec_context.event.query():
+                        exec_context.event_done = True
+                        if exec_context.pair_exec_id is None:
+                            self.next_exec_id = exec_id
+                            break
+                        elif self.execs[exec_context.pair_exec_id].exec_iter  ==  -1 or \
+                            self.execs[exec_context.pair_exec_id].exec_iter >= exec_context.ready_info["pair_exec_iter"] + 1:
+                            self.next_exec_id = exec_id
+                            break
+                elif exec_context.ready_info["key"] == "WAIT_COMMS":
                     if self._check_comm(exec_id):
                         self.next_exec_id = exec_id
                         break
-                elif self.execs[exec_id].ready_info["key"] == "THREAD_BARRIER":
-                    if self.execs[exec_id].ready_info["num_threads"] >= self.thread_barriers[self.execs[exec_id].ready_info["barrier_id"]][0] and \
-                        self.execs[exec_id].ready_info["pass_id"] >= self.thread_barriers[self.execs[exec_id].ready_info["barrier_id"]][1]:
+                elif exec_context.ready_info["key"] == "PAIR_THREAD_BARRIER":
+                    if exec_context.ready_info["num_threads"] >= self.thread_barriers[exec_context.ready_info["pair_key"]][0] and \
+                        exec_context.ready_info["pass_id"] >= self.thread_barriers[exec_context.ready_info["pair_key"]][1]:
                         self.next_exec_id = exec_id
                         break
-                elif self.execs[exec_id].ready_info["key"] == "SERIALIZED_REGION":
-                    if self.execs[exec_id].serialized_regions[self.execs[exec_id].ready_info["region_id"]].is_set():
+                elif exec_context.ready_info["key"] == "SERIALIZED_REGION":
+                    if exec_context.serialized_regions[exec_context.ready_info["region_id"]].is_set():
                         self.next_exec_id = exec_id
                         break
+                elif exec_context.ready_info["key"] == "ATTACHED_TO_CONTEXT":
+                    self.next_exec_id = exec_id
+                    break
+                else:
+                    raise ValueError(f"Unexpected ready info: {exec_context.ready_info}")
             
             if self.next_exec_id == self.active_exec_id and force_switch:
                 self.next_exec_id = self.waiting_exec_ids[0]   
@@ -340,7 +355,8 @@ class ContextScheduler:
                   "Next scheduled exec " + 
                   y_str(f"{self.next_exec_id}") + "\n", b_str), end="")
         self.execs[self.active_exec_id].signal.clear()
-        if self.execs[self.active_exec_id].ready_info == None:
+        if self.execs[self.active_exec_id].ready_info["key"] == "CONTEXT_SWITCH_HOOK":
+            self.execs[self.active_exec_id].event_done = False
             self.execs[self.active_exec_id].event.record(
                 self.execs[self.active_exec_id].stream)
         if self.next_exec_id is not None:
@@ -366,49 +382,48 @@ class ContextScheduler:
         self.active_exec_id = exec_id
         torch.cuda.set_stream(self.execs[self.active_exec_id].stream)
         if self.debug and not skip_debug:
-            print(self.format_print("Resuming exec context on stream " +
+            print(self.format_print(f"Resuming exec {exec_id} context on stream " +
                 y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
 
     def add_exec(self, exec, ident = None):
         # Add an exec to the scheduler.\
         if ident is None:
             ident = exec.ident
-        print(f"Adding exec {ident} to scheduler, length of execs: {len(self.execs)}\n", end="")
         for exec_id in self.execs:
             assert self.execs[exec_id].exec.ident != ident, \
                 f"Exec {exec} already exists, ident {ident} - ident_to_exec_id: {self.ident_to_exec_id}"
         new_exec_id = len(self.execs)
-        print(f"New exec id: {new_exec_id}, num_execs: {self.num_execs}\n", end="")
         assert new_exec_id < self.num_execs, \
             f"Expected {self.num_execs} execs, got {new_exec_id}"
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
-        print(f"New exec signal created for exec {ident}\n", end="")
-        # new_exec_stream = torch.cuda.Stream()
         dev = exec.device
-        new_exec_stream = torch.cuda.default_stream(dev)
+        # new_exec_stream = torch.cuda.default_stream(dev)
+        new_exec_stream = torch.cuda.Stream(dev)
         torch.cuda.set_stream(new_exec_stream)
         new_exec_event = torch.cuda.Event()
-        print(f"New exec event created for exec {ident}\n", end="")
+        new_exec_event_done = False
         new_exec_serialized_regions = []
         new_exec_ready_info = None
-        print(f"New exec ready info created for exec {ident}\n", end="")
         new_exec_comm_works_wait = []
         new_exec_comm_works_dispatch = []
-        print(f"Creating exec context for exec {ident}\n", end="")
+        new_exec_pair_exec_id = None
+        new_exec_exec_iter = 0
         for i in range (self.num_serialized_regions):
             new_exec_serialized_regions.append(threading.Event())
             new_exec_serialized_regions[i].clear()
         self.ident_to_exec_id[ident] = new_exec_id
-        print(f"Adding exec context to execs for exec {ident}\n", end="")
         self.execs[new_exec_id] = ExecContext(exec, 
                                               new_exec_signal, 
                                               new_exec_stream, 
                                               new_exec_event,
+                                              new_exec_event_done,
                                               new_exec_serialized_regions,
                                               new_exec_ready_info,
                                               new_exec_comm_works_wait,
-                                              new_exec_comm_works_dispatch)
+                                              new_exec_comm_works_dispatch,
+                                              new_exec_pair_exec_id,
+                                              new_exec_exec_iter)
         if self.debug:
             print(self.format_print(f"Added exec {ident} with id " + 
                   y_str(f"{new_exec_id}"), y_str))
@@ -430,7 +445,7 @@ class ContextScheduler:
         # i.e., enter the waiting queue for next exec
         if self.debug:
             print(self.format_print(f"Attaching exec " + y_str(f"{exec_id}"), b_str))
-        self.execs[exec_id].wait_keys = None
+        self.execs[exec_id].ready_info = {"key": "ATTACHED_TO_CONTEXT"}
         self._acquire_context(exec_id)
         return
 
@@ -440,7 +455,7 @@ class ContextScheduler:
         assert self.active_exec_id == exec_id, \
             f"Expected {self.active_exec_id} to be the active exec during detach, " + \
             f"got {exec_id} running"
-        self.execs[exec_id].wait_keys = {"key": "DETACHED"}
+        self.execs[exec_id].ready_info = {"key": "DETACHED_FROM_CONTEXT"}
         self._scheduler(force_switch=True)
         self._release_context(exec_id)
         if self.debug:
@@ -448,32 +463,38 @@ class ContextScheduler:
                                     " detached and running independently from the scheduler context.", b_str))
         return
 
-    def thread_barrier(self, exec_id, num_threads = 2, barrier_id=0, pass_id=0):
-        if barrier_id not in self.thread_barriers:
-            self.thread_barriers[barrier_id] = [1, 0]
+    def pair_thread_barrier(self, exec_id, pair_id, pair_key, num_threads = 2, pass_id=0):
+        if pair_key not in self.thread_barriers:
+            self.thread_barriers[pair_key] = [1, 0]
         else:
-            self.thread_barriers[barrier_id][0] += 1
-        self.execs[exec_id].ready_info = {"key": "THREAD_BARRIER", 
-                                          "barrier_id": barrier_id,
+            self.thread_barriers[pair_key][0] += 1
+        self.execs[exec_id].ready_info = {"key": "PAIR_THREAD_BARRIER", 
+                                          "pair_id": pair_id,
+                                          "pair_key": pair_key,
                                           "num_threads": num_threads,
                                           "pass_id": pass_id}
+        self.execs[exec_id].pair_exec_id = pair_id
         if self.debug:
             print(self.format_print("Exec " + y_str(f"{exec_id} ") + 
-                                    g_str(f"Entering thread barrier ") + 
-                                    y_str(f"{barrier_id}, ") + f"{self.thread_barriers[barrier_id][1]} / {pass_id} pass" +
-                                    f", {self.thread_barriers[barrier_id][0]} / {num_threads} threads"), b_str)
+                                    g_str(f"Entering pair thread barrier ") + 
+                                    y_str(f"pair id ") + f"{pair_id}, " +
+                                    y_str(f"pair key ") + f"{pair_key}, " +
+                                    f"{self.thread_barriers[pair_key][1]} / {pass_id} pass" +
+                                    f", {self.thread_barriers[pair_key][0]} / {num_threads} threads"), b_str)
         loop_count = 0
-        while self.thread_barriers[barrier_id][0] < num_threads or \
-            self.thread_barriers[barrier_id][1] < pass_id:
+        while self.thread_barriers[pair_key][0] < num_threads or \
+            self.thread_barriers[pair_key][1] < pass_id:
             self.context_switch(exec_id, skip_debug=loop_count > self.skip_debug_num)
             loop_count += 1
-        self.thread_barriers[barrier_id][1] += 1
+        self.thread_barriers[pair_key][1] += 1
         self.execs[exec_id].ready_info = None
         if self.debug:
             print(self.format_print("Exec " + y_str(f"{exec_id} ") + 
-                                    g_str(f"Passed thread barrier ") + 
-                                    y_str(f"{barrier_id}, ") + f"{self.thread_barriers[barrier_id][1]} / {pass_id} pass" +
-                                    f", {self.thread_barriers[barrier_id][0]} / {num_threads} threads"), b_str)
+                                    g_str(f"Passed pair thread barrier ") + 
+                                    y_str(f"pair id ") + f"{pair_id}, " +
+                                    y_str(f"pair key ") + f"{pair_key}, " +
+                                    f"{self.thread_barriers[pair_key][1]} / {pass_id} pass" +
+                                    f", {self.thread_barriers[pair_key][0]} / {num_threads} threads"), b_str)
         return
     
     def enter_serialized_region(self, exec_id, region_id=0, region_name=""):
@@ -489,6 +510,7 @@ class ContextScheduler:
                                     " serialized region " + y_str(f"{region_id}, {region_name}"), b_str))
         if region_name == "Backward":
             self.backward_exec_id = exec_id
+            self.execs[exec_id].exec_iter = 0
         return
     
     def exit_serialized_region(self, exec_id, region_id=0, region_name=""):
@@ -507,7 +529,7 @@ class ContextScheduler:
     def schedule_comm(self, exec_id, comm_func, comm_key, wait_for_completion):
         # Wait for all comms ops to complete
         if self.debug:
-            print(self.format_print(f"Waiting for comms ops to complete, comm_key: {comm_key}, func: {comm_func}", r_str))
+            print(self.format_print(f"Waiting for comms ops to complete, comm_key: {comm_key}", r_str))
         self.execs[exec_id].ready_info = {"key": "WAIT_COMMS", 
                                           "comm_func": comm_func, 
                                           "comm_key": comm_key, 
@@ -520,7 +542,7 @@ class ContextScheduler:
         self.execs[exec_id].ready_info = None
         if self.debug:
             print(self.format_print(g_str(f"Comms ops completed: ") + 
-                                    f"comm_key: {comm_key}, func: {comm_func}", r_str))
+                                    f"comm_key: {comm_key}", r_str))
         return
     
     def _check_comm(self, exec_id):  
@@ -665,31 +687,54 @@ class ContextScheduler:
             if bwd_hook is not None:
                 bwd_hook.remove()
         self.hooks = {}
+
+    def signal_exec_iter_completion(self, exec_id):
+        self.execs[exec_id].exec_iter = -1
         
     def forward_scheduler_hook(self, module, input, output):
+        exec_id = self.ident_to_exec_id[threading.current_thread().ident]
         if self.debug:
-            print(self.format_print(b_str(f"Forward hook") + " fired on " + 
+            print(self.format_print(b_str(f"Forward hook {exec_id}") + " fired on " + 
                 y_str(f"{module.module_name}") + "\n", g_str), end="")
         force_switch = False
         if isinstance(module, ContextSwitchModule):
             force_switch = module.force_switch
-        exec_id = self.ident_to_exec_id[threading.current_thread().ident]
+        self.execs[exec_id].exec_iter += 1
+        exec_iter = self.execs[exec_id].exec_iter
+        if self.execs[exec_id].pair_exec_id is None:
+            pair_exec_iter = None
+        else:
+            pair_exec_iter = self.execs[self.execs[exec_id].pair_exec_id].exec_iter
+        self.execs[exec_id].ready_info = {"key": "CONTEXT_SWITCH_HOOK",
+                                          "exec_iter": exec_iter,
+                                          "pair_exec_id": self.execs[exec_id].pair_exec_id,
+                                          "pair_exec_iter": pair_exec_iter}
         self.context_switch(exec_id, force_switch=force_switch)
         if self.debug:
-            print(self.format_print("Forward hook completed", g_str))
+            print(self.format_print(b_str(f"Forward hook {exec_id}") + " completed", g_str))
 
     def backward_scheduler_hook(self, module, grad_input, grad_output):
+        exec_id = self.backward_exec_id
         if self.debug:
-            print(self.format_print(r_str(f"Backward hook") + " fired on " + 
+            print(self.format_print(r_str(f"Backward hook {exec_id}") + " fired on " + 
                     y_str(f"{module.module_name}") + "\n", g_str, 
                     self.backward_exec_id), end="")
         force_switch = False
         if isinstance(module, ContextSwitchModule):
             force_switch = module.force_switch
-        exec_id = self.backward_exec_id
+        self.execs[exec_id].exec_iter += 1
+        exec_iter = self.execs[exec_id].exec_iter
+        if self.execs[exec_id].pair_exec_id is None:
+            pair_exec_iter = None
+        else:
+            pair_exec_iter = self.execs[self.execs[exec_id].pair_exec_id].exec_iter
+        self.execs[exec_id].ready_info = {"key": "CONTEXT_SWITCH_HOOK",
+                                          "exec_iter": exec_iter,
+                                          "pair_exec_id": self.execs[exec_id].pair_exec_id,
+                                          "pair_exec_iter": pair_exec_iter}
         self.context_switch(exec_id, force_switch=force_switch)
         if self.debug:
-            print(self.format_print("Backward hook completed", g_str))
+            print(self.format_print(r_str(f"Backward hook {exec_id}") + " completed", g_str))
 
             
 @dataclass
