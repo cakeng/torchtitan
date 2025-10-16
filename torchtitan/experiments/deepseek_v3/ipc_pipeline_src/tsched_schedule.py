@@ -319,7 +319,7 @@ class ScheduleTsched(TschedScheduleSingle):
                 print(g_str(f"[T{ident} R{self._global_rank} FR{self._microbatch_idx}] ") + 
                       b_str(f"Waiting for forward recv pair ") + f"{recv_pair_id}, " +
                       b_str(f"recv pair key ") + f"{recv_pair_key}")
-                scheduler.pair_thread_barrier(exec_id, recv_pair_id, recv_pair_key, 2, pass_id=0)
+                scheduler.pair_thread_barrier(exec_id, recv_pair_id, recv_pair_key, 2, pass_id=1)
                 
             scheduler.enter_serialized_region(exec_id, region_id=1, 
                                               region_name="Forward")
@@ -362,7 +362,7 @@ class ScheduleTsched(TschedScheduleSingle):
                 print(g_str(f"[T{ident} R{self._global_rank} BR{self._microbatch_idx}] ") + 
                       b_str(f"Waiting for backward recv pair ") + f"{recv_pair_id}, " +
                       b_str(f"recv pair key ") + f"{recv_pair_key}")
-                scheduler.pair_thread_barrier(exec_id, recv_pair_id, recv_pair_key, 2, pass_id=1)
+                scheduler.pair_thread_barrier(exec_id, recv_pair_id, recv_pair_key, 2, pass_id=0)
             
             scheduler.enter_serialized_region(exec_id, region_id=2, 
                                               region_name="Backward")

@@ -686,7 +686,17 @@ class MoE(nn.Module):
                 tokens_per_expert_group, tokens_per_expert, group=self.ep_group
             )
             input_splits = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-
+        with torch.no_grad():
+                output_splits = tokens_per_expert_group.view(self.ep_size, -1).sum(
+                    dim=1
+                )
+        output_splits_cpu = output_splits.to(torch.device("cpu"), non_blocking=True)
+        input_splits_cpu = input_splits.to(torch.device("cpu"), non_blocking=True)
+        sorted_tokens = self.context_switch_module(sorted_tokens)
+        torch.cuda.synchronize(device=sorted_tokens.device)
+        output_splits_list = output_splits_cpu.tolist()
+        input_splits_list = input_splits_cpu.tolist()
+        
         # DP to EP token shuffle. This part needs gradient.
         if self.shuffle_method == "symm_mem":
             # Move input to the `token_send_buf` symm mem
@@ -706,14 +716,11 @@ class MoE(nn.Module):
             gathered_tokens = token_gather_buf[:received]
         else:  # "torch_all_to_all"
             # Prepare input ans output splits
-            with torch.no_grad():
-                output_splits = tokens_per_expert_group.view(self.ep_size, -1).sum(
-                    dim=1
-                )
+            
             gathered_tokens = all_to_all_single_autograd(
                 sorted_tokens,
-                output_splits.tolist(),
-                input_splits.tolist(),
+                output_splits_list,
+                input_splits_list,
                 self.ep_group,
             ) 
         
@@ -779,8 +786,10 @@ class MoE(nn.Module):
             torch.cumsum(tokens_per_local_expert, dim=0)
         ])
         
-        offsets = self.context_switch_module(offsets)
-        offsets = offsets.tolist()
+        offsets_cpu = offsets.to(torch.device("cpu"), non_blocking=True)
+        offsets_cpu = self.context_switch_module(offsets_cpu)
+        torch.cuda.synchronize(device=offsets.device)
+        offsets = offsets_cpu.tolist()
 
         # Prepare the output buffer.
         if self.shuffle_method == "symm_mem":
@@ -819,16 +828,14 @@ class MoE(nn.Module):
         else:  # "torch_all_to_all"
             returned_tokens = all_to_all_single_autograd(
                 processed_tokens,
-                input_splits.tolist(),
-                output_splits.tolist(),
+                input_splits_list,
+                output_splits_list,
                 self.ep_group,
             )
         
-
-        output_tokens = torch.empty_like(returned_tokens)
         returned_tokens = self.context_switch_module(returned_tokens)
+        output_tokens = torch.empty_like(returned_tokens)
         output_tokens[token_indices] = returned_tokens
-
         
         final_out = (
             output_tokens.view(*topk_ids.shape, -1)
