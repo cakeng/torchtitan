@@ -5,6 +5,8 @@ import threading
 import sys
 from datetime import datetime
 import random
+import zipfile
+from ipc_pipeline_src.sync_traces import merge_chrome_traces_with_barriers
 
 run_type = sys.argv[1] if len(sys.argv) > 1 else ""
 mbp_size = 4
@@ -121,5 +123,26 @@ for i, (process, stdout_thread, stderr_thread) in enumerate(processes):
     return_code = process.wait()
     print(f"\n=== MBP Rank {i} (PID {process.pid}) completed with return code {return_code} ===")
     print("=" * 60)
+
+log_name = f"run_tsched_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}"
+log_dir = f"./tensorboard_traces/{log_name}"
+os.makedirs(log_dir, exist_ok=True)
+    
+merge_chrome_traces_with_barriers(
+    trace_dir=log_dir,
+    output_file=f"{log_dir}/merged_trace.json",
+    barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
+    trace_names=[f"trace_0_0.json", f"trace_0_{ep_size*fsdp_size}.json"],
+    whole_trace=False,
+)
+
+# compress the merged trace
+zip_name = f"{log_dir}/{log_name}_merged_trace.zip" 
+with zipfile.ZipFile(zip_name, "w",
+                    compression=zipfile.ZIP_DEFLATED, 
+                    compresslevel=9) as zipf:
+    print(f"Compressing trace to {zip_name}")
+    zipf.write(f"{log_dir}/merged_trace.json", f"{log_name}_merged_trace.json")
+print(f"Compressed trace to {zip_name}")
 
 print(f"\nAll processes completed. Run ID: {run_id}")

@@ -532,6 +532,7 @@ class MoE(nn.Module):
         self._buffer_initialized = False
         
         self.context_switch_module = ContextSwitchModule(force_switch=True)
+        self.fwd_context_switch_module = ContextSwitchModule(do_fwd=True, do_bwd=False)
 
     @classmethod
     def _initialize_group_gemm_strategies(cls):
@@ -693,7 +694,8 @@ class MoE(nn.Module):
         output_splits_cpu = output_splits.to(torch.device("cpu"), non_blocking=True)
         input_splits_cpu = input_splits.to(torch.device("cpu"), non_blocking=True)
         sorted_tokens = self.context_switch_module(sorted_tokens)
-        torch.cuda.synchronize(device=sorted_tokens.device)
+        current_stream = torch.cuda.current_stream()
+        current_stream.synchronize()
         output_splits_list = output_splits_cpu.tolist()
         input_splits_list = input_splits_cpu.tolist()
         
@@ -775,21 +777,24 @@ class MoE(nn.Module):
         # SINGLE SYNC POINT: Get the token counts for each expert.
         # We use bincount and then transfer the result to the CPU. This is the
         # one synchronization we accept to avoid the expensive per-expert syncs.
+        sorted_expert_idxs_cpu = sorted_expert_idxs.to(torch.device("cpu"), non_blocking=True)
+        sorted_expert_idxs = self.context_switch_module(sorted_expert_idxs)
         tokens_per_local_expert = torch.bincount(
-            sorted_expert_idxs, minlength=len(self.experts)
+            sorted_expert_idxs_cpu, minlength=len(self.experts)
         )
-
+        
         # Calculate the offsets for slicing into the permuted tensor.
         # e.g., [10, 20, 5] -> [0, 10, 30, 35]
         offsets = torch.cat([
             torch.tensor([0], device=tokens_per_local_expert.device, dtype=tokens_per_local_expert.dtype),
             torch.cumsum(tokens_per_local_expert, dim=0)
-        ])
+        ]).tolist()
         
-        offsets_cpu = offsets.to(torch.device("cpu"), non_blocking=True)
-        offsets_cpu = self.context_switch_module(offsets_cpu)
-        torch.cuda.synchronize(device=offsets.device)
-        offsets = offsets_cpu.tolist()
+        # offsets_cpu = offsets.to(torch.device("cpu"), non_blocking=True)
+        # offsets_cpu = self.context_switch_module(offsets_cpu)
+        # current_stream = torch.cuda.current_stream()
+        # current_stream.synchronize()
+        # offsets = offsets_cpu.tolist()
 
         # Prepare the output buffer.
         if self.shuffle_method == "symm_mem":

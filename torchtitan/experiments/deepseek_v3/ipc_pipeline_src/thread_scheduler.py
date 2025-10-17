@@ -36,6 +36,24 @@ from accelerate import init_empty_weights
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, logging
 logging.set_verbosity_error() # Suppress verbose warnings
 
+def green_ctx_stream_create(
+    device: torch.device, sm_margin: int
+) -> Tuple[torch.Stream, torch.Stream]:
+    """
+    This function creates two green context, with two associated streams.
+    """
+    # get device sm count
+    num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+    num_compute_sm = num_sm - sm_margin
+
+    assert sm_margin > 0 and num_compute_sm > 0
+    assert num_compute_sm % 8 == 0  # requested by cuda driver
+    compute_stream, comm_stream = split_device_green_ctx_by_sm_count(
+        device, [num_compute_sm]
+    )[0]
+
+    return compute_stream, comm_stream
+
 def g_str(s): # green
     return "\033[32m" + s + "\033[0m"
 def r_str(s): # red
@@ -69,11 +87,11 @@ class _PassThrough(Function):
 
 class ContextSwitchModule(nn.Module):
     def __init__(self, force_switch: bool = False, 
-                 before_comms: bool = False, after_comms: bool = False):
+                 do_fwd: bool = True, do_bwd: bool = True):
         super().__init__()
         self.force_switch = force_switch
-        self.before_comms = before_comms
-        self.after_comms = after_comms
+        self.do_fwd = do_fwd
+        self.do_bwd = do_bwd
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Ensures a grad_fn exists even if this would be a pure identity
@@ -699,6 +717,8 @@ class ContextScheduler:
         force_switch = False
         if isinstance(module, ContextSwitchModule):
             force_switch = module.force_switch
+            if not module.do_fwd:
+                return
         self.execs[exec_id].exec_iter += 1
         exec_iter = self.execs[exec_id].exec_iter
         if self.execs[exec_id].pair_exec_id is None:
@@ -722,6 +742,8 @@ class ContextScheduler:
         force_switch = False
         if isinstance(module, ContextSwitchModule):
             force_switch = module.force_switch
+            if not module.do_bwd:
+                return
         self.execs[exec_id].exec_iter += 1
         exec_iter = self.execs[exec_id].exec_iter
         if self.execs[exec_id].pair_exec_id is None:

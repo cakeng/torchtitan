@@ -458,24 +458,6 @@ if __name__ == "__main__":
             trace_path = f"{log_dir}/trace_{mbp_rank}_{dist.get_rank()}.json"
             print(f"Rank {dist.get_rank()} Exporting trace to {trace_path}")
             prof.export_chrome_trace(trace_path)
-
-            torch.cuda.empty_cache()
-            if dist.get_rank() == 0:
-                merge_chrome_traces_with_barriers(
-                    trace_dir=log_dir,
-                    output_file=f"{log_dir}/merged_trace.json",
-                    barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
-                    trace_names=[f"trace_0_0.json", f"trace_0_{ep_size*fsdp_size}.json"],
-                    whole_trace=False,
-                )
-                # compress the merged trace
-                zip_name = f"{log_dir}/{run_id}_1f1b_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}_merged_trace.zip" 
-                with zipfile.ZipFile(zip_name, "w",
-                                    compression=zipfile.ZIP_DEFLATED, 
-                                    compresslevel=9) as zipf:
-                    print(f"Rank {dist.get_rank()} Compressing trace to {zip_name}")
-                    zipf.write(f"{log_dir}/merged_trace.json", f"{run_id}_merged_trace.json")
-                print(f"Rank {dist.get_rank()} Compressed trace to {zip_name}")
     else:
         time_start = datetime.now()
         run_full_model(mesh, mbp_size, num_hidden_layers, batch_size, seq_len, num_steps)

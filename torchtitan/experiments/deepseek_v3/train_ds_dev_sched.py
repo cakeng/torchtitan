@@ -19,7 +19,6 @@ from regex import R
 import torch
 import torch.distributed as dist
 import sys
-import zipfile
 
 from torch.nn import init
 from accelerate import init_empty_weights
@@ -34,7 +33,6 @@ from datetime import datetime
 
 from ipc_pipeline_src.tsched_schedule import ScheduleTsched
 from ipc_pipeline_src.tsched_stage import TschedStage
-from ipc_pipeline_src.sync_traces import merge_chrome_traces_with_barriers
 from ipc_pipeline_src.thread_scheduler import ContextScheduler, ExecutionEngine, ModelProfiler, materialize_meta_model
 from ipc_pipeline_src.tsched_device_mesh import init_independent_device_mesh, compare_device_mesh_structures
 
@@ -176,16 +174,9 @@ def run_full_model(
     profiler = None
     context_scheduler = ContextScheduler(model, microbatches, 
                                          debug=debug, is_dist=True, profiler=profiler)
-
-    dist.barrier()
-    main_engine = TorchTitanExecutionEngine(
-                        model, x[0], label[0], loss_fn,
-                        microbatches, 0, pp_rank, pp_size, device, pp_mesh, 
-                        context_scheduler, is_dist=True, 
-                        debug=debug, main_thread= True)
-    engines = [main_engine]
-
-    for t in range(1, microbatches):
+    
+    main_t = 4
+    for t in range(0, main_t):
         mesh = meshes[t]
         pp_mesh = mesh["pp"]
         ep_mesh = mesh["ep"]
@@ -199,8 +190,34 @@ def run_full_model(
                         microbatches, t, pp_rank, pp_size, device, pp_mesh, 
                         context_scheduler, is_dist=True, 
                         debug=debug)
-        engines.append(engine_thread)
+        print(y_str(f"[Rank {rank}]") + " Starting engine thread " + f"{t}")
+        engine_thread.start_exec()
+        
+    dist.barrier()
+    main_engine = TorchTitanExecutionEngine(
+                    model, x[main_t], label[main_t], loss_fn,
+                    microbatches, main_t, pp_rank, pp_size, device, pp_mesh, 
+                    context_scheduler, is_dist=True, 
+                    debug=debug, main_thread= True)
 
+    for t in range(main_t + 1, microbatches):
+        mesh = meshes[t]
+        pp_mesh = mesh["pp"]
+        ep_mesh = mesh["ep"]
+        pp_rank = pp_mesh.get_local_rank()
+        ep_rank = ep_mesh.get_local_rank()
+
+        dist.barrier()
+        print(f"Rank {rank} Creating engine thread {t}...\n", end="")
+        engine_thread = TorchTitanExecutionEngine(
+                        model, x[t], label[t], loss_fn,
+                        microbatches, t, pp_rank, pp_size, device, pp_mesh, 
+                        context_scheduler, is_dist=True, 
+                        debug=debug)
+        print(y_str(f"[Rank {rank}]") + " Starting engine thread " + f"{t}")
+        engine_thread.start_exec()
+        
+    dist.barrier()
         # Apply data parallelism
         # fsdp_mesh = mesh["fsdp"]
         # hsdp_mesh = mesh["ep", "fsdp"]
@@ -229,15 +246,11 @@ def run_full_model(
         # currently supported for forward only. See `generate.py`.
         # model.setup_symm_mem(torch.bfloat16, device)
 
-    # dist.barrier()
-    # context_scheduler.check_gloo_comms()
-    # dist.barrier()
-    # assert 0
+
 
     context_scheduler.attach_hooks()
-    for t in range(1, microbatches):
-        print(y_str(f"[Rank {rank}]") + " Starting engine thread " + f"{t}")
-        engines[t].start_exec()
+
+        
 
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
@@ -327,23 +340,6 @@ if __name__ == "__main__":
             print(f"Rank {dist.get_rank()} Exporting trace to {trace_path}")
             prof.export_chrome_trace(trace_path)
 
-            torch.cuda.empty_cache()
-            if dist.get_rank() == 0:
-                merge_chrome_traces_with_barriers(
-                    trace_dir=log_dir,
-                    output_file=f"{log_dir}/merged_trace.json",
-                    barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
-                    trace_names=[f"trace_0_0.json", f"trace_0_{ep_size*fsdp_size}.json"],
-                    whole_trace=False,
-                )
-                # compress the merged trace
-                zip_name = f"{log_dir}/{run_id}_tsched_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}_merged_trace.zip" 
-                with zipfile.ZipFile(zip_name, "w",
-                                    compression=zipfile.ZIP_DEFLATED, 
-                                    compresslevel=9) as zipf:
-                    print(f"Rank {dist.get_rank()} Compressing trace to {zip_name}")
-                    zipf.write(f"{log_dir}/merged_trace.json", f"{run_id}_merged_trace.json")
-                print(f"Rank {dist.get_rank()} Compressed trace to {zip_name}")
     else:
         time_start = datetime.now()
         run_full_model(meshes, mbp_size, num_hidden_layers, batch_size, seq_len, num_steps)
