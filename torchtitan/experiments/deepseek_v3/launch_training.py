@@ -39,6 +39,20 @@ os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
 os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "3"
 os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
 
+# # Merlin network env
+# os.environ["NCCL_SOCKET_IFNAME"] = "eth0"
+# os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+# # NCCL Env
+# os.environ["NCCL_CGA_CLUSTER_SIZE"] = "0"
+# os.environ["NCCL_IB_PCI_RELAXED_ORDERING"] = "1"
+# os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
+# # export NCCL_IB_QPS_PER_CONNECTION=2
+# # export NCCL_IB_SPLIT_DATA_ON_QPS=0
+# os.environ["NCCL_NCHANNELS_PER_NET_PEER"] = "8"
+# # export NCCL_MIN_NCHANNELS=16
+# # export NCCL_PXN_DISABLE=1
+# os.environ["NCCL_P2P_NET_CHUNKSIZE"] = "2097152"
+
 def stream_output(process, rank, stream_type):
     """Stream output from a process in real-time"""
     for line in iter(process.stdout.readline if stream_type == "stdout" else process.stderr.readline, ''):
@@ -124,7 +138,7 @@ for i, (process, stdout_thread, stderr_thread) in enumerate(processes):
     print(f"\n=== MBP Rank {i} (PID {process.pid}) completed with return code {return_code} ===")
     print("=" * 60)
 
-log_name = f"run_tsched_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}"
+log_name = f"run_{run_type}_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}"
 log_dir = f"./tensorboard_traces/{log_name}"
 os.makedirs(log_dir, exist_ok=True)
     
@@ -132,7 +146,7 @@ merge_chrome_traces_with_barriers(
     trace_dir=log_dir,
     output_file=f"{log_dir}/merged_trace.json",
     barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
-    trace_names=[f"trace_0_0.json", f"trace_0_{ep_size*fsdp_size}.json"],
+    trace_names=[f"trace_0_2.json", f"trace_0_3.json"],
     whole_trace=False,
 )
 

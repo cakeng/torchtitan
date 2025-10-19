@@ -26,7 +26,7 @@ import time
 import traceback
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, Callable
+from typing import Dict, Callable, Tuple
 import signal
 from torch.autograd import Function
 import torch.distributed as dist
@@ -36,23 +36,27 @@ from accelerate import init_empty_weights
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, logging
 logging.set_verbosity_error() # Suppress verbose warnings
 
+from .green_ctx import split_device_green_ctx_by_sm_count
+
 def green_ctx_stream_create(
-    device: torch.device, sm_margin: int
+    device: torch.device, fwd_sm_ratio: float = 0.2
 ) -> Tuple[torch.Stream, torch.Stream]:
     """
     This function creates two green context, with two associated streams.
     """
     # get device sm count
     num_sm = torch.cuda.get_device_properties(device).multi_processor_count
-    num_compute_sm = num_sm - sm_margin
+    fwd_sm_count = int(num_sm * fwd_sm_ratio)
+    fwd_sm_count = (fwd_sm_count + 7) // 8 * 8 + 4
+    bwd_sm_count = num_sm - fwd_sm_count
 
-    assert sm_margin > 0 and num_compute_sm > 0
-    assert num_compute_sm % 8 == 0  # requested by cuda driver
-    compute_stream, comm_stream = split_device_green_ctx_by_sm_count(
-        device, [num_compute_sm]
+    assert bwd_sm_count > 0
+    assert bwd_sm_count % 8 == 0  # requested by cuda driver
+    fwd_stream, bwd_stream = split_device_green_ctx_by_sm_count(
+        device, [fwd_sm_count]
     )[0]
 
-    return compute_stream, comm_stream
+    return fwd_stream, bwd_stream
 
 def g_str(s): # green
     return "\033[32m" + s + "\033[0m"
@@ -247,8 +251,10 @@ def materialize_meta_model(
 class ExecContext:
     exec: threading.Thread
     signal: threading.Event
-    stream: torch.cuda.Stream
     event: torch.cuda.Event
+    exec_stream: torch.Stream
+    fwd_stream: torch.Stream
+    bwd_stream: torch.Stream
     event_done: bool
     serialized_regions: list[threading.Event]
     ready_info: dict[str, any]
@@ -259,9 +265,10 @@ class ExecContext:
     
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
-    def __init__(self, model, num_execs, is_dist = False, num_serialized_regions = 6,
+    def __init__(self, device, model, num_execs, is_dist = False, num_serialized_regions = 6,
                  context_switch_module_list = ["moe_forward1", "moe_forward2"], 
                  profiler = None, debug = False):
+        self.device = device
         self.model = model
         self.num_execs = num_execs
         self.active_exec_id = None
@@ -270,6 +277,7 @@ class ContextScheduler:
         self.waiting_exec_ids = SortedList()
         self.hooks = {} 
         self.execs = {}
+        self.first_non_main_exec_id = None
         self.ident_to_exec_id = {}
         self.backward_exec_id = None
         self.context_switch_module_list = context_switch_module_list
@@ -309,40 +317,52 @@ class ContextScheduler:
             print(self.format_print("Current execs: " + 
                     y_str(f"{ready_infos}"), r_str))
         if len(self.waiting_exec_ids) > 0:
-            self.next_exec_id = self.active_exec_id
-            for exec_id in self.waiting_exec_ids:
-                exec_context = self.execs[exec_id]
-                if exec_context.ready_info["key"] == "CONTEXT_SWITCH_HOOK":
-                    if exec_context.event_done or exec_context.event.query():
-                        exec_context.event_done = True
-                        if exec_context.pair_exec_id is None:
+            self.next_exec_id = None
+            run_schedule_loop = True
+            while run_schedule_loop:
+                for exec_id in self.waiting_exec_ids:
+                    exec_context = self.execs[exec_id]
+                    if exec_context.ready_info["key"] == "CONTEXT_SWITCH_HOOK":
+                        if True:
+                            exec_context.event_done = True
+                            if exec_context.pair_exec_id is None:
+                                self.next_exec_id = exec_id
+                                run_schedule_loop = False
+                                break
+                            elif self.execs[exec_context.pair_exec_id].exec_iter  ==  -1 or \
+                                self.execs[exec_context.pair_exec_id].exec_iter >= exec_context.ready_info["pair_exec_iter"] + 1:
+                                self.next_exec_id = exec_id
+                                run_schedule_loop = False
+                                break
+                    elif exec_context.ready_info["key"] == "WAIT_COMMS":
+                        if self._check_comm(exec_id):
                             self.next_exec_id = exec_id
+                            run_schedule_loop = False
                             break
-                        elif self.execs[exec_context.pair_exec_id].exec_iter  ==  -1 or \
-                            self.execs[exec_context.pair_exec_id].exec_iter >= exec_context.ready_info["pair_exec_iter"] + 1:
+                    elif exec_context.ready_info["key"] == "PAIR_THREAD_BARRIER":
+                        if exec_context.ready_info["num_threads"] >= self.thread_barriers[exec_context.ready_info["pair_key"]][0] and \
+                            exec_context.ready_info["pass_id"] >= self.thread_barriers[exec_context.ready_info["pair_key"]][1]:
                             self.next_exec_id = exec_id
+                            run_schedule_loop = False
                             break
-                elif exec_context.ready_info["key"] == "WAIT_COMMS":
-                    if self._check_comm(exec_id):
+                    elif exec_context.ready_info["key"] == "SERIALIZED_REGION":
+                        if exec_context.serialized_regions[exec_context.ready_info["region_id"]].is_set():
+                            self.next_exec_id = exec_id
+                            run_schedule_loop = False
+                            break
+                    elif exec_context.ready_info["key"] == "ATTACHED_TO_CONTEXT":
                         self.next_exec_id = exec_id
+                        run_schedule_loop = False
                         break
-                elif exec_context.ready_info["key"] == "PAIR_THREAD_BARRIER":
-                    if exec_context.ready_info["num_threads"] >= self.thread_barriers[exec_context.ready_info["pair_key"]][0] and \
-                        exec_context.ready_info["pass_id"] >= self.thread_barriers[exec_context.ready_info["pair_key"]][1]:
-                        self.next_exec_id = exec_id
-                        break
-                elif exec_context.ready_info["key"] == "SERIALIZED_REGION":
-                    if exec_context.serialized_regions[exec_context.ready_info["region_id"]].is_set():
-                        self.next_exec_id = exec_id
-                        break
-                elif exec_context.ready_info["key"] == "ATTACHED_TO_CONTEXT":
-                    self.next_exec_id = exec_id
-                    break
-                else:
-                    raise ValueError(f"Unexpected ready info: {exec_context.ready_info}")
-            
-            if self.next_exec_id == self.active_exec_id and force_switch:
-                self.next_exec_id = self.waiting_exec_ids[0]   
+                    else:
+                        raise ValueError(f"Unexpected ready info: {exec_context.ready_info}")
+                
+                if self.next_exec_id is None and not force_switch:
+                    if self.active_exec_id is None:
+                        self.next_exec_id = self.waiting_exec_ids[0]
+                    else:
+                        self.next_exec_id = self.active_exec_id
+                    run_schedule_loop = False
             
             if self.debug and not skip_debug:
                 print(self.format_print("Current waiting execs: " + 
@@ -361,6 +381,23 @@ class ContextScheduler:
                         y_str(f"{self.active_exec_id}"), r_str))
                 self.next_exec_id = self.active_exec_id
 
+    def _set_and_get_exec_stream(self, exec_id):
+        output_stream = None
+        exec_obj = self.execs[exec_id]
+        output_stream = exec_obj.exec_stream
+        # if self.backward_exec_id == exec_id:
+        #     if exec_obj.pair_exec_id is not None:
+        #         pair_exec_id = exec_obj.pair_exec_id
+        #         if self.execs[pair_exec_id].exec_iter != -1:
+        #             output_stream = exec_obj.bwd_stream
+        # else:
+        #     if self.execs[exec_id].pair_exec_id is not None:
+        #         pair_exec_id = self.execs[exec_id].pair_exec_id
+        #         if self.execs[pair_exec_id].exec_iter != -1:
+        #             output_stream = exec_obj.fwd_stream
+        torch.cuda.set_stream(output_stream)
+        return output_stream
+
     def _release_context(self, exec_id, skip_debug=False):
         # Release the context lock and signal the next exec to resume.
         assert self.active_exec_id == exec_id, \
@@ -373,10 +410,6 @@ class ContextScheduler:
                   "Next scheduled exec " + 
                   y_str(f"{self.next_exec_id}") + "\n", b_str), end="")
         self.execs[self.active_exec_id].signal.clear()
-        if self.execs[self.active_exec_id].ready_info["key"] == "CONTEXT_SWITCH_HOOK":
-            self.execs[self.active_exec_id].event_done = False
-            self.execs[self.active_exec_id].event.record(
-                self.execs[self.active_exec_id].stream)
         if self.next_exec_id is not None:
             self.execs[self.next_exec_id].signal.set()
         self.active_exec_id = None
@@ -398,13 +431,14 @@ class ContextScheduler:
         if exec_id in self.waiting_exec_ids:
             self.waiting_exec_ids.remove(exec_id)
         self.active_exec_id = exec_id
-        torch.cuda.set_stream(self.execs[self.active_exec_id].stream)
+        self._set_and_get_exec_stream(exec_id)
         if self.debug and not skip_debug:
-            print(self.format_print(f"Resuming exec {exec_id} context on stream " +
-                y_str(f"{self.execs[self.active_exec_id].stream}"), b_str))
+            print(self.format_print(f"Resuming exec {exec_id} context"), b_str)
 
     def add_exec(self, exec, ident = None):
         # Add an exec to the scheduler.\
+        assert exec.device == self.device, \
+            f"Expected {self.device} device for exec, got {exec.device}"
         if ident is None:
             ident = exec.ident
         for exec_id in self.execs:
@@ -413,15 +447,17 @@ class ContextScheduler:
         new_exec_id = len(self.execs)
         assert new_exec_id < self.num_execs, \
             f"Expected {self.num_execs} execs, got {new_exec_id}"
+        if self.first_non_main_exec_id is None and not exec.main_thread:
+            self.first_non_main_exec_id = new_exec_id
         new_exec_signal = threading.Event()
         new_exec_signal.clear()
         dev = exec.device
-        # new_exec_stream = torch.cuda.default_stream(dev)
         new_exec_stream = torch.cuda.Stream(dev)
         torch.cuda.set_stream(new_exec_stream)
         new_exec_event = torch.cuda.Event()
         new_exec_event_done = False
         new_exec_serialized_regions = []
+        new_exec_fwd_stream, new_exec_bwd_stream = green_ctx_stream_create(dev)
         new_exec_ready_info = None
         new_exec_comm_works_wait = []
         new_exec_comm_works_dispatch = []
@@ -433,8 +469,10 @@ class ContextScheduler:
         self.ident_to_exec_id[ident] = new_exec_id
         self.execs[new_exec_id] = ExecContext(exec, 
                                               new_exec_signal, 
-                                              new_exec_stream, 
                                               new_exec_event,
+                                              new_exec_stream,
+                                              new_exec_fwd_stream,
+                                              new_exec_bwd_stream,
                                               new_exec_event_done,
                                               new_exec_serialized_regions,
                                               new_exec_ready_info,
@@ -614,6 +652,8 @@ class ContextScheduler:
         self.thread_barriers = {}
         self.completion_signal_c2m.clear()
         self.completion_signal_m2c.clear()
+        for exec_id in self.execs:
+            self.execs[exec_id].exec.release_event.set()
         return
     
     def start(self, reset=True):
@@ -711,12 +751,12 @@ class ContextScheduler:
         
     def forward_scheduler_hook(self, module, input, output):
         exec_id = self.ident_to_exec_id[threading.current_thread().ident]
-        if self.debug:
-            print(self.format_print(b_str(f"Forward hook {exec_id}") + " fired on " + 
-                y_str(f"{module.module_name}") + "\n", g_str), end="")
         force_switch = False
         if isinstance(module, ContextSwitchModule):
+            pair_exec_id = self.execs[exec_id].pair_exec_id
             force_switch = module.force_switch
+            if pair_exec_id is not None and self.execs[pair_exec_id].exec_iter != -1:
+                force_switch = True  
             if not module.do_fwd:
                 return
         self.execs[exec_id].exec_iter += 1
@@ -725,10 +765,17 @@ class ContextScheduler:
             pair_exec_iter = None
         else:
             pair_exec_iter = self.execs[self.execs[exec_id].pair_exec_id].exec_iter
+        self.execs[exec_id].event_done = False
+        self.execs[exec_id].event.record()
         self.execs[exec_id].ready_info = {"key": "CONTEXT_SWITCH_HOOK",
                                           "exec_iter": exec_iter,
                                           "pair_exec_id": self.execs[exec_id].pair_exec_id,
-                                          "pair_exec_iter": pair_exec_iter}
+                                          "pair_exec_iter": pair_exec_iter,
+                                          "force_switch": force_switch}
+        if self.debug:
+            print(self.format_print(b_str(f"Forward hook {exec_id}") + " fired on " + 
+                y_str(f"{module.module_name}") + " Ready info: " + 
+                y_str(f"{self.execs[exec_id].ready_info}") + "\n", g_str), end="")
         self.context_switch(exec_id, force_switch=force_switch)
         if self.debug:
             print(self.format_print(b_str(f"Forward hook {exec_id}") + " completed", g_str))
@@ -741,7 +788,10 @@ class ContextScheduler:
                     self.backward_exec_id), end="")
         force_switch = False
         if isinstance(module, ContextSwitchModule):
+            pair_exec_id = self.execs[exec_id].pair_exec_id
             force_switch = module.force_switch
+            if pair_exec_id is not None and self.execs[pair_exec_id].exec_iter != -1:
+                force_switch = True  
             if not module.do_bwd:
                 return
         self.execs[exec_id].exec_iter += 1
@@ -750,6 +800,8 @@ class ContextScheduler:
             pair_exec_iter = None
         else:
             pair_exec_iter = self.execs[self.execs[exec_id].pair_exec_id].exec_iter
+        self.execs[exec_id].event_done = False
+        self.execs[exec_id].event.record()
         self.execs[exec_id].ready_info = {"key": "CONTEXT_SWITCH_HOOK",
                                           "exec_iter": exec_iter,
                                           "pair_exec_id": self.execs[exec_id].pair_exec_id,
@@ -1008,6 +1060,8 @@ class ExecutionEngine(threading.Thread):
         self.loss = None
         self.exec_id = None
         
+        self.release_event = threading.Event()
+        self.release_event.clear()
         self.backward_tid = -1
         self.debug = debug
         self.device = device
@@ -1035,10 +1089,16 @@ class ExecutionEngine(threading.Thread):
         prefix = color_fnc(prefix) if color_fnc is not None else prefix
         return f"[{prefix}] {message}"
 
+    def wait_release(self):
+        self.release_event.wait()
+        self.release_event.clear()
+        return
+
     def run(self):
         self.exec_id = self.scheduler.add_exec(self)
         print(self.format_print(f"Running exec {self.exec_id}..."))
         while True:
+            self.wait_release()
             self.step()
             self.sync_step_completion()
             
@@ -1051,7 +1111,7 @@ class ExecutionEngine(threading.Thread):
             if self.debug:
                 print(self.format_print("Single exec! Waiting for next iteration..."))
             return
-        if not self.main_thread:
+        if self.exec_id == self.scheduler.first_non_main_exec_id:
             self.scheduler.completion_signal_c2m.set() # Signal that the main thread can proceed to acquire the context lock
             if self.debug:
                 print(self.format_print("All execs completed! Signaling main thread to acquire context lock."))
@@ -1153,7 +1213,7 @@ def run_training_test(
     profiler = ModelProfiler(base_model, microbatches[0], label[0], loss_fn)
 
     # 3. Hook and Lock Setup
-    scheduler = ContextScheduler(num_threads, debug)
+    scheduler = ContextScheduler(base_model.device, num_threads, debug)
     for t in range(num_threads):
         model = model_factory_fn(materialized=False)
         materialize_meta_model(model, base_model)

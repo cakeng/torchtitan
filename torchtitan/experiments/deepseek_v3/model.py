@@ -531,8 +531,9 @@ class MoE(nn.Module):
         self.group_gemm_instance = MoE.group_gemm_strategies[MoE.group_mm]
         self._buffer_initialized = False
         
-        self.context_switch_module = ContextSwitchModule(force_switch=True)
+        self.context_switch_module = ContextSwitchModule()
         self.fwd_context_switch_module = ContextSwitchModule(do_fwd=True, do_bwd=False)
+        self.bwd_context_switch_module = ContextSwitchModule(do_fwd=False, do_bwd=True)
 
     @classmethod
     def _initialize_group_gemm_strategies(cls):
@@ -1029,6 +1030,10 @@ class Attention(nn.Module):
         )
         self._init_rope()
 
+        self.context_switch_module = ContextSwitchModule()
+        self.fwd_context_switch_module = ContextSwitchModule(do_fwd=True, do_bwd=False)
+        self.bwd_context_switch_module = ContextSwitchModule(do_fwd=False, do_bwd=True)
+
         self.softmax_scale = self.q_head_dim ** (-0.5)
         if self.config.rope_scaling is not None:
             mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
@@ -1157,6 +1162,8 @@ class Attention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
+        
+        # query_states = self.bwd_context_switch_module(query_states)
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query=query_states,

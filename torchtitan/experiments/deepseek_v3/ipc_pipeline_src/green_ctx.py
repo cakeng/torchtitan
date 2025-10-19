@@ -16,7 +16,7 @@ limitations under the License.
 
 from typing import List, Tuple
 import torch
-
+import functools
 try:
     import cuda.bindings.driver as driver
     import cuda.bindings.runtime as runtime
@@ -28,8 +28,29 @@ except ImportError as e:
     ) from e
 
 from .cuda_utils import checkCudaErrors
-from .utils import get_compute_capability, round_up
 
+def ceil_div(x: int, y: int) -> int:
+    """
+    Perform ceiling division of two integers.
+
+    Args:
+        x: the dividend.
+        y: the divisor.
+
+    Returns:
+        The result of the ceiling division.
+    """
+    return (x + y - 1) // y
+
+def round_up(x: int, y: int) -> int:
+    """Round up x to the nearest multiple of y"""
+    return ceil_div(x, y) * y
+
+@functools.cache
+def get_compute_capability(device: torch.device) -> Tuple[int, int]:
+    if device.type != "cuda":
+        raise ValueError("device must be a cuda device")
+    return torch.cuda.get_device_capability(device.index)
 
 def get_sm_count_constraint(major: int, minor: int) -> Tuple[int, int]:
     if major == 6:

@@ -126,8 +126,8 @@ def run_full_model(
     device_count = torch.cuda.device_count()
     device = torch.device("cuda", rank % device_count)
     microbatches = mbp_size
-    # debug = True
-    debug = False
+    debug = True
+    # debug = False
 
     mesh = meshes[0]
     pp_mesh = mesh["pp"]
@@ -172,10 +172,10 @@ def run_full_model(
     # Create loss function
     loss_fn = torch.nn.functional.cross_entropy
     profiler = None
-    context_scheduler = ContextScheduler(model, microbatches, 
+    context_scheduler = ContextScheduler(device, model, microbatches, 
                                          debug=debug, is_dist=True, profiler=profiler)
     
-    main_t = 4
+    main_t = 2
     for t in range(0, main_t):
         mesh = meshes[t]
         pp_mesh = mesh["pp"]
@@ -246,11 +246,7 @@ def run_full_model(
         # currently supported for forward only. See `generate.py`.
         # model.setup_symm_mem(torch.bfloat16, device)
 
-
-
     context_scheduler.attach_hooks()
-
-        
 
     with torch.profiler.record_function("BARRIER:EXEC_START"):
         dist.barrier()
@@ -309,7 +305,7 @@ if __name__ == "__main__":
 
     # Setup profiler
     run_id = os.getenv("RUN_ID", "0")
-    log_dir = f"./tensorboard_traces/run_tsched_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}"
+    log_dir = f"./tensorboard_traces/run_sched_{run_id}_mbp_{mbp_size}_pp_{pp_size}_ep_{ep_size}_fsdp_{fsdp_size}_layers_{num_hidden_layers}_bs_{batch_size}_seqlen_{seq_len}_steps_{num_steps}"
     os.makedirs(log_dir, exist_ok=True)
 
     # Profile the execution
