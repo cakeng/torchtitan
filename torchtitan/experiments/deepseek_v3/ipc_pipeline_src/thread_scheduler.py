@@ -16,6 +16,7 @@
 #
 # All code formatted within 80 columns as requested [2025-05-21]
 
+from re import S
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,7 +40,7 @@ logging.set_verbosity_error() # Suppress verbose warnings
 from .green_ctx import split_device_green_ctx_by_sm_count
 
 def green_ctx_stream_create(
-    device: torch.device, fwd_sm_ratio: float = 0.2
+    device: torch.device, fwd_sm_ratio: float = 0.25
 ) -> Tuple[torch.Stream, torch.Stream]:
     """
     This function creates two green context, with two associated streams.
@@ -94,6 +95,17 @@ class ContextSwitchModule(nn.Module):
                  do_fwd: bool = True, do_bwd: bool = True):
         super().__init__()
         self.force_switch = force_switch
+        self.do_fwd = do_fwd
+        self.do_bwd = do_bwd
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensures a grad_fn exists even if this would be a pure identity
+        # return x
+        return _PassThrough.apply(x)
+
+class SyncEventModule(nn.Module):
+    def __init__(self, do_fwd: bool = True, do_bwd: bool = True):
+        super().__init__()
         self.do_fwd = do_fwd
         self.do_bwd = do_bwd
 
@@ -266,7 +278,6 @@ class ExecContext:
 class ContextScheduler:
     """ Manages and schedules ExecutionEngines in a round-robin fashion. """
     def __init__(self, device, model, num_execs, is_dist = False, num_serialized_regions = 6,
-                 context_switch_module_list = ["moe_forward1", "moe_forward2"], 
                  profiler = None, debug = False):
         self.device = device
         self.model = model
@@ -280,7 +291,6 @@ class ContextScheduler:
         self.first_non_main_exec_id = None
         self.ident_to_exec_id = {}
         self.backward_exec_id = None
-        self.context_switch_module_list = context_switch_module_list
         self.profiler = profiler
         self.debug = debug
         self.skip_debug_num = 2
@@ -323,17 +333,30 @@ class ContextScheduler:
                 for exec_id in self.waiting_exec_ids:
                     exec_context = self.execs[exec_id]
                     if exec_context.ready_info["key"] == "CONTEXT_SWITCH_HOOK":
-                        if True:
-                            exec_context.event_done = True
-                            if exec_context.pair_exec_id is None:
+                        pair_exec_id = exec_context.pair_exec_id
+                        pair_exec = self.execs[pair_exec_id] if pair_exec_id is not None else None
+                        if pair_exec is None or pair_exec.exec_iter == -1:
+                            self.next_exec_id = exec_id
+                            run_schedule_loop = False
+                            break
+                        elif pair_exec.exec_iter >= exec_context.ready_info["pair_exec_iter"] + 1:
+                            if pair_exec.event_done or pair_exec.event.query():
+                                pair_exec.event_done = True
                                 self.next_exec_id = exec_id
                                 run_schedule_loop = False
                                 break
-                            elif self.execs[exec_context.pair_exec_id].exec_iter  ==  -1 or \
-                                self.execs[exec_context.pair_exec_id].exec_iter >= exec_context.ready_info["pair_exec_iter"] + 1:
-                                self.next_exec_id = exec_id
-                                run_schedule_loop = False
-                                break
+
+                        # if exec_context.event_done or exec_context.event.query():
+                        #     exec_context.event_done = True
+                        #     if exec_context.pair_exec_id is None:
+                        #         self.next_exec_id = exec_id
+                        #         run_schedule_loop = False
+                        #         break
+                        #     elif self.execs[exec_context.pair_exec_id].exec_iter  ==  -1 or \
+                        #         self.execs[exec_context.pair_exec_id].exec_iter >= exec_context.ready_info["pair_exec_iter"] + 1:
+                        #         self.next_exec_id = exec_id
+                        #         run_schedule_loop = False
+                        #         break
                     elif exec_context.ready_info["key"] == "WAIT_COMMS":
                         if self._check_comm(exec_id):
                             self.next_exec_id = exec_id
@@ -455,7 +478,8 @@ class ContextScheduler:
         new_exec_stream = torch.cuda.Stream(dev)
         torch.cuda.set_stream(new_exec_stream)
         new_exec_event = torch.cuda.Event()
-        new_exec_event_done = False
+        new_exec_event.record()
+        new_exec_event_done = True
         new_exec_serialized_regions = []
         new_exec_fwd_stream, new_exec_bwd_stream = green_ctx_stream_create(dev)
         new_exec_ready_info = None
@@ -624,6 +648,11 @@ class ContextScheduler:
             
         return False
 
+    def record_event(self, exec_id):
+        self.execs[exec_id].event_done = False
+        self.execs[exec_id].event.record()
+        return
+
     def sync_comm_works(self, exec_id):
         for work in self.execs[exec_id].comm_works_wait:
             work.wait()
@@ -704,20 +733,17 @@ class ContextScheduler:
         self.detach_hooks() # Clear any old hooks first
         for module in self.model.modules():
             module_name = module.module_name
-            module_list = self.context_switch_module_list + ["context_switch_module"]
-            if any(module_class_str in module_name for module_class_str in module_list):
+            context_switch_module_list = ["context_switch_module"]
+            sync_event_module_list = ["sync_event_module"]
+            self.hooks[module_name] = []
+            if any(module_class_str in module_name for module_class_str in context_switch_module_list):
                 fwd_hook = module.register_forward_hook(self.forward_scheduler_hook)
-                try:
-                    bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
-                    print(f"Successfully registered backward hook {bwd_hook} for {module_name}")
-                except Exception as e:
-                    print(f"Failed to register backward hook for {module_name}: {e}")
-                    bwd_hook = None
-                self.hooks[module_name] = (fwd_hook, bwd_hook)
+                bwd_hook = module.register_full_backward_hook(self.backward_scheduler_hook)
+                self.hooks[module_name].append(fwd_hook)
+                self.hooks[module_name].append(bwd_hook)
                 if self.debug:
-                    print(self.format_print("Attached forward and backward hooks to " + 
+                    print(self.format_print("Attached forward and backward context switch hooks to " + 
                           y_str(f"{module_name}") + "\n", g_str), end="")
-                continue
             elif self.profiler is not None and module_name in self.profiler.modules:
                 module_info = self.profiler.modules[module_name]
                 if module_info.fire_context_switch:
@@ -733,8 +759,19 @@ class ContextScheduler:
                         bwd_hook
                     )
                     if self.debug:
-                        print(self.format_print("Attached forward and backward hooks to " + 
+                        print(self.format_print("Attached forward and backward profiler context switch hooks to " + 
                               y_str(f"{module_name}") + "\n", g_str), end="")
+            elif any(module_class_str in module_name for module_class_str in sync_event_module_list):
+                fwd_hook = module.register_forward_hook(self.forward_record_event_hook)
+                bwd_hook = module.register_full_backward_hook(self.backward_record_event_hook)
+                self.hooks[module_name].append(fwd_hook)
+                self.hooks[module_name].append(bwd_hook)
+                if self.debug:
+                    print(self.format_print("Attached forward and backward sync event hooks to " + 
+                          y_str(f"{module_name}") + "\n", g_str), end="")
+            if len(self.hooks[module_name]) == 0:
+                self.hooks.pop(module_name)
+                              
         print(self.format_print("Hooks: " + y_str(f"{self.hooks}")))
     
     def detach_hooks(self):
@@ -748,6 +785,20 @@ class ContextScheduler:
 
     def signal_exec_iter_completion(self, exec_id):
         self.execs[exec_id].exec_iter = -1
+
+    def forward_record_event_hook(self, module, input, output):
+        if not module.do_fwd:
+            return
+        exec_id = self.ident_to_exec_id[threading.current_thread().ident]
+        self.record_event(exec_id)
+        return
+        
+    def backward_record_event_hook(self, module, grad_input, grad_output):
+        if not module.do_bwd:
+            return
+        exec_id = self.backward_exec_id
+        self.record_event(exec_id)
+        return
         
     def forward_scheduler_hook(self, module, input, output):
         exec_id = self.ident_to_exec_id[threading.current_thread().ident]
@@ -765,8 +816,6 @@ class ContextScheduler:
             pair_exec_iter = None
         else:
             pair_exec_iter = self.execs[self.execs[exec_id].pair_exec_id].exec_iter
-        self.execs[exec_id].event_done = False
-        self.execs[exec_id].event.record()
         self.execs[exec_id].ready_info = {"key": "CONTEXT_SWITCH_HOOK",
                                           "exec_iter": exec_iter,
                                           "pair_exec_id": self.execs[exec_id].pair_exec_id,
@@ -800,8 +849,6 @@ class ContextScheduler:
             pair_exec_iter = None
         else:
             pair_exec_iter = self.execs[self.execs[exec_id].pair_exec_id].exec_iter
-        self.execs[exec_id].event_done = False
-        self.execs[exec_id].event.record()
         self.execs[exec_id].ready_info = {"key": "CONTEXT_SWITCH_HOOK",
                                           "exec_iter": exec_iter,
                                           "pair_exec_id": self.execs[exec_id].pair_exec_id,

@@ -53,8 +53,7 @@ from group_gemms import (
     TritonCGBF16GroupGEMM,
 )
 
-from ipc_pipeline_src.thread_scheduler import ContextSwitchModule
-
+from ipc_pipeline_src.thread_scheduler import ContextSwitchModule, SyncEventModule
 from model_config import ModelArgs
 from symm_mem_recipes import OnDeviceAllToAllV
 from torch import nn
@@ -535,6 +534,9 @@ class MoE(nn.Module):
         self.fwd_context_switch_module = ContextSwitchModule(do_fwd=True, do_bwd=False)
         self.bwd_context_switch_module = ContextSwitchModule(do_fwd=False, do_bwd=True)
 
+        self.fwd_sync_event_module = SyncEventModule(do_fwd=True, do_bwd=False)
+        self.bwd_sync_event_module = SyncEventModule(do_fwd=False, do_bwd=True)
+
     @classmethod
     def _initialize_group_gemm_strategies(cls):
         """Initialize available group GEMM strategies"""
@@ -672,6 +674,9 @@ class MoE(nn.Module):
         # keep the seqlen dimension for later use without holding onto the sorted tokens
         seqlen_sorted_tokens = sorted_tokens.shape[0]
 
+        sorted_tokens = self.bwd_context_switch_module(sorted_tokens)
+        # sorted_tokens = self.fwd_sync_event_module(sorted_tokens)
+
         # all to all
         # This part exchange the information about the number of tokens send and
         # received by each expert. We can understand this information as "side
@@ -692,11 +697,8 @@ class MoE(nn.Module):
                 output_splits = tokens_per_expert_group.view(self.ep_size, -1).sum(
                     dim=1
                 )
-        output_splits_cpu = output_splits.to(torch.device("cpu"), non_blocking=True)
-        input_splits_cpu = input_splits.to(torch.device("cpu"), non_blocking=True)
-        sorted_tokens = self.context_switch_module(sorted_tokens)
-        current_stream = torch.cuda.current_stream()
-        current_stream.synchronize()
+        output_splits_cpu = output_splits.to(torch.device("cpu"))
+        input_splits_cpu = input_splits.to(torch.device("cpu"))
         output_splits_list = output_splits_cpu.tolist()
         input_splits_list = input_splits_cpu.tolist()
         
@@ -727,6 +729,8 @@ class MoE(nn.Module):
                 self.ep_group,
             ) 
         
+        tokens_per_expert_group = self.fwd_context_switch_module(tokens_per_expert_group)
+        # tokens_per_expert_group = self.bwd_sync_event_module(tokens_per_expert_group)
 
         # This part prepares a 1D tensor with the same length as
         # `gathered_tokens`. The 1D tensor is filled with local expert IDs which
@@ -779,7 +783,6 @@ class MoE(nn.Module):
         # We use bincount and then transfer the result to the CPU. This is the
         # one synchronization we accept to avoid the expensive per-expert syncs.
         sorted_expert_idxs_cpu = sorted_expert_idxs.to(torch.device("cpu"), non_blocking=True)
-        sorted_expert_idxs = self.context_switch_module(sorted_expert_idxs)
         tokens_per_local_expert = torch.bincount(
             sorted_expert_idxs_cpu, minlength=len(self.experts)
         )
@@ -791,12 +794,6 @@ class MoE(nn.Module):
             torch.cumsum(tokens_per_local_expert, dim=0)
         ]).tolist()
         
-        # offsets_cpu = offsets.to(torch.device("cpu"), non_blocking=True)
-        # offsets_cpu = self.context_switch_module(offsets_cpu)
-        # current_stream = torch.cuda.current_stream()
-        # current_stream.synchronize()
-        # offsets = offsets_cpu.tolist()
-
         # Prepare the output buffer.
         if self.shuffle_method == "symm_mem":
             processed_tokens_permuted = self.get_gather_buf()[: gathered_tokens.shape[0]]
@@ -819,8 +816,13 @@ class MoE(nn.Module):
             # Place the results in the corresponding slice of the output buffer.
             processed_tokens_permuted[start:end] = expert_output
 
+        
+        
         # Un-sort the processed tokens to their original order before the EP->DP shuffle.
         processed_tokens = processed_tokens_permuted[unpermutation_indices]
+
+        # processed_tokens = self.fwd_sync_event_module(processed_tokens)
+        processed_tokens = self.bwd_context_switch_module(processed_tokens)
 
         # Now shuffle the tokens back to their original owner, i.e. EP to DP shuffle.
         # The input/output splits are just a reverse of the previous shuffle.
@@ -838,8 +840,10 @@ class MoE(nn.Module):
                 output_splits_list,
                 self.ep_group,
             )
+
+        returned_tokens = self.fwd_context_switch_module(returned_tokens)
+        # returned_tokens = self.bwd_sync_event_module(returned_tokens)
         
-        returned_tokens = self.context_switch_module(returned_tokens)
         output_tokens = torch.empty_like(returned_tokens)
         output_tokens[token_indices] = returned_tokens
         
@@ -1034,6 +1038,9 @@ class Attention(nn.Module):
         self.fwd_context_switch_module = ContextSwitchModule(do_fwd=True, do_bwd=False)
         self.bwd_context_switch_module = ContextSwitchModule(do_fwd=False, do_bwd=True)
 
+        self.fwd_sync_event_module = SyncEventModule(do_fwd=True, do_bwd=False)
+        self.bwd_sync_event_module = SyncEventModule(do_fwd=False, do_bwd=True)
+
         self.softmax_scale = self.q_head_dim ** (-0.5)
         if self.config.rope_scaling is not None:
             mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
@@ -1163,8 +1170,6 @@ class Attention(nn.Module):
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
         
-        # query_states = self.bwd_context_switch_module(query_states)
-
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query=query_states,
             key=key_states,

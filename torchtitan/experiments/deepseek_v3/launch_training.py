@@ -9,14 +9,14 @@ import zipfile
 from ipc_pipeline_src.sync_traces import merge_chrome_traces_with_barriers
 
 run_type = sys.argv[1] if len(sys.argv) > 1 else ""
-mbp_size = 4
+mbp_size = 5
 pp_size = 2
 ep_size = 2
 fsdp_size = 1
 batch_size = 16
 seq_len = 128
 num_hidden_layers = 12
-num_steps = 3
+num_steps = 4
 run_profiler = "True"
 
 if run_type == "1f1b":
@@ -33,7 +33,7 @@ num_gpus = pp_size * ep_size * fsdp_size
 run_id = datetime.now().strftime("%Y%m%d%H%M%S")
 #export run_id to env
 os.environ["RUN_ID"] = run_id
-os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(0 + i) for i in range(num_gpus))
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(4 + i) for i in range(num_gpus))
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "16"
 os.environ["CUDA_SCALE_LAUNCH_QUEUES"] = "4x"
 os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "3"
@@ -146,7 +146,7 @@ merge_chrome_traces_with_barriers(
     trace_dir=log_dir,
     output_file=f"{log_dir}/merged_trace.json",
     barrier_events=["BARRIER:EXEC_START", "BARRIER:EXEC_END"],
-    trace_names=[f"trace_0_2.json", f"trace_0_3.json"],
+    trace_names=[f"trace_0_2.json", f"trace_0_0.json"],
     whole_trace=False,
 )
 
