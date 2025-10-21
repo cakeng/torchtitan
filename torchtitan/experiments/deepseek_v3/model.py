@@ -812,6 +812,9 @@ class MoE(nn.Module):
             
             # Process the tokens.
             expert_output = expert(expert_input)
+
+            if i == len(self.experts) // 2:
+                expert_output = self.bwd_context_switch_module(expert_output)
             
             # Place the results in the corresponding slice of the output buffer.
             processed_tokens_permuted[start:end] = expert_output
